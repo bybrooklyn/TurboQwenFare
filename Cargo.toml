@@ -1,0 +1,39 @@
+[package]
+name = "tqf"
+version = "0.0.1"
+edition = "2021"
+description = "TurboQwenFare: bounded-memory Qwen3.6-35B-A3B inference server"
+license = "Apache-2.0"
+default-run = "tqf"
+build = "build.rs"
+
+[[bin]]
+name = "tqf"
+path = "src/main.rs"
+
+# Deliberately a single crate: no workspace, no internal sub-crates.
+# See spec Part IV, section 23 ("One-crate source tree").
+
+[features]
+# Backend selection is compile-time; runtime autodetection picks among
+# whatever backends were compiled in. Exactly one of these is expected
+# to be enabled per build for now.
+default = ["metal"]
+metal = []
+cuda = []
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Keep unwind (not "abort"): tqf is a long-running server and a panic in
+# one request/session must not be able to take down the whole process.
+
+[profile.dev]
+opt-level = 0
