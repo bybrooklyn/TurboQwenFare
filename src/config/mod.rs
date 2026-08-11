@@ -1,6 +1,7 @@
-//! Process-level config (spec Part IX, sections 76-77). Persistent `~/.tqf`
-//! state and hardware-profile detection land in phase 3; for now this only
-//! turns CLI flags into a validated in-memory `Config`.
+//! Process-level and persisted config (spec Part IX, sections 76-77).
+
+pub mod paths;
+pub mod persisted;
 
 use crate::error::ConfigError;
 

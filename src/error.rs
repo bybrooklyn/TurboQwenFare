@@ -44,12 +44,20 @@ impl From<std::io::Error> for TqfError {
 pub enum ConfigError {
     #[error("invalid size value {0:?}: expected a byte/token count, optionally suffixed with K, M, or G")]
     InvalidSize(String),
+    #[error("invalid --host value {0:?}: expected an IP address")]
+    InvalidHost(String),
+    #[error("environment error: {0}")]
+    Environment(String),
+    #[error("failed to serialize config: {0}")]
+    Serialize(String),
 }
 
 #[derive(Debug, Error)]
 pub enum SetupError {
     #[error("model setup declined")]
     Declined,
+    #[error("no model installed and no interactive terminal to confirm setup (use --yes)")]
+    NonInteractiveConfirmationRequired,
 }
 
 #[derive(Debug, Error)]
