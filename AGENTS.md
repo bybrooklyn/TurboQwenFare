@@ -17,15 +17,21 @@ The spec uses a decision-status vocabulary that controls how much latitude an im
 - **RESEARCH CANDIDATE** — deliberately experimental; failure is an acceptable, recordable outcome.
 - **BENCHMARK-SELECTED** — multiple valid implementations exist; the benchmark winner becomes default.
 
-Current progress is through spec Phase 10 (Phases 0-9: research harvest, crate skeleton, server
+Current progress is through spec Phase 12 (Phases 0-9: research harvest, crate skeleton, server
 skeleton, setup/global state, source resolver/downloader, GGUF importer, `.tqf` writer/reader,
 lossless Q4 repacker, streaming conversion transaction, tokenizer/chat semantics; Phase 10: Metal
 baseline infrastructure — device/queue, buffer leases, pipeline cache, event timing, baseline
-metallib loading, and the synthetic bandwidth/GEMV harness under `tqf optimize`) out of ~52 phases
-(spec sections 272 onward, "Part XVI — Phase-Level Engineering Taskbook"). Phase 11 (reference Q4
-kernels) onward is not started. Most module directories under `src/` beyond those phases are still
-empty stubs (a `mod.rs` with only doc comments) — check a file's actual line count before assuming a
-subsystem is implemented.
+metallib loading, and the synthetic bandwidth/GEMV harness under `tqf optimize`; Phase 11: reference
+Q4 kernels — Q4_K GEMV/batched-GEMM, RMSNorm, elementwise residual/SiLU/sigmoid, and an LM-head path,
+each with a `backend::reference` CPU oracle and a Metal parity test (`backend::metal::kernels`);
+Phase 12: Gated DeltaNet — four separate projections, causal conv tail, per-head q/k RMSNorm, the
+FP32 delta-rule recurrent update, gated norm, and output projection, in that order, plus a per-layer
+`GdnState` with reset/snapshot/restore (`model::qwen36::gdn`); the exact per-head gate formula there
+is a documented REFERENCE BASELINE pending parity validation against real checkpoint weights, not
+yet bit-exact-verified) out of ~52 phases (spec sections 272 onward, "Part XVI — Phase-Level
+Engineering Taskbook"). Phase 13 (full attention) onward is not started. Most module directories
+under `src/` beyond those phases are still empty stubs (a `mod.rs` with only doc comments) — check a
+file's actual line count before assuming a subsystem is implemented.
 
 ## Commands
 
