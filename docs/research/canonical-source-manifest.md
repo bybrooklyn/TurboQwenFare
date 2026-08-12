@@ -1,0 +1,128 @@
+# Canonical source manifest
+
+Spec Phase 0 deliverable ("research harvest and canonical manifest," §272):
+pin the official Qwen3.6 source revisions and record their hashes/licenses
+before any format work depends on them. This file is that record — the
+frozen counterpart to the live constants in `src/source/pinned.rs`.
+
+**Note on ordering:** this manifest was produced *after* Phases 4-6
+(source downloader, GGUF importer, `.tqf` container) had already landed,
+not before, which is out of the order the spec recommends ("Do not proceed
+to format design with unresolved text-tensor names/shapes," §272). The gap
+is now closed for the source pin itself; the tensor-name/shape side is
+addressed by `src/dev/inventory.rs` and its own note about what's still
+provisional.
+
+## Base model
+
+- **Repository:** [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
+- **Architecture:** MoE with hybrid Gated-DeltaNet/full-attention (`qwen3_5_moe`
+  in the Transformers architecture registry — the model class predates the
+  3.6 version bump and was never renamed).
+- **License:** `apache-2.0`
+- **Modalities:** text/image/video, 262,144-token native context (extensible
+  to ~1,010,000 per the model card; TQF's own 128K→~1M targets are
+  independent of that upstream claim and still need TQF's own qualification,
+  spec §6).
+
+### Geometry cross-check (2026-08-11)
+
+Every field in the spec's §117 "Canonical Qwen3.6 geometry" table (marked
+**LOCKED**) was fetched live from `Qwen/Qwen3.6-35B-A3B/raw/main/config.json`
+and compared. All matched exactly — no drift between the spec and the live
+source as of this date:
+
+| Field | Spec §117 | Live `config.json` |
+|---|---|---|
+| hidden_size | 2048 | 2048 |
+| num_hidden_layers | 40 | 40 |
+| full_attention_interval | every 4th layer | 4 |
+| num_attention_heads | 16 | 16 |
+| num_key_value_heads | 2 | 2 |
+| head_dim | 256 | 256 |
+| partial_rotary_factor | 0.25 | 0.25 |
+| linear_num_key_heads (GDN key heads) | 16 | 16 |
+| linear_num_value_heads (GDN value heads) | 32 | 32 |
+| linear_key_head_dim | 128 | 128 |
+| linear_value_head_dim | 128 | 128 |
+| linear_conv_kernel_dim | 4 | 4 |
+| num_experts | 256 | 256 |
+| num_experts_per_tok | 8 | 8 |
+| moe_intermediate_size | 512 | 512 |
+| shared_expert_intermediate_size | 512 | 512 |
+| vocab_size | 248,320 | 248,320 |
+| max_position_embeddings | 262,144 | 262,144 |
+
+Additional fields observed in the live config not called out by the spec
+table (recorded here for future phases, not yet consumed by any TQF code):
+`rope_theta = 10000000`, `mrope_interleaved = true`, `mrope_section = [11, 11, 10]`
+(multimodal RoPE sectioning — relevant once `--enable-vision` work begins,
+spec Part XI).
+
+This cross-check satisfies the Phase 0 test requirement "official config
+fields equal compile-time `Qwen36Geometry` constants" — see
+`src/model/qwen36/geometry.rs`, which encodes this same table as Rust
+constants and is unit-tested against it.
+
+## GGUF conversion (the actual TQF download source)
+
+- **Repository:** [`ggml-org/Qwen3.6-35B-A3B-GGUF`](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF)
+- **Pinned commit:** `baec3ebee244827cda0f4557eafa8b28f7545fa6`
+  - Fetched via `https://huggingface.co/api/models/ggml-org/Qwen3.6-35B-A3B-GGUF`
+    (`sha` field) on 2026-08-11, cross-checked with a second independent
+    fetch of the same endpoint — both returned the identical 40-character
+    hex value.
+  - Repository `lastModified` at fetch time: `2026-07-16T18:27:09.000Z`.
+- **License:** `apache-2.0` (inherited from the base model; GGUF conversion
+  adds no separate license terms).
+- **Conversion tooling:** auto-converted via `ggml-org/convert` per the
+  repository's own description.
+
+Per spec §13's pinned-source rule, `src/source/pinned.rs::REVISION` holds
+this exact commit — never `"main"` — so a later `ggml-org` push can't
+silently change model bytes under an existing benchmark/correctness
+profile. Re-resolving this pin (e.g. for `tqf update`) means repeating the
+fetch above and re-running the cross-checks, not just editing the constant.
+
+### Pinned artifacts
+
+Fetched via `https://huggingface.co/api/models/ggml-org/Qwen3.6-35B-A3B-GGUF?blobs=true`
+on 2026-08-11 (`siblings[].lfs.sha256`/`size`):
+
+| Role | Filename | Size (bytes) | SHA-256 | Confidence |
+|---|---|---:|---|---|
+| Language checkpoint (Q4_K_M) | `Qwen3.6-35B-A3B-Q4_K_M.gguf` | 20,419,565,568 | `671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7` | **High** — matches the value already published in spec §13 verbatim; three independent sources agree (spec text, HF API fetch #1, HF API fetch #2). |
+| MTP draft (Q4_0) | `mtp-Qwen3.6-35B-A3B-Q4_0.gguf` | 1,060,038,432 | `606fca331adcbfbdadc107512ce6a7161e84e1646ba0e0018256426f6296877f` | Medium — single live fetch, not independently re-verified. The downloader (`src/source/hf.rs`) still does its own whole-file SHA-256 check against this value at fetch time regardless, so a wrong digit here fails loudly (checksum mismatch) rather than silently. |
+| Vision projector (Q8_0, mmproj) | `mmproj-Qwen3.6-35B-A3B-Q8_0.gguf` | 614,194,304 | `904cbf8c8e876220066ab3bf676c7efa40f3da372276fdaf8b01d2fb2a37a51d` | Medium — same caveat as MTP above. |
+
+The repository also carries `BF16` and `DFLASH` variants of each artifact
+(full-precision and speculative-decode-oriented builds) that TQF does not
+target — the canonical path per spec §13 is Q4_K_M language / Q4_0 MTP /
+Q8_0 vision only.
+
+### `.src_sha` (upstream provenance, informational)
+
+The GGUF repo carries a `.src_sha` file recording which upstream commit(s)
+of the base model were converted:
+
+```
+DFLASH=f181eece646affea2c38b2765f1aaa01a9734ccd
+PRIMARY=995ad96eacd98c81ed38be0c5b274b04031597b0
+```
+
+`PRIMARY` is the best candidate for the "source model repository ID;
+immutable revision/commit hash" fields of the §125 model-provenance record
+once Phase 7/8 actually populate one — not yet consumed by any TQF code.
+Not independently re-verified beyond the single fetch that produced it.
+
+## How to re-verify
+
+```
+curl -s https://huggingface.co/api/models/ggml-org/Qwen3.6-35B-A3B-GGUF | jq .sha
+curl -s 'https://huggingface.co/api/models/ggml-org/Qwen3.6-35B-A3B-GGUF?blobs=true' \
+  | jq '.siblings[] | select(.rfilename | test("Q4_K_M|mtp-.*Q4_0|mmproj.*Q8_0")) | {rfilename, size: .lfs.size, sha256: .lfs.sha256}'
+```
+
+If any value differs from this file, `src/source/pinned.rs` needs a
+deliberate update (and a note here about when/why the pin moved) — not a
+silent edit, per the pinned-source rule.

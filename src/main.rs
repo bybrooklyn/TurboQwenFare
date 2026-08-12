@@ -11,6 +11,7 @@ mod error;
 mod experts;
 mod format;
 mod gui;
+mod ids;
 mod integrations;
 mod io;
 mod mcp;
@@ -23,6 +24,7 @@ mod sampling;
 mod server;
 mod setup;
 mod simd;
+mod source;
 mod tokenizer;
 mod vision;
 

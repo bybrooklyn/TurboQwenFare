@@ -13,6 +13,8 @@ use crate::error::{Result, SetupError};
 use crate::runtime::GenerationSlot;
 use crate::server::{self, bind, AppState};
 use crate::setup::flow::{self, SetupOutcome};
+use crate::setup::hardware::HardwareProfile;
+use crate::source::{self, local::LocalFileSource, manifest::FetchedArtifact, ModelSource};
 
 /// Diagnostic-only escape hatch so the server skeleton can be started and
 /// exercised manually before real model install exists (spec Part I
@@ -27,6 +29,7 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
     let config = effective_config(cli_config, &persisted);
 
     let first_run = flow::run(cli.yes)?;
+    let runtime = tokio::runtime::Runtime::new()?;
 
     let model_installed = match first_run.outcome {
         SetupOutcome::Ready => true,
@@ -46,15 +49,14 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
             return Err(SetupError::NonInteractiveConfirmationRequired.into());
         }
         SetupOutcome::ProceedNotYetImplemented => {
-            println!(
-                "tqf: model download/repack isn't implemented yet (spec phases 4-8).\n\
-                 Detected hardware: {} {}, {} cores, backend={}.",
-                first_run.hardware.os,
-                first_run.hardware.arch,
-                first_run.hardware.cpu_cores,
-                first_run.hardware.backend,
-            );
-            false
+            // Phase 4 exists now: attempt an actual source fetch (local
+            // --model import, or the pinned HF source) through the real
+            // CLI. GGUF import/.tqf repack (phases 5-8) still don't exist,
+            // so this always reports `model_installed = false` regardless
+            // of fetch outcome — no receipt is written, matching
+            // `SetupOutcome::ProceedNotYetImplemented`'s existing contract
+            // that no partial receipt is ever written for this outcome.
+            runtime.block_on(attempt_source_fetch(cli, &first_run.hardware))
         }
     };
 
@@ -71,8 +73,92 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
         );
     }
 
-    let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run_server(cli, config, model_installed))
+}
+
+/// Exercises the phase-4 source resolver/downloader through the real CLI:
+/// `--model <path>` imports a local file (spec §29 experimental import
+/// path); otherwise this attempts the pinned canonical HF source. Always
+/// returns `false` for `model_installed` — GGUF parsing and `.tqf` repack
+/// (phases 5-8) don't exist yet, so a successful fetch is not an installed
+/// model, just verified bytes on disk ready for those later phases.
+async fn attempt_source_fetch(cli: &Cli, hardware: &HardwareProfile) -> bool {
+    let models_dir = match paths::models_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            println!("tqf: could not resolve model storage directory: {err}");
+            return false;
+        }
+    };
+
+    if let Some(model_path) = &cli.model {
+        match LocalFileSource::open(model_path.clone()) {
+            Ok(local_source) => {
+                let dest_dir = source::default_dest_dir(&models_dir, local_source.metadata());
+                report_fetch(
+                    source::fetch_verified(
+                        &local_source,
+                        source::SourceOwnership::UserOwned,
+                        &dest_dir,
+                        source::FetchOptions::default(),
+                    )
+                    .await,
+                );
+            }
+            Err(err) => println!(
+                "tqf: could not open --model path {}: {err}",
+                model_path.display()
+            ),
+        }
+        return false;
+    }
+
+    println!(
+        "tqf: no model installed. Fetching the pinned canonical checkpoint ({}, {} bytes) — \
+         this can take a while.\nDetected hardware: {} {}, {} cores, backend={}.",
+        source::pinned::LANGUAGE_CHECKPOINT_FILENAME,
+        source::pinned::LANGUAGE_CHECKPOINT_SIZE_BYTES,
+        hardware.os,
+        hardware.arch,
+        hardware.cpu_cores,
+        hardware.backend,
+    );
+
+    match source::hf::HfRangeSource::resolve(
+        source::pinned::REPO_ID,
+        source::pinned::REVISION,
+        source::pinned::LANGUAGE_CHECKPOINT_FILENAME,
+        Some(source::pinned::LANGUAGE_CHECKPOINT_SHA256.to_string()),
+    )
+    .await
+    {
+        Ok(hf_source) => {
+            let dest_dir = source::default_dest_dir(&models_dir, hf_source.metadata());
+            report_fetch(
+                source::fetch_verified(
+                    &hf_source,
+                    source::SourceOwnership::TqfManaged,
+                    &dest_dir,
+                    source::FetchOptions::default(),
+                )
+                .await,
+            );
+        }
+        Err(err) => println!("tqf: could not resolve pinned source: {err}"),
+    }
+
+    false
+}
+
+fn report_fetch(result: Result<FetchedArtifact>) {
+    match result {
+        Ok(artifact) => println!(
+            "tqf: fetched and verified {} ({} bytes, sha256={}).\n\
+             GGUF import/.tqf repack isn't implemented yet (spec phases 5-8).",
+            artifact.artifact_name, artifact.size_bytes, artifact.sha256
+        ),
+        Err(err) => println!("tqf: source fetch failed: {err}"),
+    }
 }
 
 /// Only overwrites a persisted field when the CLI actually provided a

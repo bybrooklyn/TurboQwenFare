@@ -1,0 +1,340 @@
+[
+  {
+    "canonical_name": "token_embd.weight",
+    "logical_role": "TokenEmbedding",
+    "layer": null,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "Embeddings",
+    "residency": "ResidentCore",
+    "consumer": "Embedding"
+  },
+  {
+    "canonical_name": "output_norm.weight",
+    "logical_role": "FinalNorm",
+    "layer": null,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "Embeddings",
+    "residency": "ResidentCore",
+    "consumer": "Norm"
+  },
+  {
+    "canonical_name": "output.weight",
+    "logical_role": "LmHead",
+    "layer": null,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "LmHead",
+    "residency": "ResidentCore",
+    "consumer": "LmHead"
+  },
+  {
+    "canonical_name": "mmproj.weight",
+    "logical_role": "VisionProjector",
+    "layer": null,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "VisionLink",
+    "residency": "Lazy",
+    "consumer": "Vision"
+  },
+  {
+    "canonical_name": "blk.3.attn_q.weight",
+    "logical_role": "AttnQProj",
+    "layer": 3,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Attention"
+  },
+  {
+    "canonical_name": "blk.3.attn_k.weight",
+    "logical_role": "AttnKProj",
+    "layer": 3,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Attention"
+  },
+  {
+    "canonical_name": "blk.3.attn_v.weight",
+    "logical_role": "AttnVProj",
+    "layer": 3,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Attention"
+  },
+  {
+    "canonical_name": "blk.3.attn_output.weight",
+    "logical_role": "AttnOProj",
+    "layer": 3,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Attention"
+  },
+  {
+    "canonical_name": "blk.3.attn_norm.weight",
+    "logical_role": "AttnNorm",
+    "layer": 3,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Norm"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.in_proj_qkv.weight",
+    "logical_role": "GdnInProjQkv",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.in_proj_z.weight",
+    "logical_role": "GdnInProjZ",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.in_proj_a.weight",
+    "logical_role": "GdnInProjA",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.in_proj_b.weight",
+    "logical_role": "GdnInProjB",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.conv1d.weight",
+    "logical_role": "GdnConv1d",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.A_log",
+    "logical_role": "GdnALog",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.dt_bias",
+    "logical_role": "GdnDtBias",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.gated_norm.weight",
+    "logical_role": "GdnGatedNorm",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "model.layers.0.linear_attn.out_proj.weight",
+    "logical_role": "GdnOutProj",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "GatedDeltaNet"
+  },
+  {
+    "canonical_name": "blk.0.ffn_gate_inp.weight",
+    "logical_role": "RouterGate",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Router"
+  },
+  {
+    "canonical_name": "blk.0.mlp.shared_expert.gate_proj.weight",
+    "logical_role": "SharedExpertGate",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Expert"
+  },
+  {
+    "canonical_name": "blk.0.mlp.shared_expert.up_proj.weight",
+    "logical_role": "SharedExpertUp",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Expert"
+  },
+  {
+    "canonical_name": "blk.0.mlp.shared_expert.down_proj.weight",
+    "logical_role": "SharedExpertDown",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Expert"
+  },
+  {
+    "canonical_name": "blk.0.ffn_gate_exps.weight",
+    "logical_role": "RoutedExpertGate",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "RoutedExperts",
+    "residency": "ColdExpertStore",
+    "consumer": "Expert"
+  },
+  {
+    "canonical_name": "blk.0.ffn_up_exps.weight",
+    "logical_role": "RoutedExpertUp",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "RoutedExperts",
+    "residency": "ColdExpertStore",
+    "consumer": "Expert"
+  },
+  {
+    "canonical_name": "blk.0.ffn_down_exps.weight",
+    "logical_role": "RoutedExpertDown",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "RoutedExperts",
+    "residency": "ColdExpertStore",
+    "consumer": "Expert"
+  },
+  {
+    "canonical_name": "blk.0.ffn_norm.weight",
+    "logical_role": "FfnNorm",
+    "layer": 0,
+    "shape": [
+      32
+    ],
+    "source_quant": "Q4_0",
+    "source_bytes": 18,
+    "tqf_section": "ResidentCore",
+    "residency": "ResidentCore",
+    "consumer": "Norm"
+  }
+]

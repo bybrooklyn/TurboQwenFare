@@ -28,6 +28,8 @@ pub enum TqfError {
     Retrieval(#[from] RetrievalError),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+    #[error(transparent)]
+    Source(#[from] SourceError),
     #[error("cancelled")]
     Cancelled,
     #[error(transparent)]
@@ -37,6 +39,22 @@ pub enum TqfError {
 impl From<std::io::Error> for TqfError {
     fn from(e: std::io::Error) -> Self {
         TqfError::Io(IoError::from(e))
+    }
+}
+
+// `#[from]` on `FormatError::Gguf`/`FormatError::Container` only gives
+// `From<GgufError> for FormatError` (one level) — these fill in the second
+// hop so parsing code can freely use `?` in functions returning the
+// crate-wide `Result` without an intermediate `.map_err(FormatError::from)`.
+impl From<GgufError> for TqfError {
+    fn from(e: GgufError) -> Self {
+        TqfError::Format(FormatError::Gguf(e))
+    }
+}
+
+impl From<ContainerError> for TqfError {
+    fn from(e: ContainerError) -> Self {
+        TqfError::Format(FormatError::Container(e))
     }
 }
 
@@ -64,12 +82,138 @@ pub enum SetupError {
 pub enum ModelError {
     #[error("unsupported model: {0}")]
     Unsupported(String),
+    #[error("tokenizer metadata key {0:?} is missing from the source checkpoint")]
+    TokenizerMetadataMissing(&'static str),
+    #[error(
+        "unsupported tokenizer.ggml.model {0:?}: only byte-level BPE (\"gpt2\") is implemented"
+    )]
+    UnsupportedTokenizerModel(String),
+    #[error("failed to build tokenizer: {0}")]
+    TokenizerBuild(String),
 }
 
+/// On-disk format errors: GGUF import (spec Part XVI phase 5) and the
+/// native `.tqf` container (phase 6). Bounds/structure violations must
+/// always resolve to one of these typed variants rather than a panic or an
+/// out-of-bounds read (spec §119: "A corrupted `.tqf` or index never
+/// triggers unsafe reads; readers bounds-check before mapping/dispatch.").
 #[derive(Debug, Error)]
 pub enum FormatError {
-    #[error("corrupt or incompatible .tqf container: {0}")]
-    Corrupt(String),
+    #[error(transparent)]
+    Gguf(#[from] GgufError),
+    #[error(transparent)]
+    Container(#[from] ContainerError),
+}
+
+/// Errors from the strict GGUF import reader (spec §277, §115 invariants
+/// #2/#3: little-endian only, offsets validated as `u64` before any
+/// `usize` cast). Not a general GGUF library — only the subset needed to
+/// enumerate the pinned canonical checkpoints.
+#[derive(Debug, Error)]
+pub enum GgufError {
+    #[error("not a GGUF file: bad magic")]
+    BadMagic,
+    #[error("unsupported GGUF version {0}")]
+    UnsupportedVersion(u32),
+    #[error("integer overflow validating GGUF structure")]
+    IntegerOverflow,
+    #[error(
+        "GGUF file truncated: needed {needed} bytes at offset {offset}, file is {available} bytes"
+    )]
+    Truncated {
+        offset: u64,
+        needed: u64,
+        available: u64,
+    },
+    #[error("GGUF string length {0} exceeds sane bound")]
+    StringTooLong(u64),
+    #[error("invalid UTF-8 in GGUF string")]
+    InvalidUtf8,
+    #[error("unsupported GGUF metadata value type tag {0}")]
+    UnsupportedValueType(u32),
+    #[error("unsupported quant/ggml type id {0}")]
+    UnsupportedQuantType(u32),
+    #[error("tensor {name:?} has unsupported rank {rank} (max 4)")]
+    UnsupportedRank { name: String, rank: u32 },
+    #[error(
+        "tensor {name:?} byte range [{offset}, {offset}+{len}) is outside the tensor-data \
+         section (size {data_len})"
+    )]
+    TensorOutOfBounds {
+        name: String,
+        offset: u64,
+        len: u64,
+        data_len: u64,
+    },
+    #[error("duplicate tensor name {0:?}")]
+    DuplicateTensor(String),
+    #[error("duplicate metadata key {0:?}")]
+    DuplicateMetadataKey(String),
+    #[error("declared tensor count {0} exceeds sane bound")]
+    TooManyTensors(u64),
+    #[error("declared metadata entry count {0} exceeds sane bound")]
+    TooManyMetadataEntries(u64),
+    #[error("invalid GGUF alignment value {0} (must be a nonzero power of two)")]
+    InvalidAlignment(u64),
+    #[error(
+        "tensor {0:?} could not be classified into a known logical role (spec §118: unknown \
+         production-language tensors are fatal, not silently skipped)"
+    )]
+    UnclassifiedTensor(String),
+}
+
+/// Errors from the native `.tqf` container reader/writer (spec Part XIV
+/// sections 120-126, phase 6). Mirrors the fuzz-target checklist in spec
+/// §246: bad magic, integer overflow in offsets/counts, truncated files,
+/// out-of-bounds tables, unsupported quant layouts, corrupted metadata
+/// hash.
+#[derive(Debug, Error)]
+pub enum ContainerError {
+    #[error("not a .tqf container: bad magic")]
+    BadMagic,
+    #[error("unsupported .tqf superblock size {0} (expected 4096)")]
+    BadSuperblockSize(u32),
+    #[error("unsupported .tqf endian marker {0:#x}")]
+    BadEndianMarker(u32),
+    #[error("unsupported .tqf format major version {0}")]
+    UnsupportedMajorVersion(u16),
+    #[error("declared file length {declared} does not match actual file length {actual}")]
+    FileLengthMismatch { declared: u64, actual: u64 },
+    #[error("integer overflow validating .tqf table bounds")]
+    IntegerOverflow,
+    #[error("table {name} range [{offset}, {offset}+{len}) exceeds file length {file_len}")]
+    TableOutOfBounds {
+        name: &'static str,
+        offset: u64,
+        len: u64,
+        file_len: u64,
+    },
+    #[error("metadata root hash mismatch: expected {expected}, computed {computed}")]
+    MetadataRootHashMismatch { expected: String, computed: String },
+    #[error("tensor with role {role_id} layer {layer:?} not found")]
+    TensorNotFound { role_id: u32, layer: Option<u8> },
+    #[error("expert (layer {layer}, expert {expert}) not found")]
+    ExpertNotFound { layer: u8, expert: u16 },
+    #[error("checksum mismatch for extent {0:?}")]
+    ChecksumMismatch(String),
+    #[error("duplicate extent name {0:?}")]
+    DuplicateExtent(String),
+    #[error("string table offset {offset} + length {len} exceeds string table size {table_len}")]
+    StringTableOutOfBounds {
+        offset: u64,
+        len: u64,
+        table_len: u64,
+    },
+    #[error(".tqf file truncated: needed {needed} bytes, file is {available} bytes")]
+    Truncated { needed: u64, available: u64 },
+    #[error("unknown .tqf section kind {0}")]
+    UnknownSectionKind(u32),
+    #[error("tensor extent has unsupported rank {0} (max 4)")]
+    UnsupportedRank(u32),
+    #[error("malformed .tqf record in {table}")]
+    MalformedRecord { table: &'static str },
+    #[error("{0}")]
+    QuantMismatch(crate::format::quant::validate::QuantMismatchReport),
 }
 
 #[derive(Debug, Error)]
@@ -114,6 +258,48 @@ pub enum RetrievalError {
 pub enum ProtocolError {
     #[error("protocol error: {0}")]
     Invalid(String),
+}
+
+/// Errors from the source resolver/downloader (spec Part V section 29-30,
+/// Part XVI phase 4). Kept distinct from `SetupError` (terminal UX/policy
+/// outcomes like "user declined") and `ModelError` (model *compatibility*):
+/// a future `tqf doctor` needs to tell "network/verification failed" apart
+/// from those.
+#[derive(Debug, Error)]
+pub enum SourceError {
+    #[error("network request failed: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("http status {status} fetching {url}")]
+    HttpStatus { status: u16, url: String },
+    #[error("server does not honor byte-range requests for {url}")]
+    RangeNotSupported { url: String },
+    #[error("checksum mismatch for {artifact}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        artifact: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("source revision/ETag changed mid-download for {artifact}: expected {expected}, got {actual}")]
+    RevisionChanged {
+        artifact: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("resume journal is corrupt or inconsistent: {0}")]
+    JournalCorrupt(String),
+    #[error("local source unavailable: {0}")]
+    LocalSourceUnavailable(std::io::Error),
+    #[error("source metadata for {artifact} has no known size; cannot plan a resumable download")]
+    UnknownSize { artifact: String },
+    #[error(
+        "short read for {artifact} at offset {offset}: expected {expected} bytes, got {actual}"
+    )]
+    ShortRead {
+        artifact: String,
+        offset: u64,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 /// Indicates a violated TQF invariant rather than user/environment error.

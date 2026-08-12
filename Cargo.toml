@@ -19,7 +19,7 @@ path = "src/main.rs"
 # whatever backends were compiled in. Exactly one of these is expected
 # to be enabled per build for now.
 default = ["metal"]
-metal = []
+metal = ["dep:metal-sys"]
 cuda = []
 
 [dependencies]
@@ -34,6 +34,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 tokio-stream = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha2 = "0.10"
+blake3 = "1"
+async-trait = "0.1"
+bytes = "1"
+tokenizers = "0.23.1"
+# Renamed from the crate's real name "metal" to keep it distinct from this
+# manifest's own `metal` compute-backend feature (spec §49: "mature
+# Objective-C/Metal bindings for device/queue/resource management").
+metal-sys = { package = "metal", version = "0.33", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
