@@ -242,6 +242,11 @@ The 16-token release run took 374,033 ms and recorded 5,120 expert misses,
 fixture while demonstrating that the current reference cache is nowhere near
 the Phase 19–25 performance target.
 
+The same exact path passed the pinned raw-`A` 128-token oracle on 2026-08-17.
+It took 1,244,716 ms and recorded 40,960 misses, 40,809 evictions, zero hits,
+267,190,272 resident expert bytes, and 72,477,573,120 raw miss bytes. The
+immutable result record is `docs/research/qualification/raw-a-128-tqf.json`.
+
 The release setup path then validated the installed model, wrote the receipt,
 completed its short hardware tune on the base Apple M4, and started the bounded
 headless server at `127.0.0.1:11434`. `/health` reported version `0.0.1` with
@@ -250,9 +255,9 @@ headless server at `127.0.0.1:11434`. `/health` reported version `0.0.1` with
 reused the receipt and passed both probes again. The server was stopped cleanly
 after each check.
 
-Qualification boundary: the real bounded graph now closes the raw-`A` 1- and
-16-token deterministic lengths. It does not close Phase 15's broader workload
-matrix or its 128/512-token lengths, the 512-token cache-ordering
+Qualification boundary: the real bounded graph now closes the raw-`A` 1-,
+16-, and 128-token deterministic lengths. It does not close Phase 15's broader
+workload matrix or its 512-token length, the 512-token cache-ordering
 gate, OS-observed 4 GiB qualification, the >=15 tok/s floor, the combined <=1%
 quality gate, plain GUI startup, or RTX 3070 Ti/CUDA qualification. No claim in
 this document should be read as closing those gates.

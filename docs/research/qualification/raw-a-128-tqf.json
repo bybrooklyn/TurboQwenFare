@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-17",
+  "tqf_commit": "7d0ad31",
+  "fixture": "docs/research/oracles/raw-a-128.json",
+  "model_source_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "oracle_runtime": "llama.cpp",
+  "oracle_revision": "4df29be4f4c3673f428170fda944a5b19f743bb8",
+  "memory_budget_bytes": 4294967296,
+  "expert_cache_capacity_bytes": 268435456,
+  "result": "pass",
+  "report": {
+    "fixture_id": "raw-a-128",
+    "prompt_tokens": 1,
+    "generated_tokens": 128,
+    "decode_steps": 128,
+    "elapsed_milliseconds": 1244716,
+    "cache_hits": 0,
+    "cache_misses": 40960,
+    "cache_evictions": 40809,
+    "cache_resident_bytes": 267190272,
+    "raw_miss_bytes": 72477573120,
+    "broker_reserved_bytes_after_run": 606790980
+  },
+  "qualification_boundary": "This closes one raw 128-token fixture, not the 512-token length, the multi-workload matrix, OS-observed 4 GiB certification, or any throughput gate."
+}
