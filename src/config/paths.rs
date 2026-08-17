@@ -1,6 +1,6 @@
 //! `~/.tqf` layout (spec Part V section 28; Part IX section 76): a single
 //! machine-global root holding persisted config, the hardware profile,
-//! trusted receipts, and (later) installed model data.
+//! trusted receipts, and installed model data.
 
 use std::path::PathBuf;
 

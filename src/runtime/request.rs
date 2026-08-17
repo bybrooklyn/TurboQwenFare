@@ -20,9 +20,16 @@ pub enum Role {
 }
 
 #[derive(Debug, Clone)]
+pub struct MessageToolCall {
+    pub name: String,
+    pub arguments_json: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    pub tool_calls: Vec<MessageToolCall>,
 }
 
 #[derive(Debug, Clone)]

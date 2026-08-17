@@ -63,6 +63,15 @@ impl Default for Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Axum cancels a request handler future when its client disappears.
+        // Turning that ordinary Rust drop into an explicit token signal also
+        // stops queued or spawn-blocking model work for non-streaming calls.
+        self.cancellation.cancel();
+    }
+}
+
 /// v1 has exactly one active generation; every other request queues behind
 /// this permit. Holding the permit *is* "generating" (spec Part IX section
 /// 75, Part IV section 25).
@@ -92,5 +101,19 @@ impl GenerationSlot {
 impl Default for GenerationSlot {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_session_signals_all_cancellation_observers() {
+        let session = Session::new();
+        let observer = session.cancellation.clone();
+        assert!(!observer.is_cancelled());
+        drop(session);
+        assert!(observer.is_cancelled());
     }
 }

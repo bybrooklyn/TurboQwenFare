@@ -28,6 +28,7 @@ use super::superblock::{Superblock, FORMAT_MAJOR, FORMAT_MINOR, SUPERBLOCK_SIZE}
 const EXPERT_SUPEREXTENT_ALIGNMENT: u64 = 4096;
 const METADATA_TABLE_ALIGNMENT: u64 = 64;
 
+#[derive(Debug, Clone)]
 pub struct TqfHeaderInfo {
     pub backend_id: u32,
     pub feature_bits: u64,
@@ -268,6 +269,25 @@ impl TqfWriter {
             .map(PendingExpert::from_recovered)
             .collect::<Result<Vec<_>>>()?;
 
+        for extent in &extents {
+            verify_recovered_payload(
+                &file,
+                extent.file_offset,
+                extent.stored_bytes,
+                &extent.digest,
+                "recovered tensor extent",
+            )?;
+        }
+        for expert in &experts {
+            verify_recovered_payload(
+                &file,
+                expert.file_offset,
+                expert.stored_bytes as u64,
+                &expert.digest,
+                "recovered expert superextent",
+            )?;
+        }
+
         let next_offset = extents
             .iter()
             .map(|e| e.file_offset + e.stored_bytes)
@@ -306,6 +326,14 @@ impl TqfWriter {
         self.experts
             .iter()
             .any(|e| e.layer == layer && e.expert == expert)
+    }
+
+    /// Makes all payload bytes written so far durable before the conversion
+    /// journal is allowed to claim the corresponding extent/expert. Metadata
+    /// tables and the superblock are still finalized only by `commit`.
+    pub fn sync_payload(&self) -> Result<()> {
+        self.file.sync_data()?;
+        Ok(())
     }
 
     /// Appends one tensor's bytes at the next `required_alignment`-aligned
@@ -373,6 +401,22 @@ impl TqfWriter {
         gate_up: &[u8],
         down: &[u8],
     ) -> Result<RecoveredExpert> {
+        self.write_expert_parts(layer, expert, quant_layout_id, gate_up, &[], down)
+    }
+
+    /// Writes gate and up matrices as adjacent regions without first making
+    /// a temporary concatenation. Canonical Qwen routed experts keep the
+    /// matrices separately in GGUF; this preserves their bytes while making
+    /// one checksummed whole-expert superextent for the streaming cache.
+    pub fn write_expert_parts(
+        &mut self,
+        layer: LayerId,
+        expert: ExpertId,
+        quant_layout_id: u16,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+    ) -> Result<RecoveredExpert> {
         if self
             .experts
             .iter()
@@ -387,13 +431,16 @@ impl TqfWriter {
 
         let aligned_offset = align_up(self.next_offset, EXPERT_SUPEREXTENT_ALIGNMENT)?;
         pad_to(&mut self.file, self.next_offset, aligned_offset)?;
-        self.file.write_all(gate_up)?;
+        self.file.write_all(gate)?;
+        self.file.write_all(up)?;
         self.file.write_all(down)?;
 
         let mut hasher = blake3::Hasher::new();
-        hasher.update(gate_up);
+        hasher.update(gate);
+        hasher.update(up);
         hasher.update(down);
-        let stored_bytes = (gate_up.len() + down.len()) as u32;
+        let gate_up_bytes = gate.len() + up.len();
+        let stored_bytes = (gate_up_bytes + down.len()) as u32;
 
         let tiles = vec![
             ExpertTileRecord {
@@ -402,7 +449,7 @@ impl TqfWriter {
                 neuron_start: 0,
                 neuron_count: 0,
                 relative_offset: 0,
-                stored_bytes: gate_up.len() as u32,
+                stored_bytes: gate_up_bytes as u32,
                 quant_layout_id,
                 flags: 0,
             },
@@ -411,7 +458,7 @@ impl TqfWriter {
                 tile_id: TileId(1),
                 neuron_start: 0,
                 neuron_count: 0,
-                relative_offset: gate_up.len() as u32,
+                relative_offset: gate_up_bytes as u32,
                 stored_bytes: down.len() as u32,
                 quant_layout_id,
                 flags: 0,
@@ -501,7 +548,14 @@ impl TqfWriter {
                 layer: ex.layer,
                 expert: ex.expert,
                 flags: 0,
-                layout_id: 0,
+                // The index repeats the tile layout so cache admission can
+                // reject an unsupported expert before reading its payload.
+                // `write_expert_parts` always emits at least the GateUp tile.
+                layout_id: ex
+                    .tiles
+                    .first()
+                    .expect("expert superextent has a GateUp tile")
+                    .quant_layout_id,
                 file_offset: ex.file_offset,
                 stored_bytes: ex.stored_bytes,
                 tile_first,
@@ -626,8 +680,48 @@ impl TqfWriter {
         drop(self.file);
 
         std::fs::rename(&self.partial_path, &self.final_path)?;
+        if let Some(parent) = self.final_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
+}
+
+fn verify_recovered_payload(
+    file: &File,
+    offset: u64,
+    length: u64,
+    expected: &[u8; 32],
+    label: &'static str,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let file_length = file.metadata()?.len();
+    let end = offset
+        .checked_add(length)
+        .ok_or(ContainerError::IntegerOverflow)?;
+    if end > file_length {
+        return Err(ContainerError::TableOutOfBounds {
+            name: label,
+            offset,
+            len: length,
+            file_len: file_length,
+        }
+        .into());
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut scratch = [0_u8; 64 * 1024];
+    let mut consumed = 0_u64;
+    while consumed < length {
+        let take = (length - consumed).min(scratch.len() as u64) as usize;
+        file.read_exact_at(&mut scratch[..take], offset + consumed)?;
+        hasher.update(&scratch[..take]);
+        consumed += take as u64;
+    }
+    if hasher.finalize().as_bytes() != expected {
+        return Err(ContainerError::ChecksumMismatch(label.to_string()).into());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

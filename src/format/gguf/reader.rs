@@ -15,6 +15,8 @@ use crate::error::{GgufError, Result};
 use crate::format::byte_reader::ByteReader;
 use crate::format::gguf::value::{read_gguf_string, read_gguf_value, GgufValue};
 use crate::format::quant::GgmlType;
+use crate::ids::Bytes;
+use crate::memory::{MemoryBroker, MemoryClass, MemoryLease, MemoryOwner};
 
 const MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: u64 = 32;
@@ -43,12 +45,25 @@ pub struct TensorDescriptor {
 #[derive(Debug)]
 pub struct GgufFile {
     path: PathBuf,
+    source_bytes: u64,
+    header_blake3: [u8; 32],
     pub version: u32,
     pub metadata: HashMap<String, GgufValue>,
     pub tensors: Vec<TensorDescriptor>,
+    _metadata_lease: MemoryLease,
 }
 
 impl GgufFile {
+    /// Digest of the parsed GGUF header/metadata/tensor-directory region,
+    /// excluding alignment padding and tensor payload bytes. This makes
+    /// tokenizer provenance cheap to revalidate at startup.
+    pub fn header_blake3(&self) -> [u8; 32] {
+        self.header_blake3
+    }
+
+    pub fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
     pub fn tensor(&self, name: &str) -> Option<&TensorDescriptor> {
         self.tensors.iter().find(|t| t.name == name)
     }
@@ -71,24 +86,70 @@ impl GgufFile {
     }
 }
 
-pub fn open(path: &Path) -> Result<GgufFile> {
+pub fn open_with_broker(path: &Path, broker: &MemoryBroker) -> Result<GgufFile> {
     let file_len = std::fs::metadata(path)?.len();
 
     let probe_len = file_len.min(MAX_HEADER_PROBE_BYTES);
-    let mut probe = Vec::new();
+    // Parsing duplicates strings and descriptor data while the raw probe is
+    // still live. Reserve both the temporary probe and a conservative 4x
+    // retained-metadata/tokenizer envelope before either allocation can
+    // occur; the extra headroom covers HashMap/string allocator overhead.
+    let metadata_envelope = probe_len
+        .checked_mul(4)
+        .ok_or(GgufError::IntegerOverflow)?
+        .max(1);
+    let metadata_lease = broker.reserve(
+        MemoryOwner::Core,
+        MemoryClass::Fixed,
+        Bytes(metadata_envelope),
+        64,
+    )?;
+    let probe_lease = broker.reserve(
+        MemoryOwner::IoStaging,
+        MemoryClass::Transient,
+        Bytes(probe_len.max(1)),
+        64,
+    )?;
+    let probe_capacity: usize = probe_len
+        .try_into()
+        .map_err(|_| GgufError::IntegerOverflow)?;
+    let mut probe = Vec::with_capacity(probe_capacity);
     File::open(path)?.take(probe_len).read_to_end(&mut probe)?;
 
     let parsed = parse_header_and_metadata(&probe, file_len)?;
+    let header_len: usize = parsed
+        .header_end
+        .try_into()
+        .map_err(|_| GgufError::IntegerOverflow)?;
+    let header = probe.get(..header_len).ok_or(GgufError::Truncated {
+        offset: 0,
+        needed: parsed.header_end,
+        available: probe.len() as u64,
+    })?;
+    let header_blake3 = *blake3::hash(header).as_bytes();
+    drop(probe_lease);
     Ok(GgufFile {
         path: path.to_path_buf(),
+        source_bytes: file_len,
+        header_blake3,
         version: parsed.version,
         metadata: parsed.metadata,
         tensors: parsed.tensors,
+        _metadata_lease: metadata_lease,
     })
+}
+
+/// Unit-test convenience. Product paths must supply the process-wide broker
+/// through `open_with_broker` so metadata cannot escape `--memory`.
+#[cfg(test)]
+pub fn open(path: &Path) -> Result<GgufFile> {
+    let broker = MemoryBroker::new(Bytes(5 * MAX_HEADER_PROBE_BYTES));
+    open_with_broker(path, &broker)
 }
 
 struct ParsedHeader {
     version: u32,
+    header_end: u64,
     metadata: HashMap<String, GgufValue>,
     tensors: Vec<TensorDescriptor>,
 }
@@ -214,6 +275,7 @@ fn parse_header_and_metadata(
 
     Ok(ParsedHeader {
         version,
+        header_end,
         metadata,
         tensors,
     })
@@ -267,6 +329,14 @@ impl QuantBlockReader {
 
     pub fn total_blocks(&self) -> u64 {
         self.total_blocks
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.total_blocks * self.block_bytes
+    }
+
+    pub fn max_batch_bytes(&self) -> u64 {
+        self.total_blocks.min(self.batch_blocks) * self.block_bytes
     }
 
     /// Reads the next batch of blocks (up to the configured batch size) as

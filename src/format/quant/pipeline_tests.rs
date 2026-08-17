@@ -8,6 +8,12 @@ use std::path::PathBuf;
 
 use crate::format::gguf;
 use crate::format::quant::{repack, validate, GgmlType};
+use crate::ids::Bytes;
+use crate::memory::MemoryBroker;
+
+fn broker() -> MemoryBroker {
+    MemoryBroker::new(Bytes(1024 * 1024))
+}
 
 fn write_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u64).to_le_bytes());
@@ -73,14 +79,29 @@ fn passthrough_repack_validates_cleanly() {
     assert_eq!(tensor.ggml_type, GgmlType::Q4_0);
 
     let mut reader = file.quant_block_reader(tensor).unwrap();
-    let repacked = repack::repack_passthrough(&mut reader).unwrap();
-    assert_eq!(repacked, block_bytes);
+    let repacked = repack::repack_passthrough(&mut reader, &broker()).unwrap();
+    assert_eq!(&*repacked, block_bytes.as_slice());
     assert_eq!(
         repack::tqf_quant_layout_id(tensor.ggml_type),
         Some(repack::TQF_QUANT_PASSTHROUGH_Q4_0)
     );
 
     validate::validate_tensor(&file, tensor, &repacked).unwrap();
+}
+
+#[test]
+fn passthrough_repack_reserves_output_and_read_batch_before_allocating() {
+    let block_bytes = sample_q4_0_blocks(3);
+    let bytes = build_gguf_fixture("weight", &[96], 2, &block_bytes);
+    let path = write_fixture("repack-budget.gguf", &bytes);
+    let file = gguf::open(&path).unwrap();
+    let tensor = file.tensor("weight").unwrap();
+    let mut reader = file.quant_block_reader(tensor).unwrap();
+    let required = block_bytes.len() as u64 * 2;
+    let broker = MemoryBroker::new(Bytes(required - 1));
+
+    assert!(repack::repack_passthrough(&mut reader, &broker).is_err());
+    assert_eq!(broker.snapshot().reserved, Bytes(0));
 }
 
 #[test]
@@ -93,7 +114,7 @@ fn corrupted_repack_is_caught_with_precise_location() {
     let tensor = file.tensor("weight").unwrap();
 
     let mut reader = file.quant_block_reader(tensor).unwrap();
-    let mut repacked = repack::repack_passthrough(&mut reader).unwrap();
+    let mut repacked = repack::repack_passthrough(&mut reader, &broker()).unwrap();
     // Corrupt one nibble inside the second block (block 1, byte offset
     // 18 + 2 within that block's qs region).
     let corrupt_offset = 18 + 2; // block 1's qs[0] (block header is 2 bytes)

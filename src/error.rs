@@ -90,6 +90,14 @@ pub enum ModelError {
     UnsupportedTokenizerModel(String),
     #[error("failed to build tokenizer: {0}")]
     TokenizerBuild(String),
+    #[error("invalid {tensor} shape: expected {expected} elements, got {actual}")]
+    Shape {
+        tensor: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("full-attention layer {layer} reached configured context capacity {capacity}")]
+    ContextCapacity { layer: u8, capacity: usize },
 }
 
 /// On-disk format errors: GGUF import (spec Part XVI phase 5) and the

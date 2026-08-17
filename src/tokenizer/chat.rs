@@ -1,8 +1,9 @@
 //! Qwen chat-template rendering (spec §281 phase 9 golden-fixture list:
 //! "normal system/user/assistant; developer guidance; historical thinking
 //! if supported; tool definitions/results; vision placeholders;
-//! Unicode/byte fallback"). ChatML-style, matching the Qwen model family's
-//! own published template (`<|im_start|>role\n...<|im_end|>\n`),
+//! Unicode/byte fallback"). This is a native rendering of the pinned
+//! Qwen3.6 template's text/tool subset, including its XML function-call
+//! wire format and thinking prefix,
 //! reimplemented natively in Rust rather than interpreting the
 //! GGUF-embedded Jinja2 template string — a general Jinja engine
 //! dependency for one fixed model family's fixed template shape is out of
@@ -20,6 +21,8 @@ pub const TOOL_RESPONSE_START: &str = "<tool_response>";
 pub const TOOL_RESPONSE_END: &str = "</tool_response>";
 pub const THINK_START: &str = "<think>";
 pub const THINK_END: &str = "</think>";
+
+const TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
@@ -70,8 +73,8 @@ pub struct ChatMessage {
     pub content: Vec<ContentPart>,
     /// Reasoning content from a *prior, already-committed* assistant turn
     /// (spec: "historical thinking if supported"). The template never
-    /// generates a `<think>` opening tag for a *new* assistant turn —
-    /// that's the sampling loop's job once decoding actually starts.
+    /// generates a `<think>` opening tag for a *new* assistant turn; the
+    /// generation prompt below does that exactly as the pinned template does.
     pub thinking: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
@@ -111,35 +114,67 @@ pub fn render(messages: &[ChatMessage], tools: &[ToolSpec], add_generation_promp
     if !tools.is_empty() {
         out.push_str(IM_START);
         out.push_str("system\n");
-        if let Some(text) = &leading_system_text {
-            out.push_str(text);
-            out.push('\n');
-        }
-        out.push_str(
-            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n<tools>\n",
-        );
+        out.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
         for tool in tools {
-            out.push_str(&format!(
-                "{{\"name\": {:?}, \"description\": {:?}, \"parameters\": {}}}\n",
-                tool.name, tool.description, tool.parameters_json_schema
-            ));
+            let parameters =
+                serde_json::from_str::<serde_json::Value>(&tool.parameters_json_schema)
+                    .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+            let wire = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": parameters,
+                }
+            });
+            out.push('\n');
+            out.push_str(&wire.to_string());
         }
-        out.push_str("</tools>\n");
+        out.push_str("\n</tools>");
+        out.push_str(TOOL_INSTRUCTIONS);
+        if let Some(text) = &leading_system_text {
+            if !text.trim().is_empty() {
+                out.push_str("\n\n");
+                out.push_str(text.trim());
+            }
+        }
         out.push_str(IM_END);
         out.push('\n');
     }
 
     let skip_first = !tools.is_empty() && leading_system_text.is_some();
-    for (i, message) in messages.iter().enumerate() {
+    let mut i = 0;
+    while i < messages.len() {
+        let message = &messages[i];
         if i == 0 && skip_first {
+            i += 1;
+            continue;
+        }
+        if message.role == ChatRole::Tool {
+            out.push_str(IM_START);
+            out.push_str("user");
+            while i < messages.len() && messages[i].role == ChatRole::Tool {
+                out.push('\n');
+                out.push_str(TOOL_RESPONSE_START);
+                out.push('\n');
+                out.push_str(render_content(&messages[i].content).trim());
+                out.push('\n');
+                out.push_str(TOOL_RESPONSE_END);
+                i += 1;
+            }
+            out.push_str(IM_END);
+            out.push('\n');
             continue;
         }
         render_message(&mut out, message);
+        i += 1;
     }
 
     if add_generation_prompt {
         out.push_str(IM_START);
         out.push_str("assistant\n");
+        out.push_str(THINK_START);
+        out.push('\n');
     }
 
     out
@@ -150,13 +185,7 @@ fn render_message(out: &mut String, message: &ChatMessage) {
     out.push_str(message.role.wire_role());
     out.push('\n');
 
-    if message.role == ChatRole::Tool {
-        out.push_str(TOOL_RESPONSE_START);
-        out.push('\n');
-        out.push_str(&render_content(&message.content));
-        out.push('\n');
-        out.push_str(TOOL_RESPONSE_END);
-    } else {
+    if message.role != ChatRole::Tool {
         if let Some(thinking) = &message.thinking {
             out.push_str(THINK_START);
             out.push('\n');
@@ -165,16 +194,35 @@ fn render_message(out: &mut String, message: &ChatMessage) {
             out.push_str(THINK_END);
             out.push('\n');
         }
-        out.push_str(&render_content(&message.content));
-        for call in &message.tool_calls {
-            out.push('\n');
+        let content = render_content(&message.content);
+        let content = content.trim();
+        out.push_str(content);
+        for (index, call) in message.tool_calls.iter().enumerate() {
+            if index > 0 {
+                out.push('\n');
+            } else if !content.is_empty() {
+                out.push_str("\n\n");
+            }
             out.push_str(TOOL_CALL_START);
             out.push('\n');
-            out.push_str(&format!(
-                "{{\"name\": {:?}, \"arguments\": {}}}",
-                call.name, call.arguments_json
-            ));
-            out.push('\n');
+            out.push_str("<function=");
+            out.push_str(&call.name);
+            out.push_str(">\n");
+            if let Ok(serde_json::Value::Object(arguments)) =
+                serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            {
+                for (name, value) in arguments {
+                    out.push_str("<parameter=");
+                    out.push_str(&name);
+                    out.push_str(">\n");
+                    match value {
+                        serde_json::Value::String(value) => out.push_str(&value),
+                        value => out.push_str(&value.to_string()),
+                    }
+                    out.push_str("\n</parameter>\n");
+                }
+            }
+            out.push_str("</function>\n");
             out.push_str(TOOL_CALL_END);
         }
     }
@@ -222,7 +270,7 @@ mod tests {
     fn add_generation_prompt_opens_trailing_assistant_turn() {
         let messages = vec![ChatMessage::text(ChatRole::User, "Hi")];
         let rendered = render(&messages, &[], true);
-        assert!(rendered.ends_with("<|im_start|>assistant\n"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]
@@ -253,8 +301,9 @@ mod tests {
         let messages = vec![ChatMessage::text(ChatRole::User, "What's the weather?")];
         let rendered = render(&messages, &tools, false);
         assert!(rendered.contains("<tools>"));
-        assert!(rendered.contains("get_weather"));
+        assert!(rendered.contains("\"name\":\"get_weather\""));
         assert!(rendered.contains("</tools>"));
+        assert!(rendered.contains("<function=example_function_name>"));
     }
 
     #[test]
@@ -268,11 +317,30 @@ mod tests {
 
         let rendered = render(&[assistant, tool_result], &[], false);
         assert!(rendered.contains("<tool_call>"));
-        assert!(rendered.contains("get_weather"));
+        assert!(rendered.contains("<function=get_weather>"));
+        assert!(rendered.contains("<parameter=city>\nBoston\n</parameter>"));
         assert!(rendered.contains("</tool_call>"));
         assert!(rendered.contains("<tool_response>"));
         assert!(rendered.contains(r#"{"tempF":72}"#));
         assert!(rendered.contains("</tool_response>"));
+    }
+
+    #[test]
+    fn multiple_tool_calls_follow_the_pinned_single_newline_separator() {
+        let mut assistant = ChatMessage::text(ChatRole::Assistant, "planning");
+        assistant.tool_calls = vec![
+            ToolCall {
+                name: "first".to_string(),
+                arguments_json: "{}".to_string(),
+            },
+            ToolCall {
+                name: "second".to_string(),
+                arguments_json: "{}".to_string(),
+            },
+        ];
+        let rendered = render(&[assistant], &[], false);
+        assert!(rendered.contains("planning\n\n<tool_call>"));
+        assert!(rendered.contains("</tool_call>\n<tool_call>\n<function=second>"));
     }
 
     #[test]

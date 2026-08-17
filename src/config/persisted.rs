@@ -4,6 +4,7 @@
 //! can never corrupt the previously good config — the same transactional
 //! discipline the spec requires of model installation (Part V section 28).
 
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -51,8 +52,18 @@ pub fn atomic_write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, text.as_bytes())?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 //! Reference dequantizers for the GGML quant types the pinned canonical
 //! checkpoints actually use (spec §279 "source Q4 decoder"): Q4_0 (MTP
-//! checkpoint), Q4_K (language weights, "Q4_K_M"), Q8_0 (vision
+//! checkpoint), Q4_K/Q6_K (language weights, "Q4_K_M"), Q8_0 (vision
 //! projector). Faithful reimplementations of the public ggml/llama.cpp
 //! block layouts — this is interop with an external wire format (same
 //! posture as `format/gguf`), not copied proprietary code.
@@ -49,6 +49,7 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 
 pub const Q4_0_BLOCK_ELEMENTS: usize = 32;
 pub const Q4_K_BLOCK_ELEMENTS: usize = 256;
+pub const Q6_K_BLOCK_ELEMENTS: usize = 256;
 pub const Q8_0_BLOCK_ELEMENTS: usize = 32;
 
 /// `block_q4_0`: `ggml_half d` (2 bytes) + 16 bytes of packed nibbles.
@@ -129,6 +130,40 @@ pub fn dequantize_q4_k(block: &[u8]) -> [f32; Q4_K_BLOCK_ELEMENTS] {
     out
 }
 
+/// `block_q6_K`: 128 bytes of low nibbles, 64 bytes of packed high two-bit
+/// values, 16 signed per-16-value scales, then an f16 super-block scale.
+/// This layout is used by the canonical Q4_K_M LM head and must not be
+/// treated as Q4_K merely because both have 256-value blocks.
+pub fn dequantize_q6_k(block: &[u8]) -> [f32; Q6_K_BLOCK_ELEMENTS] {
+    debug_assert_eq!(block.len(), GgmlType::Q6K.block_bytes() as usize);
+    let ql = &block[..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208];
+    let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+    let mut out = [0.0; Q6_K_BLOCK_ELEMENTS];
+
+    // Matches ggml's `dequantize_row_q6_K`: two 128-value halves, each
+    // arranged as four interleaved 32-value groups.
+    for half in 0..2 {
+        let ql = &ql[half * 64..(half + 1) * 64];
+        let qh = &qh[half * 32..(half + 1) * 32];
+        let scales = &scales[half * 8..(half + 1) * 8];
+        let base = half * 128;
+        for index in 0..32 {
+            let scale_group = index / 16;
+            let q1 = ((ql[index] & 0x0f) | ((qh[index] & 0x03) << 4)) as i8 - 32;
+            let q2 = ((ql[index + 32] & 0x0f) | (((qh[index] >> 2) & 0x03) << 4)) as i8 - 32;
+            let q3 = ((ql[index] >> 4) | (((qh[index] >> 4) & 0x03) << 4)) as i8 - 32;
+            let q4 = ((ql[index + 32] >> 4) | (((qh[index] >> 6) & 0x03) << 4)) as i8 - 32;
+            out[base + index] = d * scales[scale_group] as i8 as f32 * q1 as f32;
+            out[base + index + 32] = d * scales[scale_group + 2] as i8 as f32 * q2 as f32;
+            out[base + index + 64] = d * scales[scale_group + 4] as i8 as f32 * q3 as f32;
+            out[base + index + 96] = d * scales[scale_group + 6] as i8 as f32 * q4 as f32;
+        }
+    }
+    out
+}
+
 /// Dispatches on `GgmlType`, returning `None` for types this repacker does
 /// not decode. The pinned checkpoints only use Q4_0/Q4_K/Q8_0 for
 /// quantized tensors; everything else the importer touches (F32/F16/BF16
@@ -138,6 +173,7 @@ pub fn dequantize_block(ggml_type: GgmlType, block: &[u8]) -> Option<Vec<f32>> {
     match ggml_type {
         GgmlType::Q4_0 => Some(dequantize_q4_0(block).to_vec()),
         GgmlType::Q4K => Some(dequantize_q4_k(block).to_vec()),
+        GgmlType::Q6K => Some(dequantize_q6_k(block).to_vec()),
         GgmlType::Q8_0 => Some(dequantize_q8_0(block).to_vec()),
         _ => None,
     }
@@ -205,6 +241,16 @@ mod tests {
         assert_eq!(out[0], 2.0); // first low-nibble group, element 0
         assert_eq!(out[32], 1.0); // first high-nibble group, element 0
         assert_eq!(out[1], 0.0); // qs[1] is zero
+    }
+
+    #[test]
+    fn dequantize_q6_k_known_zero_low_bits() {
+        let mut block = [0u8; 210];
+        block[192..208].fill(1); // signed group scale 1
+        block[208..210].copy_from_slice(&F16_ONE.to_le_bytes());
+        // ql/qh all zero encodes signed quant value -32 in every position.
+        let out = dequantize_q6_k(&block);
+        assert!(out.iter().all(|&value| value == -32.0));
     }
 
     #[test]

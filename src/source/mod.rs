@@ -2,8 +2,8 @@
 //! model bytes onto local disk — either by resumable HTTP range download
 //! from the pinned canonical source, or by accepting an already-local file
 //! (`tqf --model <path>`) — without parsing GGUF (phase 5) or touching the
-//! `.tqf` container (phase 6+). Later phases hold a `Box<dyn ModelSource>`
-//! and consume this module's output as their input.
+//! `.tqf` container (phase 6+). Setup consumes this module's verified
+//! artifact as the conversion transaction's input.
 //!
 //! `setup` calls into `source`, never the reverse (spec §112 phase map
 //! lists "Source resolver/downloader" as its own phase, distinct from
@@ -26,6 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SourceError};
+use crate::ids::Bytes;
+use crate::memory::{MemoryBroker, MemoryClass, MemoryOwner};
 use retry::{RetryOutcome, RetryPolicy};
 
 /// One backend TQF can pull model bytes from. Exactly the three the spec
@@ -128,6 +130,7 @@ pub async fn fetch_verified(
     ownership: SourceOwnership,
     dest_dir: &Path,
     options: FetchOptions,
+    broker: &MemoryBroker,
 ) -> Result<manifest::FetchedArtifact> {
     std::fs::create_dir_all(dest_dir)?;
     let metadata = source.metadata().clone();
@@ -148,10 +151,10 @@ pub async fn fetch_verified(
     }
 
     if let Some(local_path) = source.local_path() {
-        return fetch_local_in_place(local_path, &metadata, ownership, dest_dir);
+        return fetch_local_in_place(local_path, &metadata, ownership, dest_dir, broker);
     }
 
-    fetch_remote(source, &metadata, ownership, dest_dir, options).await
+    fetch_remote(source, &metadata, ownership, dest_dir, options, broker).await
 }
 
 fn fetch_local_in_place(
@@ -159,9 +162,10 @@ fn fetch_local_in_place(
     metadata: &SourceMetadata,
     ownership: SourceOwnership,
     dest_dir: &Path,
+    broker: &MemoryBroker,
 ) -> Result<manifest::FetchedArtifact> {
     let file_meta = std::fs::metadata(local_path).map_err(SourceError::LocalSourceUnavailable)?;
-    let sha256 = checksum::hex_digest_file(local_path)?;
+    let sha256 = checksum::hex_digest_file(local_path, broker)?;
 
     let artifact = manifest::FetchedArtifact::new(
         metadata.artifact_name.clone(),
@@ -182,6 +186,7 @@ async fn fetch_remote(
     ownership: SourceOwnership,
     dest_dir: &Path,
     options: FetchOptions,
+    broker: &MemoryBroker,
 ) -> Result<manifest::FetchedArtifact> {
     let total_size = metadata
         .size_bytes
@@ -244,6 +249,12 @@ async fn fetch_remote(
             continue;
         }
 
+        let chunk_lease = broker.reserve(
+            MemoryOwner::IoStaging,
+            MemoryClass::Transient,
+            Bytes(len),
+            64,
+        )?;
         let bytes = fetch_chunk_with_retry(source, offset, len, &options.retry_policy).await?;
         if bytes.len() as u64 != len {
             return Err(SourceError::ShortRead {
@@ -264,6 +275,7 @@ async fn fetch_remote(
             sha256: chunk_hash,
             verified_at_unix: unix_now(),
         })?;
+        drop(chunk_lease);
 
         offset += len;
     }
@@ -271,7 +283,7 @@ async fn fetch_remote(
     // The real correctness gate: one streaming whole-file hash pass, not
     // "the per-chunk checks all happened to pass" (spec §126: "A completed
     // extent is never trusted solely because its bytes exist").
-    let whole_file_sha256 = checksum::hex_digest_file(&part_path)?;
+    let whole_file_sha256 = checksum::hex_digest_file(&part_path, broker)?;
     if let Some(expected) = &metadata.expected_sha256 {
         if &whole_file_sha256 != expected {
             return Err(SourceError::ChecksumMismatch {
@@ -290,6 +302,9 @@ async fn fetch_remote(
     drop(writer);
 
     std::fs::rename(&part_path, &final_path)?;
+    if let Some(parent) = final_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
 
     let artifact = manifest::FetchedArtifact::new(
         metadata.artifact_name.clone(),
@@ -358,7 +373,7 @@ async fn write_chunk(path: &Path, offset: u64, bytes: bytes::Bytes) -> Result<()
     tokio::task::spawn_blocking(move || -> Result<()> {
         use std::os::unix::fs::FileExt;
         let file = std::fs::OpenOptions::new().write(true).open(&path)?;
-        file.write_at(&bytes, offset)?;
+        file.write_all_at(&bytes, offset)?;
         file.sync_all()?;
         Ok(())
     })

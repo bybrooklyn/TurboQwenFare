@@ -162,6 +162,19 @@ fn parses_minimal_valid_file() {
 }
 
 #[test]
+fn metadata_probe_requires_broker_admission_before_allocation() {
+    let bytes = GgufBuilder::new()
+        .tensor("weight", vec![32], 2, q4_0_block_of(0))
+        .build();
+    let path = write_fixture("metadata-budget.gguf", &bytes);
+    let broker = crate::memory::MemoryBroker::new(crate::ids::Bytes(1));
+
+    let error = gguf::open_with_broker(&path, &broker).unwrap_err();
+    assert!(matches!(error, crate::error::TqfError::Memory(_)));
+    assert_eq!(broker.snapshot().reserved, crate::ids::Bytes(0));
+}
+
+#[test]
 fn respects_custom_alignment_metadata() {
     let block = q4_0_block_of(0x11);
     let bytes = GgufBuilder::new()

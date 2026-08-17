@@ -1,0 +1,530 @@
+//! Qwen3.6 generation boundary shared by every HTTP protocol. This is not a
+//! multi-model abstraction: the only permitted implementation executes the
+//! fixed Qwen3.6 graph. Keeping its output shape here prevents OpenAI/SSE
+//! framing or tool-tag parsing from leaking into token-critical decode.
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
+
+use crate::error::{ProtocolError, Result, TqfError};
+use crate::experts::ExpertCacheStats;
+use crate::format::gguf;
+use crate::ids::Bytes;
+use crate::memory::MemoryBroker;
+use crate::model::qwen36::runtime::{Qwen36BoundedReferenceRuntime, Qwen36ReferenceRuntime};
+use crate::runtime::{NormalizedRequest, Role};
+use crate::tokenizer::chat::{self, ChatMessage, ChatRole, ToolSpec};
+use crate::tokenizer::chat::{THINK_END, THINK_START, TOOL_CALL_END, TOOL_CALL_START};
+use crate::tokenizer::TqfTokenizer;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedToolCall {
+    pub id: String,
+    pub name: String,
+    /// Kept in exact JSON text form for OpenAI compatibility and to avoid a
+    /// parse/serialize round trip changing caller-visible argument bytes.
+    pub arguments_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedOutput {
+    pub text: String,
+    pub tool_calls: Vec<GeneratedToolCall>,
+    pub finish_reason: &'static str,
+}
+
+impl GeneratedOutput {
+    /// Separates ordinary assistant text from complete Qwen `<tool_call>`
+    /// blocks. The pinned Qwen3.6 template emits XML function/parameter
+    /// blocks; the older JSON body is still accepted for stored transcripts.
+    /// Invalid payloads or an unmatched delimiter are a protocol error;
+    /// forwarding malformed calls to coding clients would be worse than a
+    /// visible failed generation.
+    pub fn from_model_text(text: impl Into<String>) -> Result<Self> {
+        let mut remaining = visible_after_thinking(text.into());
+        let mut plain = String::new();
+        let mut calls = Vec::new();
+        while let Some(start) = remaining.find(TOOL_CALL_START) {
+            plain.push_str(&remaining[..start]);
+            let after_start = &remaining[start + TOOL_CALL_START.len()..];
+            let end = after_start.find(TOOL_CALL_END).ok_or_else(|| {
+                ProtocolError::Invalid(
+                    "model emitted an unterminated <tool_call> block".to_string(),
+                )
+            })?;
+            let body = after_start[..end].trim();
+            calls.push(parse_tool_call(body, calls.len())?);
+            remaining = after_start[end + TOOL_CALL_END.len()..].to_string();
+        }
+        plain.push_str(&remaining);
+        let finish_reason = if calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        Ok(Self {
+            text: plain,
+            tool_calls: calls,
+            finish_reason,
+        })
+    }
+
+    /// Parses a continuation produced after the Qwen3.6 chat template has
+    /// already opened `<think>`. Until the model emits `</think>`, every byte
+    /// is private reasoning and must not reach a compatibility client.
+    fn from_qwen_continuation(text: String) -> Result<Self> {
+        if !text.contains(THINK_END) {
+            return Self::from_model_text("");
+        }
+        Self::from_model_text(text)
+    }
+}
+
+/// The generation prompt already opens `<think>`, so newly decoded text
+/// normally begins with reasoning and contains only the closing tag. Keep
+/// reasoning private from compatibility `content`; if a stored transcript
+/// includes the opening tag, the same rule applies.
+fn visible_after_thinking(text: String) -> String {
+    if let Some(end) = text.find(THINK_END) {
+        return text[end + THINK_END.len()..]
+            .trim_start_matches(['\r', '\n'])
+            .to_string();
+    }
+    text.strip_prefix(THINK_START)
+        .map(|text| text.trim_start_matches(['\r', '\n']).to_string())
+        .unwrap_or(text)
+}
+
+fn parse_tool_call(body: &str, index: usize) -> Result<GeneratedToolCall> {
+    if body.starts_with('{') {
+        let wire: ToolCallWire = serde_json::from_str(body).map_err(|error| {
+            ProtocolError::Invalid(format!("model emitted invalid tool-call JSON: {error}"))
+        })?;
+        return build_tool_call(index, wire.name, wire.arguments);
+    }
+
+    let function = body.strip_prefix("<function=").ok_or_else(|| {
+        ProtocolError::Invalid("model tool call is missing <function=name>".to_string())
+    })?;
+    let name_end = function.find('>').ok_or_else(|| {
+        ProtocolError::Invalid("model tool call has an unterminated function name".to_string())
+    })?;
+    let name = &function[..name_end];
+    let function_body = &function[name_end + 1..];
+    let function_end = function_body.rfind("</function>").ok_or_else(|| {
+        ProtocolError::Invalid("model tool call is missing </function>".to_string())
+    })?;
+    if !function_body[function_end + "</function>".len()..]
+        .trim()
+        .is_empty()
+    {
+        return Err(ProtocolError::Invalid(
+            "model tool call has content after </function>".to_string(),
+        )
+        .into());
+    }
+
+    let mut parameters = &function_body[..function_end];
+    let mut arguments = serde_json::Map::new();
+    loop {
+        parameters = parameters.trim_start_matches([' ', '\t', '\r', '\n']);
+        if parameters.is_empty() {
+            break;
+        }
+        let parameter = parameters.strip_prefix("<parameter=").ok_or_else(|| {
+            ProtocolError::Invalid("model tool call contains malformed parameters".to_string())
+        })?;
+        let parameter_name_end = parameter.find('>').ok_or_else(|| {
+            ProtocolError::Invalid("model tool call has an unterminated parameter name".to_string())
+        })?;
+        let parameter_name = parameter[..parameter_name_end].trim();
+        if parameter_name.is_empty() || arguments.contains_key(parameter_name) {
+            return Err(ProtocolError::Invalid(
+                "model tool call has an empty or duplicate parameter name".to_string(),
+            )
+            .into());
+        }
+        let value_and_rest = parameter[parameter_name_end + 1..]
+            .strip_prefix("\r\n")
+            .or_else(|| parameter[parameter_name_end + 1..].strip_prefix('\n'))
+            .unwrap_or(&parameter[parameter_name_end + 1..]);
+        let close = value_and_rest.find("</parameter>").ok_or_else(|| {
+            ProtocolError::Invalid(format!(
+                "model tool call parameter {parameter_name} is unterminated"
+            ))
+        })?;
+        let raw_value = value_and_rest[..close]
+            .trim_end_matches(['\r', '\n'])
+            .trim();
+        let value = serde_json::from_str(raw_value)
+            .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
+        arguments.insert(parameter_name.to_string(), value);
+        parameters = &value_and_rest[close + "</parameter>".len()..];
+    }
+    build_tool_call(
+        index,
+        name.to_string(),
+        serde_json::Value::Object(arguments),
+    )
+}
+
+fn build_tool_call(
+    index: usize,
+    name: String,
+    arguments: serde_json::Value,
+) -> Result<GeneratedToolCall> {
+    if name.trim().is_empty() {
+        return Err(ProtocolError::Invalid(
+            "model emitted a tool call with an empty name".to_string(),
+        )
+        .into());
+    }
+    Ok(GeneratedToolCall {
+        id: format!("call_{index}"),
+        name,
+        arguments_json: serde_json::to_string(&arguments).expect("JSON value serializes"),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallWire {
+    name: String,
+    arguments: serde_json::Value,
+}
+
+/// Qwen-specific model session, supplied after a trusted converted model has
+/// loaded. It receives only normalized requests; no HTTP protocol is visible
+/// to this boundary.
+#[async_trait]
+pub trait Qwen36Generator: Send + Sync {
+    async fn generate(
+        &self,
+        request: NormalizedRequest,
+        cancellation: CancellationToken,
+    ) -> Result<GeneratedOutput>;
+}
+
+/// An actual, fixed-graph Qwen3.6 generator for the high-memory resident
+/// reference profile.  It is intentionally separate from the default server
+/// path: Phase 14 makes this oracle useful for parity, while Phase 18 is what
+/// makes the same graph fit the normal bounded-memory product contract.
+pub struct Qwen36ResidentReferenceGenerator {
+    tokenizer: Mutex<TqfTokenizer>,
+    // Retains the conservative GGUF metadata/tokenizer allocation envelope
+    // for as long as the derived tokenizer is live.
+    _tokenizer_source: gguf::GgufFile,
+    runtime: Arc<Mutex<QwenRuntimeInstance>>,
+    max_context: usize,
+}
+
+enum QwenRuntimeInstance {
+    Resident(Qwen36ReferenceRuntime),
+    Bounded(Qwen36BoundedReferenceRuntime),
+}
+
+impl QwenRuntimeInstance {
+    fn decode_greedy(&mut self, token: u32) -> Result<crate::runtime::DecodeToken> {
+        match self {
+            Self::Resident(runtime) => runtime.decode_greedy(token),
+            Self::Bounded(runtime) => runtime.decode_greedy(token),
+        }
+    }
+
+    fn reset_session(&mut self) {
+        match self {
+            Self::Resident(runtime) => runtime.reset_session(),
+            Self::Bounded(runtime) => runtime.reset_session(),
+        }
+    }
+
+    fn expert_cache_stats(&self) -> Option<ExpertCacheStats> {
+        match self {
+            Self::Resident(runtime) => runtime.expert_cache_stats(),
+            Self::Bounded(runtime) => Some(runtime.expert_cache_stats()),
+        }
+    }
+}
+
+const DEV_DECODE_DIAGNOSTICS_ENV: &str = "TQF_DEV_DECODE_DIAGNOSTICS";
+
+fn emit_decode_diagnostics(
+    input_token: u32,
+    decoded: &crate::runtime::DecodeToken,
+    cache_before: Option<ExpertCacheStats>,
+    cache_after: Option<ExpertCacheStats>,
+) {
+    if std::env::var(DEV_DECODE_DIAGNOSTICS_ENV).as_deref() != Ok("1") {
+        return;
+    }
+    let timings = &decoded.diagnostics.timings;
+    let layer_time = timings
+        .layers
+        .iter()
+        .map(|(_, duration)| *duration)
+        .sum::<std::time::Duration>();
+    let raw_miss_bytes = cache_before
+        .zip(cache_after)
+        .map(|(before, after)| {
+            after
+                .raw_miss_bytes
+                .0
+                .saturating_sub(before.raw_miss_bytes.0)
+        })
+        .unwrap_or(0);
+    tracing::info!(
+        input_token,
+        output_token = decoded.token,
+        embedding_ms = timings.embedding.as_secs_f64() * 1000.0,
+        layers_ms = layer_time.as_secs_f64() * 1000.0,
+        final_norm_ms = timings.final_norm.as_secs_f64() * 1000.0,
+        lm_head_ms = timings.lm_head.as_secs_f64() * 1000.0,
+        sampling_ms = timings.sampling.as_secs_f64() * 1000.0,
+        raw_expert_miss_bytes = raw_miss_bytes,
+        "Qwen3.6 greedy decode diagnostics"
+    );
+    for layer in &decoded.diagnostics.per_layer_hashes {
+        tracing::info!(
+            layer = layer.layer.0,
+            hash = %layer.hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "Qwen3.6 layer hash"
+        );
+    }
+    for route in &decoded.diagnostics.router_trace {
+        tracing::info!(
+            layer = route.layer.0,
+            expert_ids = ?route.route.ids.map(|expert| expert.0),
+            weights = ?route.route.weights,
+            "Qwen3.6 exact router trace"
+        );
+    }
+}
+
+impl Qwen36ResidentReferenceGenerator {
+    pub fn open(
+        tqf_path: &Path,
+        tokenizer_gguf_path: &Path,
+        memory_budget: Bytes,
+        max_context: usize,
+    ) -> Result<Self> {
+        let broker = MemoryBroker::new(memory_budget);
+        let gguf = gguf::open_with_broker(tokenizer_gguf_path, &broker)?;
+        let tokenizer = TqfTokenizer::from_gguf(&gguf)?;
+        let runtime = Qwen36ReferenceRuntime::open_resident(tqf_path, broker, max_context)?;
+        Ok(Self {
+            tokenizer: Mutex::new(tokenizer),
+            _tokenizer_source: gguf,
+            runtime: Arc::new(Mutex::new(QwenRuntimeInstance::Resident(runtime))),
+            max_context,
+        })
+    }
+
+    /// Opens the same protocol adapter over the whole-expert streaming
+    /// reference graph. The historical type name is retained so callers have
+    /// one fixed Qwen generator surface; this profile does not pin routed
+    /// expert tensors.
+    pub fn open_streaming(
+        tqf_path: &Path,
+        tokenizer_gguf_path: &Path,
+        memory_budget: Bytes,
+        max_context: usize,
+        expert_cache_bytes: Bytes,
+    ) -> Result<Self> {
+        let broker = MemoryBroker::new(memory_budget);
+        let gguf = gguf::open_with_broker(tokenizer_gguf_path, &broker)?;
+        let tokenizer = TqfTokenizer::from_gguf(&gguf)?;
+        let runtime =
+            Qwen36BoundedReferenceRuntime::open(tqf_path, broker, max_context, expert_cache_bytes)?;
+        Ok(Self {
+            tokenizer: Mutex::new(tokenizer),
+            _tokenizer_source: gguf,
+            runtime: Arc::new(Mutex::new(QwenRuntimeInstance::Bounded(runtime))),
+            max_context,
+        })
+    }
+
+    fn prompt_tokens(&self, request: &NormalizedRequest) -> Result<Vec<u32>> {
+        if !request.vision.is_empty() {
+            return Err(ProtocolError::Invalid(
+                "vision inputs require the later vision execution path".to_string(),
+            )
+            .into());
+        }
+        let messages = request
+            .messages
+            .iter()
+            .map(|message| {
+                let mut rendered = ChatMessage::text(
+                    match message.role {
+                        Role::System => ChatRole::System,
+                        Role::User => ChatRole::User,
+                        Role::Assistant => ChatRole::Assistant,
+                        Role::Tool => ChatRole::Tool,
+                    },
+                    message.content.clone(),
+                );
+                rendered.tool_calls = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| chat::ToolCall {
+                        name: call.name.clone(),
+                        arguments_json: call.arguments_json.clone(),
+                    })
+                    .collect();
+                rendered
+            })
+            .collect::<Vec<_>>();
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| ToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters_json_schema: tool.parameters_json_schema.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.tokenizer
+            .lock()
+            .expect("tokenizer mutex poisoned")
+            .encode(&chat::render(&messages, &tools, true), false)
+    }
+}
+
+#[async_trait]
+impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
+    async fn generate(
+        &self,
+        request: NormalizedRequest,
+        cancellation: CancellationToken,
+    ) -> Result<GeneratedOutput> {
+        let prompt = self.prompt_tokens(&request)?;
+        if prompt.is_empty() {
+            return Err(ProtocolError::Invalid("empty tokenized prompt".to_string()).into());
+        }
+        let maximum = request.sampling.max_output_tokens.unwrap_or(256).min(256) as usize;
+        if prompt.len().saturating_add(maximum) > self.max_context {
+            return Err(ProtocolError::Invalid(format!(
+                "tokenized prompt ({}) plus requested output ({maximum}) exceeds context limit {}",
+                prompt.len(),
+                self.max_context
+            ))
+            .into());
+        }
+        if maximum == 0 {
+            return GeneratedOutput::from_model_text("");
+        }
+        let eos = self
+            .tokenizer
+            .lock()
+            .expect("tokenizer mutex poisoned")
+            .eos_token_id;
+        let runtime = Arc::clone(&self.runtime);
+        let cancellation_for_decode = cancellation.clone();
+        let (generated, reached_eos) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u32>, bool)> {
+                let mut runtime = runtime.lock().expect("Qwen runtime mutex poisoned");
+                runtime.reset_session();
+                let mut next = 0;
+                for token in prompt {
+                    if cancellation_for_decode.is_cancelled() {
+                        return Err(TqfError::Cancelled);
+                    }
+                    let cache_before = runtime.expert_cache_stats();
+                    let decoded = runtime.decode_greedy(token)?;
+                    let cache_after = runtime.expert_cache_stats();
+                    emit_decode_diagnostics(token, &decoded, cache_before, cache_after);
+                    next = decoded.token;
+                }
+                let mut output = Vec::with_capacity(maximum);
+                let mut reached_eos = false;
+                for _ in 0..maximum {
+                    if cancellation_for_decode.is_cancelled() {
+                        return Err(TqfError::Cancelled);
+                    }
+                    output.push(next);
+                    if Some(next) == eos {
+                        reached_eos = true;
+                        break;
+                    }
+                    let input = next;
+                    let cache_before = runtime.expert_cache_stats();
+                    let decoded = runtime.decode_greedy(input)?;
+                    let cache_after = runtime.expert_cache_stats();
+                    emit_decode_diagnostics(input, &decoded, cache_before, cache_after);
+                    next = decoded.token;
+                }
+                Ok((output, reached_eos))
+            })
+            .await
+            .map_err(|error| {
+                TqfError::Internal(crate::error::InternalError {
+                    incident_id: format!("resident-reference-generate-{error}"),
+                    message: "reference decode worker panicked or was cancelled".to_string(),
+                })
+            })??;
+        let text = self
+            .tokenizer
+            .lock()
+            .expect("tokenizer mutex poisoned")
+            .decode(&generated, true)?;
+        let mut output = GeneratedOutput::from_qwen_continuation(text)?;
+        if !reached_eos && output.finish_reason == "stop" {
+            output.finish_reason = "length";
+        }
+        Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_tool_calls_and_preserves_plain_assistant_text() {
+        let output = GeneratedOutput::from_model_text(
+            "Working.<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.rs\"}}</tool_call>Done.",
+        )
+        .unwrap();
+        assert_eq!(output.text, "Working.Done.");
+        assert_eq!(output.finish_reason, "tool_calls");
+        assert_eq!(output.tool_calls[0].name, "read_file");
+        assert_eq!(output.tool_calls[0].arguments_json, r#"{"path":"a.rs"}"#);
+    }
+
+    #[test]
+    fn extracts_canonical_qwen_xml_tool_calls_and_hides_thinking() {
+        let output = GeneratedOutput::from_model_text(
+            "private reasoning\n</think>\n\nWorking.\n<tool_call>\n<function=read_file>\n<parameter=path>\nCargo.toml\n</parameter>\n<parameter=line>\n12\n</parameter>\n</function>\n</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(output.text.trim(), "Working.");
+        assert_eq!(output.finish_reason, "tool_calls");
+        assert_eq!(output.tool_calls[0].name, "read_file");
+        assert_eq!(
+            output.tool_calls[0].arguments_json,
+            r#"{"path":"Cargo.toml","line":12}"#
+        );
+    }
+
+    #[test]
+    fn hides_an_incomplete_qwen_reasoning_continuation() {
+        let output = GeneratedOutput::from_qwen_continuation(
+            "private reasoning that reached the output limit".to_string(),
+        )
+        .unwrap();
+        assert_eq!(output.text, "");
+        assert!(output.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn rejects_unterminated_or_invalid_tool_calls() {
+        assert!(GeneratedOutput::from_model_text("<tool_call>{}").is_err());
+        assert!(GeneratedOutput::from_model_text("<tool_call>wat</tool_call>").is_err());
+        assert!(GeneratedOutput::from_model_text(
+            "<tool_call><function=x><parameter=a>1</function></tool_call>"
+        )
+        .is_err());
+    }
+}

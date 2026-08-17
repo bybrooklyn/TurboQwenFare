@@ -6,5 +6,7 @@ mod reader;
 mod tests;
 mod value;
 
-pub use reader::{open, GgufFile, QuantBlockReader, TensorDescriptor};
+#[cfg(test)]
+pub use reader::open;
+pub use reader::{open_with_broker, GgufFile, QuantBlockReader, TensorDescriptor};
 pub use value::GgufValue;

@@ -7,22 +7,12 @@
 //! classified" — `generate_inventory` does exactly that rather than
 //! silently skipping unknown tensors.
 //!
-//! **Known limitation, stated plainly:** this environment has never
-//! downloaded the real 20+ GB canonical checkpoint (see
-//! `docs/research/canonical-source-manifest.md` — the pin is resolved, but
-//! fetching 20GB wasn't part of this research pass), so the *actual*
-//! on-disk tensor names `ggml-org`'s conversion uses are not independently
-//! confirmed here. Classification below is grounded in two sources only:
-//! (1) the exact Transformers-style names spec §117 quotes directly
-//! (`q_proj`, `in_proj_qkv`, `gate`/`up`/`down`, ...), and (2) llama.cpp's
-//! well-established GGUF naming convention for embedding/norm/full-
-//! attention/MoE-expert tensors (`token_embd`, `output_norm`, `attn_q`,
-//! `ffn_gate_exps`, ...) — standard across essentially all llama.cpp
-//! conversions, not specific to this model. Gated DeltaNet's *llama.cpp*
-//! names are not confirmed by either source; only the Transformers-style
-//! GDN names are recognized here. Running this generator against the real
-//! file (once downloaded) is expected to surface new patterns to add —
-//! that's the generator doing its job, not a bug in it.
+//! The canonical language checkpoint's actual GGUF names are verified from
+//! the `ggml-org` conversion log pinned in
+//! `docs/research/canonical-source-manifest.md`: GDN uses
+//! `attn_qkv`/`attn_gate` plus `ssm_*`, while shared MoE tensors use the
+//! `*_shexp` suffix. Transformer-style aliases remain accepted only for an
+//! explicit local `--model` import; they do not weaken canonical validation.
 
 use std::path::Path;
 
@@ -34,7 +24,8 @@ use crate::format::quant::GgmlType;
 use crate::format::tqf::TqfSectionKind;
 use crate::ids::LayerId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
 pub enum TensorRole {
     TokenEmbedding,
     FinalNorm,
@@ -64,6 +55,10 @@ pub enum TensorRole {
     RoutedExpertUp,
     RoutedExpertDown,
     FfnNorm,
+    /// Scalar gate that mixes the shared expert into the MoE output. This is
+    /// distinct from the shared expert's own SiLU gate matrix. Appended so
+    /// pre-existing serialized role IDs remain stable.
+    SharedExpertInputGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,8 +167,10 @@ fn classify(name: &str) -> Option<Classification> {
         return c(T::AttnNorm, R::ResidentCore, K::Norm, S::ResidentCore);
     }
 
-    // Gated DeltaNet — Transformers-style names only, per module doc.
-    if name.ends_with("in_proj_qkv.weight") {
+    // Gated DeltaNet. `blk.N.attn_qkv`/`attn_gate` and `ssm_*` are the
+    // actual ggml-org Qwen3.6 language-GGUF names; the aliases preserve the
+    // source-model names documented in spec §117 for local imports.
+    if name.ends_with("in_proj_qkv.weight") || name.ends_with("attn_qkv.weight") {
         return c(
             T::GdnInProjQkv,
             R::ResidentCore,
@@ -181,7 +178,7 @@ fn classify(name: &str) -> Option<Classification> {
             S::ResidentCore,
         );
     }
-    if name.ends_with("in_proj_z.weight") {
+    if name.ends_with("in_proj_z.weight") || name.ends_with("attn_gate.weight") {
         return c(
             T::GdnInProjZ,
             R::ResidentCore,
@@ -189,7 +186,7 @@ fn classify(name: &str) -> Option<Classification> {
             S::ResidentCore,
         );
     }
-    if name.ends_with("in_proj_a.weight") {
+    if name.ends_with("in_proj_a.weight") || name.ends_with("ssm_alpha.weight") {
         return c(
             T::GdnInProjA,
             R::ResidentCore,
@@ -197,7 +194,7 @@ fn classify(name: &str) -> Option<Classification> {
             S::ResidentCore,
         );
     }
-    if name.ends_with("in_proj_b.weight") {
+    if name.ends_with("in_proj_b.weight") || name.ends_with("ssm_beta.weight") {
         return c(
             T::GdnInProjB,
             R::ResidentCore,
@@ -205,7 +202,7 @@ fn classify(name: &str) -> Option<Classification> {
             S::ResidentCore,
         );
     }
-    if name.ends_with("conv1d.weight") {
+    if name.ends_with("conv1d.weight") || name.ends_with("ssm_conv1d.weight") {
         return c(
             T::GdnConv1d,
             R::ResidentCore,
@@ -213,7 +210,7 @@ fn classify(name: &str) -> Option<Classification> {
             S::ResidentCore,
         );
     }
-    if name.ends_with("A_log") {
+    if name.ends_with("A_log") || name.ends_with("ssm_a") {
         return c(
             T::GdnALog,
             R::ResidentCore,
@@ -221,7 +218,7 @@ fn classify(name: &str) -> Option<Classification> {
             S::ResidentCore,
         );
     }
-    if name.ends_with("dt_bias") {
+    if name.ends_with("dt_bias") || name.ends_with("ssm_dt.bias") {
         return c(
             T::GdnDtBias,
             R::ResidentCore,
@@ -229,7 +226,7 @@ fn classify(name: &str) -> Option<Classification> {
             S::ResidentCore,
         );
     }
-    if name.ends_with("gated_norm.weight") {
+    if name.ends_with("gated_norm.weight") || name.ends_with("ssm_norm.weight") {
         return c(
             T::GdnGatedNorm,
             R::ResidentCore,
@@ -237,7 +234,7 @@ fn classify(name: &str) -> Option<Classification> {
             S::ResidentCore,
         );
     }
-    if name.ends_with("out_proj.weight") {
+    if name.ends_with("out_proj.weight") || name.ends_with("ssm_out.weight") {
         return c(
             T::GdnOutProj,
             R::ResidentCore,
@@ -247,10 +244,20 @@ fn classify(name: &str) -> Option<Classification> {
     }
 
     // Router / experts.
-    if name.contains("ffn_gate_inp") || name.ends_with("mlp.gate.weight") {
+    if (name.contains("ffn_gate_inp") && !name.contains("_shexp"))
+        || name.ends_with("mlp.gate.weight")
+    {
         return c(T::RouterGate, R::ResidentCore, K::Router, S::ResidentCore);
     }
-    if name.contains("shared_expert") {
+    if name.contains("shared_expert") || name.contains("_shexp") {
+        if name.contains("gate_inp") {
+            return c(
+                T::SharedExpertInputGate,
+                R::ResidentCore,
+                K::Expert,
+                S::ResidentCore,
+            );
+        }
         if name.contains("gate") {
             return c(
                 T::SharedExpertGate,
@@ -300,7 +307,10 @@ fn classify(name: &str) -> Option<Classification> {
             S::RoutedExperts,
         );
     }
-    if name.ends_with("ffn_norm.weight") || name.ends_with("post_attention_layernorm.weight") {
+    if name.ends_with("ffn_norm.weight")
+        || name.ends_with("post_attention_norm.weight")
+        || name.ends_with("post_attention_layernorm.weight")
+    {
         return c(T::FfnNorm, R::ResidentCore, K::Norm, S::ResidentCore);
     }
 
@@ -321,8 +331,7 @@ fn extract_layer_index(name: &str) -> Option<LayerId> {
 /// Reads `gguf_path`'s tensor descriptors and classifies every one. Fails
 /// on the first tensor that doesn't match a known role (spec §118) rather
 /// than silently dropping it from the inventory.
-pub fn generate_inventory(gguf_path: &Path) -> Result<Vec<TensorInventoryEntry>> {
-    let file = gguf::open(gguf_path)?;
+pub fn generate_inventory_from_file(file: &gguf::GgufFile) -> Result<Vec<TensorInventoryEntry>> {
     let mut entries = Vec::with_capacity(file.tensors.len());
     for tensor in &file.tensors {
         let classification = classify(&tensor.name)
@@ -340,6 +349,12 @@ pub fn generate_inventory(gguf_path: &Path) -> Result<Vec<TensorInventoryEntry>>
         });
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+pub fn generate_inventory(gguf_path: &Path) -> Result<Vec<TensorInventoryEntry>> {
+    let file = gguf::open(gguf_path)?;
+    generate_inventory_from_file(&file)
 }
 
 /// Serializes `entries` as pretty JSON, writes it to `path`, and returns a
@@ -388,6 +403,31 @@ mod tests {
             "model.layers.0.mlp.shared_expert.down_proj.weight",
         ] {
             assert!(classify(name).is_some(), "expected {name:?} to classify");
+        }
+    }
+
+    #[test]
+    fn canonical_ggml_qwen36_gdn_and_shared_expert_names_are_classified() {
+        let expected = [
+            ("blk.0.attn_qkv.weight", TensorRole::GdnInProjQkv),
+            ("blk.0.attn_gate.weight", TensorRole::GdnInProjZ),
+            ("blk.0.ssm_alpha.weight", TensorRole::GdnInProjA),
+            ("blk.0.ssm_beta.weight", TensorRole::GdnInProjB),
+            ("blk.0.ssm_conv1d.weight", TensorRole::GdnConv1d),
+            ("blk.0.ssm_a", TensorRole::GdnALog),
+            ("blk.0.ssm_dt.bias", TensorRole::GdnDtBias),
+            ("blk.0.ssm_norm.weight", TensorRole::GdnGatedNorm),
+            ("blk.0.ssm_out.weight", TensorRole::GdnOutProj),
+            (
+                "blk.0.ffn_gate_inp_shexp.weight",
+                TensorRole::SharedExpertInputGate,
+            ),
+            ("blk.0.ffn_gate_shexp.weight", TensorRole::SharedExpertGate),
+            ("blk.0.ffn_up_shexp.weight", TensorRole::SharedExpertUp),
+            ("blk.0.ffn_down_shexp.weight", TensorRole::SharedExpertDown),
+        ];
+        for (name, role) in expected {
+            assert_eq!(classify(name).unwrap().role, role, "{name}");
         }
     }
 
@@ -583,6 +623,70 @@ mod tests {
             std::fs::read(&out_a).unwrap(),
             std::fs::read(&out_b).unwrap()
         );
+    }
+
+    /// Real-checkpoint qualification seam. It is ignored because the
+    /// canonical GGUF is intentionally not a repository fixture; point it at
+    /// the verified download with `TQF_CANONICAL_GGUF`.
+    #[test]
+    #[ignore]
+    fn canonical_checkpoint_inventory_matches_the_fixed_graph() {
+        let path = std::env::var_os("TQF_CANONICAL_GGUF")
+            .map(std::path::PathBuf::from)
+            .expect("set TQF_CANONICAL_GGUF to the pinned language GGUF");
+        let entries = generate_inventory(&path).unwrap();
+        assert_eq!(entries.len(), 733);
+        assert!(entries.iter().all(|entry| {
+            crate::format::quant::repack::tqf_quant_layout_id(entry.source_quant).is_some()
+        }));
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| {
+                    entry.layer == Some(0)
+                        && entry.logical_role == TensorRole::SharedExpertInputGate
+                })
+                .expect("layer 0 shared-expert input gate")
+                .shape,
+            vec![2048],
+            "canonical GGUF squeezes the single-output shared gate to rank 1"
+        );
+
+        for layer in 0..crate::model::qwen36::geometry::Qwen36Geometry::NUM_LAYERS {
+            let layer_entries = entries
+                .iter()
+                .filter(|entry| entry.layer == Some(layer as u8))
+                .collect::<Vec<_>>();
+            let expected = match crate::model::qwen36::geometry::Qwen36Geometry::layer_kind(
+                LayerId(layer as u8),
+            ) {
+                crate::ids::LayerKind::GatedDeltaNet => 19,
+                crate::ids::LayerKind::FullAttention => 16,
+            };
+            assert_eq!(layer_entries.len(), expected, "layer {layer}");
+
+            for role in [
+                TensorRole::AttnNorm,
+                TensorRole::FfnNorm,
+                TensorRole::RouterGate,
+                TensorRole::SharedExpertInputGate,
+                TensorRole::SharedExpertGate,
+                TensorRole::SharedExpertUp,
+                TensorRole::SharedExpertDown,
+                TensorRole::RoutedExpertGate,
+                TensorRole::RoutedExpertUp,
+                TensorRole::RoutedExpertDown,
+            ] {
+                assert_eq!(
+                    layer_entries
+                        .iter()
+                        .filter(|entry| entry.logical_role == role)
+                        .count(),
+                    1,
+                    "layer {layer} role {role:?}"
+                );
+            }
+        }
     }
 
     /// Regenerates the committed `dev/generated/qwen36_tensor_inventory.json`

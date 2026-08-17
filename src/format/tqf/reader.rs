@@ -12,7 +12,8 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{ContainerError, Result};
-use crate::ids::{ExpertId, LayerId};
+use crate::ids::{Bytes, ExpertId, LayerId};
+use crate::memory::{MemoryBroker, MemoryClass, MemoryLease, MemoryOwner};
 
 use super::records::{
     read_string_at, ChecksumEntry, ExpertIndexRecord, ExpertTileRecord, SectionRecord,
@@ -34,10 +35,11 @@ pub struct TqfReader {
     experts: Vec<ExpertIndexRecord>,
     tiles: Vec<ExpertTileRecord>,
     checksums: Vec<ChecksumEntry>,
+    _metadata_lease: MemoryLease,
 }
 
 impl TqfReader {
-    pub fn open_validated(path: &Path) -> Result<Self> {
+    pub fn open_validated_with_broker(path: &Path, broker: &MemoryBroker) -> Result<Self> {
         let file_len = std::fs::metadata(path)?.len();
         let file = File::open(path)?;
 
@@ -60,22 +62,41 @@ impl TqfReader {
             .into());
         }
 
+        let section_table_bytes = (superblock.section_count as u64)
+            .checked_mul(SECTION_RECORD_SIZE as u64)
+            .ok_or(ContainerError::IntegerOverflow)?;
+        let extent_table_bytes = superblock
+            .extent_count
+            .checked_mul(TENSOR_EXTENT_RECORD_SIZE as u64)
+            .ok_or(ContainerError::IntegerOverflow)?;
+        let metadata_raw_bytes = section_table_bytes
+            .checked_add(extent_table_bytes)
+            .and_then(|total| total.checked_add(superblock.string_table_bytes))
+            .and_then(|total| total.checked_add(superblock.expert_index_bytes))
+            .and_then(|total| total.checked_add(superblock.checksum_table_bytes))
+            .ok_or(ContainerError::IntegerOverflow)?;
+        let metadata_envelope = metadata_raw_bytes
+            .checked_mul(2)
+            .ok_or(ContainerError::IntegerOverflow)?
+            .max(1);
+        let metadata_lease = broker.reserve(
+            MemoryOwner::Core,
+            MemoryClass::Fixed,
+            Bytes(metadata_envelope),
+            64,
+        )?;
+
         let section_table = read_table(
             &file,
             superblock.section_table_offset,
-            (superblock.section_count as u64)
-                .checked_mul(SECTION_RECORD_SIZE as u64)
-                .ok_or(ContainerError::IntegerOverflow)?,
+            section_table_bytes,
             file_len,
             "section table",
         )?;
         let extent_table = read_table(
             &file,
             superblock.extent_table_offset,
-            superblock
-                .extent_count
-                .checked_mul(TENSOR_EXTENT_RECORD_SIZE as u64)
-                .ok_or(ContainerError::IntegerOverflow)?,
+            extent_table_bytes,
             file_len,
             "extent table",
         )?;
@@ -224,7 +245,16 @@ impl TqfReader {
             experts,
             tiles,
             checksums,
+            _metadata_lease: metadata_lease,
         })
+    }
+
+    /// Unit-test convenience. Product paths must supply the process-wide
+    /// broker through `open_validated_with_broker`.
+    #[cfg(test)]
+    pub fn open_validated(path: &Path) -> Result<Self> {
+        let broker = MemoryBroker::new(Bytes(256 * 1024 * 1024));
+        Self::open_validated_with_broker(path, &broker)
     }
 
     /// `role_id`/`layer` per the taskbook's `TqfReader::tensor(role/layer)`
@@ -267,20 +297,68 @@ impl TqfReader {
 
     /// Reads one tensor's raw bytes and verifies them against the
     /// checksum table before returning them.
+    #[cfg(test)]
     pub fn read_extent_bytes(&self, extent: &TensorExtentRecord) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; extent.stored_bytes as usize];
-        self.file.read_exact_at(&mut buf, extent.file_offset)?;
-        self.verify_checksum(extent.checksum_index, &buf)?;
+        let len: usize = extent
+            .stored_bytes
+            .try_into()
+            .map_err(|_| ContainerError::IntegerOverflow)?;
+        let mut buf = vec![0u8; len];
+        self.read_extent_into(extent, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Reads a tensor into caller-owned storage and verifies its checksum.
+    /// Runtime callers reserve this destination with the memory broker before
+    /// allocating it; this low-level reader never guesses at a memory budget.
+    pub fn read_extent_into(
+        &self,
+        extent: &TensorExtentRecord,
+        destination: &mut [u8],
+    ) -> Result<()> {
+        let expected: usize = extent
+            .stored_bytes
+            .try_into()
+            .map_err(|_| ContainerError::IntegerOverflow)?;
+        if destination.len() != expected {
+            return Err(ContainerError::MalformedRecord {
+                table: "tensor extent destination length",
+            }
+            .into());
+        }
+        self.file.read_exact_at(destination, extent.file_offset)?;
+        self.verify_checksum(extent.checksum_index, destination)
     }
 
     /// Reads one expert's raw (gate_up + down) bytes and verifies them
     /// against the checksum table before returning them.
+    #[cfg(test)]
     pub fn read_expert_bytes(&self, idx: &ExpertIndexRecord) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; idx.stored_bytes as usize];
-        self.file.read_exact_at(&mut buf, idx.file_offset)?;
-        self.verify_checksum(idx.checksum_index, &buf)?;
+        let len: usize = idx
+            .stored_bytes
+            .try_into()
+            .map_err(|_| ContainerError::IntegerOverflow)?;
+        let mut buf = vec![0u8; len];
+        self.read_expert_into(idx, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Reads one whole-expert superextent into caller-owned storage and
+    /// verifies its checksum. Runtime cache misses must reserve this exact
+    /// destination with the memory broker before allocating it.
+    pub fn read_expert_into(&self, idx: &ExpertIndexRecord, destination: &mut [u8]) -> Result<()> {
+        let expected: usize = idx
+            .stored_bytes
+            .try_into()
+            .map_err(|_| ContainerError::IntegerOverflow)?;
+        if destination.len() != expected {
+            return Err(ContainerError::MalformedRecord {
+                table: "expert superextent destination length",
+            }
+            .into());
+        }
+        self.file.read_exact_at(destination, idx.file_offset)?;
+        self.verify_checksum(idx.checksum_index, destination)
     }
 
     fn verify_checksum(&self, index: u32, data: &[u8]) -> Result<()> {

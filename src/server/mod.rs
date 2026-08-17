@@ -19,7 +19,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 
 use crate::config::Config;
-use crate::runtime::GenerationSlot;
+use crate::runtime::{GenerationSlot, Qwen36Generator};
 
 /// Shared state handed to every route. Cloned per-request by axum, so its
 /// contents are themselves cheap-to-clone handles (`Arc`, atomics).
@@ -31,6 +31,9 @@ pub struct AppState {
     /// reflects "is there something on disk to load."
     pub model_installed: bool,
     pub generation_slot: GenerationSlot,
+    /// `None` until a trusted converted Qwen3.6 model has loaded. The
+    /// protocol layer never fabricates output when this is absent.
+    pub generator: Option<Arc<dyn Qwen36Generator>>,
     pub started_at: Instant,
     /// `Some` only for non-loopback binds without `--insecure` (spec Part
     /// IX section 74); enforced by the `auth` middleware on the protected

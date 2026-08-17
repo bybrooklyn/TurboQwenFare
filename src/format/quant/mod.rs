@@ -14,7 +14,8 @@ pub mod validate;
 /// GGML tensor element types as used by the GGUF wire format (external
 /// prior art — llama.cpp/ggml's type IDs and block layouts, not defined by
 /// the TQF spec itself). Only the subset actually needed to import the
-/// pinned canonical checkpoints (Q4_K_M language, Q4_0 MTP, Q8_0 vision)
+/// pinned canonical checkpoints (mixed Q4_K/Q6_K/Q8_0/F32 Q4_K_M language,
+/// Q4_0 MTP, Q8_0 vision)
 /// plus their common companion full-precision/K-quant types is
 /// implemented — an unrecognized type ID is a hard parse error, never a
 /// guess (spec §115 invariant #2: "readers must reject unsupported ...
@@ -68,6 +69,33 @@ impl GgmlType {
             30 => Self::Bf16,
             other => return Err(GgufError::UnsupportedQuantType(other)),
         })
+    }
+
+    /// Canonical GGML wire identifier. Stored alongside the TQF layout ID so
+    /// a reader can reject a layout/type mismatch without guessing.
+    pub const fn ggml_id(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4_1 => 3,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
+            Self::Q8_0 => 8,
+            Self::Q8_1 => 9,
+            Self::Q2K => 10,
+            Self::Q3K => 11,
+            Self::Q4K => 12,
+            Self::Q5K => 13,
+            Self::Q6K => 14,
+            Self::Q8K => 15,
+            Self::I8 => 24,
+            Self::I16 => 25,
+            Self::I32 => 26,
+            Self::I64 => 27,
+            Self::F64 => 28,
+            Self::Bf16 => 30,
+        }
     }
 
     /// Elements per quantization block (1 for plain float/int types).

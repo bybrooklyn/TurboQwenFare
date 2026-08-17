@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use crate::format::gguf;
 use crate::format::quant::{repack, validate};
-use crate::ids::LayerId;
+use crate::ids::{Bytes, LayerId};
+use crate::memory::MemoryBroker;
 
 use super::conversion::{BeginOutcome, ConversionTransaction};
 use super::{TqfHeaderInfo, TqfReader, TqfSectionKind};
@@ -76,6 +77,7 @@ fn fixture_path(name: &str) -> PathBuf {
 
 #[test]
 fn gguf_repack_conversion_reader_round_trip() {
+    let broker = MemoryBroker::new(Bytes(1024 * 1024));
     let gguf_bytes = build_gguf_fixture();
     let gguf_path = fixture_path("source.gguf");
     std::fs::write(&gguf_path, &gguf_bytes).unwrap();
@@ -116,7 +118,7 @@ fn gguf_repack_conversion_reader_round_trip() {
     for (source_name, role_id, layer, section_kind, dims) in plan {
         let tensor = gguf_file.tensor(source_name).unwrap();
         let mut reader = gguf_file.quant_block_reader(tensor).unwrap();
-        let repacked = repack::repack_passthrough(&mut reader).unwrap();
+        let repacked = repack::repack_passthrough(&mut reader, &broker).unwrap();
 
         // Phase 7's validation gate runs as part of the conversion
         // pipeline, not just in isolation: a real converter would refuse
@@ -150,6 +152,9 @@ fn gguf_repack_conversion_reader_round_trip() {
     // (lossless passthrough), byte for byte.
     let embed_tensor = gguf_file.tensor("token_embedding").unwrap();
     let mut embed_reader = gguf_file.quant_block_reader(embed_tensor).unwrap();
-    let expected_embed = repack::repack_passthrough(&mut embed_reader).unwrap();
-    assert_eq!(reader.read_extent_bytes(embed).unwrap(), expected_embed);
+    let expected_embed = repack::repack_passthrough(&mut embed_reader, &broker).unwrap();
+    assert_eq!(
+        reader.read_extent_bytes(embed).unwrap().as_slice(),
+        &*expected_embed
+    );
 }

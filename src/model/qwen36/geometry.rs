@@ -31,6 +31,9 @@ impl Qwen36Geometry {
     pub const ROTARY_FRACTION: f64 = 0.25;
     /// `FULL_HEAD_DIM * ROTARY_FRACTION`.
     pub const ROTARY_SUBDIM: usize = 64;
+    /// Text RoPE base from the pinned canonical config. Multimodal M-RoPE
+    /// sectioning is intentionally deferred to the vision phase.
+    pub const ROPE_THETA: f32 = 10_000_000.0;
 
     pub const GDN_KEY_HEADS: usize = 16;
     pub const GDN_VALUE_HEADS: usize = 32;

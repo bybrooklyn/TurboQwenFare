@@ -1,7 +1,7 @@
 //! Streaming conversion transaction (spec Part XIV §126, phase 8):
 //! resumable `.tqf` writes driven by a per-extent append-only journal, so
-//! a kill mid-conversion resumes without re-verifying extents that
-//! already landed. Mirrors `source::journal`'s NDJSON design (a torn
+//! a kill mid-conversion resumes after re-verifying journaled extents that
+//! already landed, without rewriting them. Mirrors `source::journal`'s NDJSON design (a torn
 //! trailing line is crash recovery, not corruption) applied to output
 //! *target* extents rather than *source* download chunks — this is a
 //! deliberately separate journal from Phase 4's source-download journal
@@ -261,12 +261,18 @@ impl ConversionTransaction {
         };
 
         match read_journal(&journal_path)? {
-            Some(recovered) if !recovered.finalized => {
+            Some(recovered) => {
                 if recovered.header != expected_header {
                     return Err(ContainerError::MalformedRecord {
                         table: "conversion journal (header mismatch for this request)",
                     }
                     .into());
+                }
+                if recovered.finalized {
+                    tracing::warn!(
+                        path = %final_path.display(),
+                        "conversion journal was finalized before the installed file appeared; retrying the atomic commit"
+                    );
                 }
                 tracing::info!(
                     path = %final_path.display(),
@@ -287,18 +293,6 @@ impl ConversionTransaction {
                     journal_path,
                     state: ConversionState::WritingExtents,
                 }))
-            }
-            Some(_finalized_but_not_installed) => {
-                // Journal says Finalized but the final file doesn't exist
-                // (checked above) and commit() consumes `self` atomically
-                // — this combination means commit() itself was
-                // interrupted mid-rename. Safe recovery is out of scope
-                // for this phase's REFERENCE BASELINE: surface it loudly
-                // rather than guessing.
-                Err(ContainerError::MalformedRecord {
-                    table: "conversion journal (finalized with no installed file)",
-                }
-                .into())
             }
             None => {
                 let writer = TqfWriter::create_partial(&final_path, header)?;
@@ -361,6 +355,7 @@ impl ConversionTransaction {
             required_alignment,
             data,
         )?;
+        self.writer.sync_payload()?;
         self.journal.append(&JournalEntry::ExtentVerified {
             extent: recovered,
             verified_at_unix: unix_now(),
@@ -380,6 +375,30 @@ impl ConversionTransaction {
         let recovered = self
             .writer
             .write_expert(layer, expert, quant_layout_id, gate_up, down)?;
+        self.writer.sync_payload()?;
+        self.journal.append(&JournalEntry::ExpertVerified {
+            expert: recovered,
+            verified_at_unix: unix_now(),
+        })?;
+        Ok(())
+    }
+
+    /// Journaled form of `TqfWriter::write_expert_parts`, used by canonical
+    /// conversion to avoid a second gate+up allocation per routed expert.
+    pub fn write_expert_parts(
+        &mut self,
+        layer: LayerId,
+        expert: ExpertId,
+        quant_layout_id: u16,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+    ) -> Result<()> {
+        self.state = ConversionState::WritingExtents;
+        let recovered =
+            self.writer
+                .write_expert_parts(layer, expert, quant_layout_id, gate, up, down)?;
+        self.writer.sync_payload()?;
         self.journal.append(&JournalEntry::ExpertVerified {
             expert: recovered,
             verified_at_unix: unix_now(),
@@ -393,14 +412,22 @@ impl ConversionTransaction {
     /// `WritingFinalTables -> FsyncPartial -> AtomicRename -> Installed`
     /// tail (writing the trusted receipt is the caller's job, one layer
     /// up, once this returns `Ok`).
-    pub fn finish(mut self) -> Result<()> {
-        self.state = ConversionState::WritingFinalTables;
-        self.journal.append(&JournalEntry::Finalized {
+    pub fn finish(self) -> Result<()> {
+        let ConversionTransaction {
+            writer,
+            mut journal,
+            journal_path,
+            ..
+        } = self;
+
+        // Commit writes and fsyncs the final tables and superblock before the
+        // atomic rename. The journal must not claim finalization first: a
+        // crash in that gap must remain an ordinary resumable transaction.
+        writer.commit()?;
+        journal.append(&JournalEntry::Finalized {
             finalized_at_unix: unix_now(),
         })?;
-        self.writer.commit()?;
-        self.state = ConversionState::Installed;
-        std::fs::remove_file(&self.journal_path).ok();
+        std::fs::remove_file(&journal_path).ok();
         Ok(())
     }
 }
@@ -538,6 +565,51 @@ mod tests {
     }
 
     #[test]
+    fn finalized_journal_without_installed_file_retries_commit() {
+        let path = fixture_path("finalized-before-rename.tqf");
+        {
+            let outcome = ConversionTransaction::begin(&path, header(), "source-a").unwrap();
+            let mut txn = match outcome {
+                BeginOutcome::Transaction(t) => t,
+                BeginOutcome::AlreadyInstalled => panic!("unexpected"),
+            };
+            txn.write_extent(
+                1,
+                "token_embedding",
+                None,
+                TqfSectionKind::Embeddings,
+                &[16, 4],
+                12,
+                12,
+                64,
+                &extent_bytes(0xAB, 64),
+            )
+            .unwrap();
+
+            // Reproduce the ordering used by older binaries: the journal
+            // reached Finalized, but the process died before commit/rename.
+            txn.journal
+                .append(&JournalEntry::Finalized {
+                    finalized_at_unix: unix_now(),
+                })
+                .unwrap();
+        }
+
+        assert!(!path.exists());
+        let outcome = ConversionTransaction::begin(&path, header(), "source-a").unwrap();
+        let txn = match outcome {
+            BeginOutcome::Transaction(t) => t,
+            BeginOutcome::AlreadyInstalled => panic!("expected a resumed transaction"),
+        };
+        assert!(txn.has_extent("token_embedding"));
+        txn.finish().unwrap();
+
+        assert!(path.exists());
+        assert!(!journal_path_for(&path).exists());
+        super::super::TqfReader::open_validated(&path).unwrap();
+    }
+
+    #[test]
     fn resuming_with_a_different_source_hash_is_rejected() {
         let path = fixture_path("mismatched-source.tqf");
         {
@@ -562,6 +634,44 @@ mod tests {
 
         let err = ConversionTransaction::begin(&path, header(), "source-b").unwrap_err();
         assert!(err.to_string().contains("conversion journal"));
+    }
+
+    #[test]
+    fn resume_rejects_corrupted_payload_claimed_by_the_journal() {
+        let path = fixture_path("corrupt-resume.tqf");
+        {
+            let outcome = ConversionTransaction::begin(&path, header(), "source-a").unwrap();
+            let mut txn = match outcome {
+                BeginOutcome::Transaction(t) => t,
+                BeginOutcome::AlreadyInstalled => panic!("unexpected"),
+            };
+            txn.write_extent(
+                1,
+                "token_embedding",
+                None,
+                TqfSectionKind::Embeddings,
+                &[16, 4],
+                12,
+                12,
+                64,
+                &extent_bytes(0xAB, 64),
+            )
+            .unwrap();
+        }
+
+        use std::os::unix::fs::FileExt;
+        let mut partial_name = path.file_name().unwrap().to_os_string();
+        partial_name.push(".partial");
+        let partial = path.with_file_name(partial_name);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(partial)
+            .unwrap();
+        file.write_all_at(&[0xEE], 4096).unwrap();
+        file.sync_all().unwrap();
+
+        let error = ConversionTransaction::begin(&path, header(), "source-a").unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
     }
 
     #[test]

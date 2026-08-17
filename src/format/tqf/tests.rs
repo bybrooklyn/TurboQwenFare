@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{ContainerError, TqfError};
-use crate::ids::{ExpertId, LayerId};
+use crate::ids::{Bytes, ExpertId, LayerId};
+use crate::memory::MemoryBroker;
 
 use super::{TqfHeaderInfo, TqfReader, TqfSectionKind, TqfWriter};
 
@@ -87,6 +88,17 @@ fn build_sample(path: &Path) {
 }
 
 #[test]
+fn metadata_tables_require_broker_admission_before_allocation() {
+    let path = fixture_path("metadata-budget.tqf");
+    build_sample(&path);
+    let broker = MemoryBroker::new(Bytes(1));
+
+    let error = TqfReader::open_validated_with_broker(&path, &broker).unwrap_err();
+    assert!(matches!(error, TqfError::Memory(_)));
+    assert_eq!(broker.snapshot().reserved, Bytes(0));
+}
+
+#[test]
 fn roundtrip_simple_extents_and_experts() {
     let path = fixture_path("roundtrip.tqf");
     build_sample(&path);
@@ -109,6 +121,35 @@ fn roundtrip_simple_extents_and_experts() {
     let mut expected = expert_gate_up_bytes();
     expected.extend(expert_down_bytes());
     assert_eq!(reader.read_expert_bytes(idx).unwrap(), expected);
+}
+
+#[test]
+fn expert_parts_preserve_three_matrix_boundaries_without_temporary_join() {
+    let path = fixture_path("expert-parts.tqf");
+    let gate = vec![0xA1; 17];
+    let up = vec![0xB2; 19];
+    let down = vec![0xC3; 23];
+    let mut writer = TqfWriter::create_partial(&path, header()).unwrap();
+    writer
+        .write_expert_parts(LayerId(0), ExpertId(1), 2, &gate, &up, &down)
+        .unwrap();
+    writer.commit().unwrap();
+
+    let reader = TqfReader::open_validated(&path).unwrap();
+    let (index, tiles) = reader.expert(LayerId(0), ExpertId(1)).unwrap();
+    assert_eq!(tiles.len(), 2);
+    assert_eq!(tiles[0].relative_offset, 0);
+    assert_eq!(tiles[0].stored_bytes, (gate.len() + up.len()) as u32);
+    assert_eq!(tiles[1].relative_offset, (gate.len() + up.len()) as u32);
+    assert_eq!(tiles[1].stored_bytes, down.len() as u32);
+    let mut destination = vec![0; index.stored_bytes as usize];
+    reader.read_expert_into(index, &mut destination).unwrap();
+    assert_eq!(&destination[..gate.len()], gate);
+    assert_eq!(&destination[gate.len()..gate.len() + up.len()], up);
+    assert_eq!(&destination[gate.len() + up.len()..], down);
+    assert!(reader
+        .read_expert_into(index, &mut destination[..3])
+        .is_err());
 }
 
 #[test]

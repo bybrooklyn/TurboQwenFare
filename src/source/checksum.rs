@@ -9,6 +9,10 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::error::Result;
+use crate::ids::Bytes;
+use crate::memory::{MemoryBroker, MemoryClass, MemoryOwner};
+
+const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub fn hex_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -18,10 +22,16 @@ pub fn hex_digest(bytes: &[u8]) -> String {
 
 /// Hashes a file in bounded memory (fixed-size read blocks), never loading
 /// the whole file into RAM — required for multi-gigabyte model artifacts.
-pub fn hex_digest_file(path: &Path) -> Result<String> {
+pub fn hex_digest_file(path: &Path, broker: &MemoryBroker) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
+    let _lease = broker.reserve(
+        MemoryOwner::IoStaging,
+        MemoryClass::Transient,
+        Bytes(HASH_BUFFER_BYTES as u64),
+        64,
+    )?;
+    let mut buf = vec![0u8; HASH_BUFFER_BYTES];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -65,7 +75,9 @@ mod tests {
         let data = vec![0x5au8; 3 * 1024 * 1024 + 17]; // spans multiple 1MB blocks
         std::fs::write(&path, &data).unwrap();
 
-        assert_eq!(hex_digest_file(&path).unwrap(), hex_digest(&data));
+        let broker = MemoryBroker::new(Bytes(2 * 1024 * 1024));
+        assert_eq!(hex_digest_file(&path, &broker).unwrap(), hex_digest(&data));
+        assert_eq!(broker.snapshot().reserved, Bytes(0));
 
         std::fs::remove_dir_all(&dir).ok();
     }

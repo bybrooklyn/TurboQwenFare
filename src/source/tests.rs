@@ -18,11 +18,16 @@ use axum::Router;
 use tokio::net::TcpListener;
 
 use crate::error::{SourceError, TqfError};
+use crate::ids::Bytes;
+use crate::memory::MemoryBroker;
 use crate::source::hf::HfRangeSource;
 use crate::source::local::LocalFileSource;
 use crate::source::manifest::FetchedArtifact;
 use crate::source::retry::RetryPolicy;
-use crate::source::{checksum, fetch_verified, FetchOptions, SourceOwnership};
+use crate::source::{
+    checksum, fetch_verified as fetch_verified_with_broker, FetchOptions, ModelSource,
+    SourceOwnership,
+};
 
 const TEST_REPO: &str = "repo";
 const TEST_REVISION: &str = "rev";
@@ -166,6 +171,20 @@ fn test_body() -> Vec<u8> {
     (0..64u8).collect() // 64 bytes -> 4 chunks of 16 bytes
 }
 
+/// Keep the integration-test call sites focused on source semantics while
+/// still exercising the production brokered API. The hash pass needs 1 MiB.
+async fn fetch_verified(
+    source: &dyn ModelSource,
+    ownership: SourceOwnership,
+    dest_dir: &std::path::Path,
+    options: FetchOptions,
+) -> crate::error::Result<FetchedArtifact> {
+    let broker = MemoryBroker::new(Bytes(2 * 1024 * 1024));
+    let result = fetch_verified_with_broker(source, ownership, dest_dir, options, &broker).await;
+    assert_eq!(broker.snapshot().reserved, Bytes(0));
+    result
+}
+
 #[tokio::test]
 async fn happy_path_downloads_and_verifies() {
     let body = test_body();
@@ -201,6 +220,54 @@ async fn happy_path_downloads_and_verifies() {
     assert_eq!(final_bytes, body);
     assert!(!dest_dir.join(format!("{TEST_FILENAME}.journal")).exists());
     assert!(FetchedArtifact::load(&dest_dir).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn chunk_budget_is_reserved_before_the_http_body_is_requested() {
+    let body = test_body();
+    let server = TestServer::new(body);
+    let base_url = spawn_test_server(server.clone()).await;
+    let dest_dir = test_dir("chunk-budget");
+    let source = HfRangeSource::resolve_with_base_url(
+        &base_url,
+        TEST_REPO,
+        TEST_REVISION,
+        TEST_FILENAME,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(server.request_count(), 1, "metadata probe only");
+
+    let broker = MemoryBroker::new(Bytes(8));
+    let result = fetch_verified_with_broker(
+        &source,
+        SourceOwnership::TqfManaged,
+        &dest_dir,
+        FetchOptions {
+            chunk_size_bytes: 16,
+            retry_policy: fast_policy(),
+        },
+        &broker,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(TqfError::Memory(
+            crate::error::MemoryError::BudgetExceeded {
+                requested: 16,
+                available: 8,
+                ..
+            }
+        ))
+    ));
+    assert_eq!(
+        server.request_count(),
+        1,
+        "no chunk request before admission"
+    );
+    assert_eq!(broker.snapshot().reserved, Bytes(0));
 }
 
 #[tokio::test]
