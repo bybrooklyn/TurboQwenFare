@@ -17,21 +17,17 @@ The spec uses a decision-status vocabulary that controls how much latitude an im
 - **RESEARCH CANDIDATE** — deliberately experimental; failure is an acceptable, recordable outcome.
 - **BENCHMARK-SELECTED** — multiple valid implementations exist; the benchmark winner becomes default.
 
-Current progress is through spec Phase 12 (Phases 0-9: research harvest, crate skeleton, server
-skeleton, setup/global state, source resolver/downloader, GGUF importer, `.tqf` writer/reader,
-lossless Q4 repacker, streaming conversion transaction, tokenizer/chat semantics; Phase 10: Metal
-baseline infrastructure — device/queue, buffer leases, pipeline cache, event timing, baseline
-metallib loading, and the synthetic bandwidth/GEMV harness under `tqf optimize`; Phase 11: reference
-Q4 kernels — Q4_K GEMV/batched-GEMM, RMSNorm, elementwise residual/SiLU/sigmoid, and an LM-head path,
-each with a `backend::reference` CPU oracle and a Metal parity test (`backend::metal::kernels`);
-Phase 12: Gated DeltaNet — four separate projections, causal conv tail, per-head q/k RMSNorm, the
-FP32 delta-rule recurrent update, gated norm, and output projection, in that order, plus a per-layer
-`GdnState` with reset/snapshot/restore (`model::qwen36::gdn`); the exact per-head gate formula there
-is a documented REFERENCE BASELINE pending parity validation against real checkpoint weights, not
-yet bit-exact-verified) out of ~52 phases (spec sections 272 onward, "Part XVI — Phase-Level
-Engineering Taskbook"). Phase 13 (full attention) onward is not started. Most module directories
-under `src/` beyond those phases are still empty stubs (a `mod.rs` with only doc comments) — check a
-file's actual line count before assuming a subsystem is implemented.
+Implementation coverage now extends through the Phase 18 reference/bounded baseline: BF16 virtual-GQA
+full attention, exact MoE routing/shared/routed computation, a 40-layer decode graph, normalized
+OpenAI streaming adapters, canonical download/conversion/receipt startup, and a whole-expert LFU
+cache with exact load plans. A pinned real Q4_K_M checkpoint passes source and installed-container
+topology validation, release headless server probes, and a one-token greedy comparison against a
+pinned external oracle. This is not equivalent to closing every Phase 13-18 exit gate: Phase 15's
+16/128/512-token matrix (especially the required 512-token reference sequence), OS-observed 4 GiB
+qualification, the >=15 tok/s floor, combined <=1% quality qualification, plain GUI startup, and
+RTX 3070 Ti/CUDA qualification remain open. Phase 19 and later implementation is not started. Check
+the current code, tests, and `docs/research/canonical-source-manifest.md` before making a stronger
+status claim.
 
 ## Commands
 
