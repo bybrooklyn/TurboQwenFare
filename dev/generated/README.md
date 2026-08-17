@@ -11,19 +11,18 @@ Produced by `src/dev/inventory.rs`'s `generate_inventory` +
 `cargo test -- --ignored regenerate_committed_tensor_inventory_artifact`,
 not part of a normal `cargo test`).
 
-**This is a synthetic fixture, not the real model's inventory.** This
-environment has resolved the real canonical source pin (see
-`docs/research/canonical-source-manifest.md`) but has not downloaded the
-20+ GB checkpoint, so the real per-tensor GGUF names and shapes are
-unconfirmed. The 26 entries here are one representative tensor per known
+**This committed file remains a synthetic fixture, not the real model's
+inventory.** The pinned 20+ GB checkpoint has since been downloaded and its
+733 descriptors pass the ignored real-inventory and installed-container
+topology tests recorded in `docs/research/canonical-source-manifest.md`.
+The 26 entries here are still one representative tensor per known
 logical role (embedding, one full-attention layer, one Gated DeltaNet
 layer, router, shared/routed experts, ...), with placeholder `[32]`-element
 shapes — enough to exercise and pin the classifier's behavior, not a real
 model description.
 
-Once the real file is downloaded, re-run the generator against it
-(`generate_inventory(&real_gguf_path)`); expect it to surface tensor names
-this classifier doesn't recognize yet, especially for Gated DeltaNet
-layers, whose real llama.cpp-convention names are the least confidently
-guessed part of `src/dev/inventory.rs`'s classifier (see that file's
-top-of-module doc comment).
+For live qualification, run
+`canonical_checkpoint_inventory_matches_the_fixed_graph` with
+`TQF_CANONICAL_GGUF` pointing at the pinned source. Do not replace this small
+redistributable fixture with checkpoint-derived weights or other large model
+payloads.

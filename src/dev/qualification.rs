@@ -172,6 +172,8 @@ pub fn qualify_oracle(
     )?;
     let started = Instant::now();
     let mut last_top_logits = None;
+    let show_progress = std::env::var("TQF_QUALIFICATION_PROGRESS").as_deref() == Ok("1");
+    let mut completed_decode_steps = 0usize;
     let decode_steps = verify_greedy_sequence(
         &artifact.prompt_tokens,
         &artifact.generated_tokens,
@@ -185,6 +187,20 @@ pub fn qualify_oracle(
                 ));
             }
             last_top_logits = Some(decoded.diagnostics.top_logits);
+            completed_decode_steps += 1;
+            if show_progress {
+                let cache = runtime.expert_cache_stats();
+                println!(
+                    "qualification_decode_step={} input_token={} output_token={} elapsed_ms={} cache_hits={} cache_misses={} raw_miss_bytes={}",
+                    completed_decode_steps,
+                    input,
+                    decoded.token,
+                    started.elapsed().as_millis(),
+                    cache.hits,
+                    cache.misses,
+                    cache.raw_miss_bytes.0,
+                );
+            }
             Ok(decoded.token)
         },
     )
