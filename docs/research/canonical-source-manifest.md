@@ -227,6 +227,21 @@ llama.cpp oracle above. Its first-token whole-expert-cache counters were 320
 misses, 169 evictions, 267,190,272 resident bytes, and 566,231,040 raw miss
 bytes. These are diagnostic counters, not a throughput result.
 
+On 2026-08-17 the same pinned prompt was extended to the mandatory 16-token
+length using `docs/research/oracles/raw-a-16.json`. TQF reproduced all 16
+greedy llama.cpp token IDs exactly. Real layerwise comparison was required to
+reach parity: GGML Q8_0/Q4_K/Q6_K matvecs quantize their activation operand to
+Q8_0/Q8_K before the integer dot, and GDN Q/K L2 normalization is
+`1 / max(sqrt(sum_squares), epsilon)`, not
+`1 / sqrt(sum_squares + epsilon)`. These are checkpoint execution semantics,
+not a token-specific correction.
+
+The 16-token release run took 374,033 ms and recorded 5,120 expert misses,
+4,969 evictions, zero hits, 267,190,272 resident expert bytes, and
+9,059,696,640 raw miss bytes. This closes the raw-`A` 16-token correctness
+fixture while demonstrating that the current reference cache is nowhere near
+the Phase 19–25 performance target.
+
 The release setup path then validated the installed model, wrote the receipt,
 completed its short hardware tune on the base Apple M4, and started the bounded
 headless server at `127.0.0.1:11434`. `/health` reported version `0.0.1` with
@@ -235,9 +250,9 @@ headless server at `127.0.0.1:11434`. `/health` reported version `0.0.1` with
 reused the receipt and passed both probes again. The server was stopped cleanly
 after each check.
 
-Qualification boundary: this one-token result closes the smallest mandatory
-greedy length and proves a real bounded graph can reach a token. It does not
-close Phase 15's 16/128/512-token workload matrix, the 512-token cache-ordering
+Qualification boundary: the real bounded graph now closes the raw-`A` 1- and
+16-token deterministic lengths. It does not close Phase 15's broader workload
+matrix or its 128/512-token lengths, the 512-token cache-ordering
 gate, OS-observed 4 GiB qualification, the >=15 tok/s floor, the combined <=1%
 quality gate, plain GUI startup, or RTX 3070 Ti/CUDA qualification. No claim in
 this document should be read as closing those gates.

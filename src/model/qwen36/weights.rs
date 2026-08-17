@@ -712,7 +712,10 @@ fn matvec_row(dtype: GgmlType, row: &[u8], input: &[f32]) -> Result<f32> {
                 ) * input
             })
             .sum()),
-        GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q6K | GgmlType::Q8_0 => {
+        GgmlType::Q8_0 => q8_0_dot(row, input),
+        GgmlType::Q4K => q4_k_dot(row, input),
+        GgmlType::Q6K => q6_k_dot(row, input),
+        GgmlType::Q4_0 => {
             let block_bytes = dtype.block_bytes() as usize;
             let block_elements = dtype.block_size() as usize;
             let mut output = 0.0;
@@ -735,6 +738,214 @@ fn matvec_row(dtype: GgmlType, row: &[u8], input: &[f32]) -> Result<f32> {
         ))
         .into()),
     }
+}
+
+/// Canonical GGML Q8_0 matvec semantics quantize the activation to Q8_0
+/// before taking the integer dot product. Directly multiplying dequantized
+/// weights by f32 activations is close, but it is a different operation and
+/// accumulated enough drift to break the real greedy-sequence gate.
+fn q8_0_dot(row: &[u8], input: &[f32]) -> Result<f32> {
+    const ELEMENTS: usize = crate::format::quant::dequant::Q8_0_BLOCK_ELEMENTS;
+    const BYTES: usize = 34;
+    if input.len() % ELEMENTS != 0 || row.len() != input.len() / ELEMENTS * BYTES {
+        return Err(ModelError::Shape {
+            tensor: "Qwen Q8_0 dot payload",
+            expected: input.len() / ELEMENTS * BYTES,
+            actual: row.len(),
+        }
+        .into());
+    }
+    let mut output = 0.0f32;
+    for (weight, activation) in row.chunks_exact(BYTES).zip(input.chunks_exact(ELEMENTS)) {
+        let weight_scale =
+            crate::format::quant::dequant::f16_to_f32(u16::from_le_bytes([weight[0], weight[1]]));
+        let maximum = activation
+            .iter()
+            .fold(0.0f32, |current, value| current.max(value.abs()));
+        let activation_scale = maximum / 127.0;
+        let inverse = if activation_scale == 0.0 {
+            0.0
+        } else {
+            activation_scale.recip()
+        };
+        let stored_activation_scale = crate::format::quant::dequant::f16_to_f32(
+            crate::format::quant::dequant::f32_to_f16(activation_scale),
+        );
+        let integer_dot = weight[2..]
+            .iter()
+            .zip(activation)
+            .map(|(weight, activation)| {
+                let quantized = (activation * inverse).round().clamp(-128.0, 127.0) as i32;
+                (*weight as i8 as i32) * quantized
+            })
+            .sum::<i32>();
+        output += integer_dot as f32 * (weight_scale * stored_activation_scale);
+    }
+    Ok(output)
+}
+
+struct QuantizedQ8K {
+    values: [i8; 256],
+    sums: [i16; 16],
+    scale: f32,
+}
+
+fn quantize_q8_k(values: &[f32]) -> QuantizedQ8K {
+    debug_assert_eq!(values.len(), 256);
+    let mut signed_maximum = 0.0f32;
+    let mut absolute_maximum = 0.0f32;
+    for &value in values {
+        let absolute = value.abs();
+        if absolute > absolute_maximum {
+            absolute_maximum = absolute;
+            signed_maximum = value;
+        }
+    }
+    if absolute_maximum == 0.0 {
+        return QuantizedQ8K {
+            values: [0; 256],
+            sums: [0; 16],
+            scale: 0.0,
+        };
+    }
+    let inverse_scale = -127.0 / signed_maximum;
+    let scale = inverse_scale.recip();
+    let mut quantized = [0i8; 256];
+    for (output, value) in quantized.iter_mut().zip(values) {
+        *output = (value * inverse_scale).round_ties_even().min(127.0) as i8;
+    }
+    let mut sums = [0i16; 16];
+    for (sum, values) in sums.iter_mut().zip(quantized.chunks_exact(16)) {
+        *sum = values.iter().map(|value| *value as i16).sum();
+    }
+    QuantizedQ8K {
+        values: quantized,
+        sums,
+        scale,
+    }
+}
+
+fn q4_k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
+    if index < 4 {
+        (packed[index] & 63, packed[index + 4] & 63)
+    } else {
+        (
+            (packed[index + 4] & 0x0f) | ((packed[index - 4] >> 6) << 4),
+            (packed[index + 4] >> 4) | ((packed[index] >> 6) << 4),
+        )
+    }
+}
+
+fn q4_k_dot(row: &[u8], input: &[f32]) -> Result<f32> {
+    const ELEMENTS: usize = 256;
+    const BYTES: usize = 144;
+    if input.len() % ELEMENTS != 0 || row.len() != input.len() / ELEMENTS * BYTES {
+        return Err(ModelError::Shape {
+            tensor: "Qwen Q4_K dot payload",
+            expected: input.len() / ELEMENTS * BYTES,
+            actual: row.len(),
+        }
+        .into());
+    }
+    let mut sums = [0.0f32; 8];
+    let mut minimum_sum = 0.0f32;
+    for (weight, activation) in row.chunks_exact(BYTES).zip(input.chunks_exact(ELEMENTS)) {
+        let quantized = quantize_q8_k(activation);
+        let weight_scale =
+            crate::format::quant::dequant::f16_to_f32(u16::from_le_bytes([weight[0], weight[1]]));
+        let minimum_scale =
+            crate::format::quant::dequant::f16_to_f32(u16::from_le_bytes([weight[2], weight[3]]));
+        let packed_scales = &weight[4..16];
+        let packed_values = &weight[16..];
+        let mut unpacked = [0i8; ELEMENTS];
+        for chunk in 0..4 {
+            let source = &packed_values[chunk * 32..(chunk + 1) * 32];
+            let base = chunk * 64;
+            for index in 0..32 {
+                unpacked[base + index] = (source[index] & 0x0f) as i8;
+                unpacked[base + 32 + index] = (source[index] >> 4) as i8;
+            }
+        }
+
+        let mut lane_sums = [0i32; 8];
+        let mut block_minimum_sum = 0i32;
+        for subblock in 0..8 {
+            let (scale, minimum) = q4_k_scale_min(subblock, packed_scales);
+            let start = subblock * 32;
+            block_minimum_sum += minimum as i32
+                * (quantized.sums[subblock * 2] as i32 + quantized.sums[subblock * 2 + 1] as i32);
+            for quarter in 0..4 {
+                for lane in 0..8 {
+                    let index = start + quarter * 8 + lane;
+                    lane_sums[lane] +=
+                        scale as i32 * quantized.values[index] as i32 * unpacked[index] as i32;
+                }
+            }
+        }
+        let combined_scale = weight_scale * quantized.scale;
+        for (sum, integer) in sums.iter_mut().zip(lane_sums) {
+            *sum += combined_scale * integer as f32;
+        }
+        minimum_sum -= minimum_scale * quantized.scale * block_minimum_sum as f32;
+    }
+    Ok(minimum_sum + sums.into_iter().sum::<f32>())
+}
+
+fn q6_k_dot(row: &[u8], input: &[f32]) -> Result<f32> {
+    const ELEMENTS: usize = 256;
+    const BYTES: usize = 210;
+    if input.len() % ELEMENTS != 0 || row.len() != input.len() / ELEMENTS * BYTES {
+        return Err(ModelError::Shape {
+            tensor: "Qwen Q6_K dot payload",
+            expected: input.len() / ELEMENTS * BYTES,
+            actual: row.len(),
+        }
+        .into());
+    }
+    let mut sums = [0.0f32; 8];
+    for (weight, activation) in row.chunks_exact(BYTES).zip(input.chunks_exact(ELEMENTS)) {
+        let quantized = quantize_q8_k(activation);
+        let ql = &weight[..128];
+        let qh = &weight[128..192];
+        let scales = &weight[192..208];
+        let weight_scale = crate::format::quant::dequant::f16_to_f32(u16::from_le_bytes([
+            weight[208],
+            weight[209],
+        ]));
+        let mut unpacked = [0i8; ELEMENTS];
+        for half in 0..2 {
+            let low = &ql[half * 64..(half + 1) * 64];
+            let high = &qh[half * 32..(half + 1) * 32];
+            let base = half * 128;
+            for index in 0..32 {
+                unpacked[base + index] =
+                    ((low[index] & 0x0f) | ((high[index] & 0x03) << 4)) as i8 - 32;
+                unpacked[base + index + 32] =
+                    ((low[index + 32] & 0x0f) | (((high[index] >> 2) & 0x03) << 4)) as i8 - 32;
+                unpacked[base + index + 64] =
+                    ((low[index] >> 4) | (((high[index] >> 4) & 0x03) << 4)) as i8 - 32;
+                unpacked[base + index + 96] =
+                    ((low[index + 32] >> 4) | (((high[index] >> 6) & 0x03) << 4)) as i8 - 32;
+            }
+        }
+        let mut lane_sums = [0i32; 8];
+        for group in 0..16 {
+            let scale = scales[group] as i8 as i32;
+            let start = group * 16;
+            for half in 0..2 {
+                for lane in 0..8 {
+                    let index = start + half * 8 + lane;
+                    lane_sums[lane] +=
+                        scale * quantized.values[index] as i32 * unpacked[index] as i32;
+                }
+            }
+        }
+        let combined_scale = weight_scale * quantized.scale;
+        for (sum, integer) in sums.iter_mut().zip(lane_sums) {
+            *sum += combined_scale * integer as f32;
+        }
+    }
+    Ok(sums.into_iter().sum())
 }
 
 /// Qwen-only lazy weight binder. It deliberately loads exactly one extent at

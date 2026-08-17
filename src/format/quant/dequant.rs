@@ -47,6 +47,59 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
+/// f32 -> IEEE 754 binary16 with round-to-nearest, ties-to-even. Runtime
+/// activation quantization uses the rounded half scale stored by GGML's Q8_0
+/// block contract, so keeping this conversion explicit avoids a host-only
+/// dependency on a generic tensor or half-float crate.
+pub fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ffff;
+
+    if exponent == 0xff {
+        return sign
+            | if mantissa == 0 {
+                0x7c00
+            } else {
+                0x7e00 | ((mantissa >> 13) as u16 & 0x01ff)
+            };
+    }
+
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign;
+        }
+        let significand = mantissa | 0x80_0000;
+        let shift = (14 - half_exponent) as u32;
+        let truncated = significand >> shift;
+        let remainder = significand & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        let rounded = truncated
+            + u32::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0));
+        return sign | rounded as u16;
+    }
+
+    let truncated = mantissa >> 13;
+    let remainder = mantissa & 0x1fff;
+    let rounded =
+        truncated + u32::from(remainder > 0x1000 || (remainder == 0x1000 && truncated & 1 != 0));
+    let mut encoded_exponent = half_exponent as u32;
+    let mut encoded_mantissa = rounded;
+    if encoded_mantissa == 0x400 {
+        encoded_exponent += 1;
+        encoded_mantissa = 0;
+        if encoded_exponent >= 0x1f {
+            return sign | 0x7c00;
+        }
+    }
+    sign | ((encoded_exponent as u16) << 10) | encoded_mantissa as u16
+}
+
 pub const Q4_0_BLOCK_ELEMENTS: usize = 32;
 pub const Q4_K_BLOCK_ELEMENTS: usize = 256;
 pub const Q6_K_BLOCK_ELEMENTS: usize = 256;
@@ -220,6 +273,14 @@ mod tests {
         assert_eq!(out[0], 10.0);
         assert_eq!(out[1], -6.0);
         assert_eq!(out[2], 0.0);
+    }
+
+    #[test]
+    fn f16_round_trip_covers_normal_subnormal_and_special_values() {
+        for bits in [0x0000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0xc100, 0x7c00] {
+            assert_eq!(f32_to_f16(f16_to_f32(bits)), bits);
+        }
+        assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
     }
 
     #[test]

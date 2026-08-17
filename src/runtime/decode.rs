@@ -35,7 +35,32 @@ pub struct DecodeTimings {
 pub struct DecodeDiagnostics {
     pub per_layer_hashes: Vec<LayerHash>,
     pub router_trace: Vec<RouterTrace>,
+    pub top_logits: [LogitCandidate; 4],
     pub timings: DecodeTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogitCandidate {
+    pub token: u32,
+    pub logit: f32,
+}
+
+pub fn top_logit_candidates(logits: &[f32]) -> [LogitCandidate; 4] {
+    let mut top = [LogitCandidate {
+        token: 0,
+        logit: f32::NEG_INFINITY,
+    }; 4];
+    for (index, &logit) in logits.iter().enumerate() {
+        let candidate = LogitCandidate {
+            token: index as u32,
+            logit,
+        };
+        if let Some(position) = top.iter().position(|current| logit > current.logit) {
+            top[position..].rotate_right(1);
+            top[position] = candidate;
+        }
+    }
+    top
 }
 
 #[derive(Debug, Clone)]
@@ -133,12 +158,8 @@ where
         .into());
     }
     let start = Instant::now();
-    let token = logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
-        .map(|(index, _)| index as u32)
-        .expect("checked nonempty logits");
+    let top_logits = top_logit_candidates(&logits);
+    let token = top_logits[0].token;
     timings.sampling = start.elapsed();
 
     Ok(DecodeToken {
@@ -146,6 +167,7 @@ where
         diagnostics: DecodeDiagnostics {
             per_layer_hashes,
             router_trace,
+            top_logits,
             timings,
         },
     })

@@ -2,3 +2,4 @@
 //! II section 12; Part I section 3).
 
 pub mod inventory;
+pub mod qualification;

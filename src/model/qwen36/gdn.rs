@@ -252,8 +252,8 @@ pub fn qk_norm(q: &[f32], k: &[f32]) -> (Vec<f32>, Vec<f32>) {
         values
             .chunks_exact(KEY_HEAD_DIM)
             .flat_map(|head| {
-                let inv_norm =
-                    1.0 / (head.iter().map(|value| value * value).sum::<f32>() + 1e-6).sqrt();
+                let norm = head.iter().map(|value| value * value).sum::<f32>().sqrt();
+                let inv_norm = 1.0 / norm.max(1e-6);
                 head.iter().map(move |value| value * inv_norm)
             })
             .collect()
@@ -276,7 +276,8 @@ pub fn qk_norm_in_place(q: &mut Qwen36Activation, k: &mut Qwen36Activation) -> R
     }
     for values in [&mut q.values, &mut k.values] {
         for head in values.chunks_exact_mut(KEY_HEAD_DIM) {
-            let inverse = 1.0 / (head.iter().map(|value| value * value).sum::<f32>() + 1e-6).sqrt();
+            let norm = head.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let inverse = 1.0 / norm.max(1e-6);
             for value in head {
                 *value *= inverse;
             }

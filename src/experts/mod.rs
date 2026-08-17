@@ -627,6 +627,20 @@ impl Qwen36StreamingMoe {
         broker: &MemoryBroker,
         input: &Qwen36Activation,
     ) -> Result<(Qwen36Activation, RouterResult)> {
+        self.forward_with_observer(loader, cache, broker, input, |_, _| Ok(()))
+    }
+
+    pub fn forward_with_observer<F>(
+        &mut self,
+        loader: &Qwen36WeightLoader,
+        cache: &mut WholeExpertLfuCache,
+        broker: &MemoryBroker,
+        input: &Qwen36Activation,
+        mut observer: F,
+    ) -> Result<(Qwen36Activation, RouterResult)>
+    where
+        F: FnMut(&'static str, &Qwen36Activation) -> Result<()>,
+    {
         require_len("Qwen streaming MoE input", input.values.len(), HIDDEN)?;
         let route_logits = self.router.matvec(broker, &input.values)?;
         let route = RouterResult::from_logits(&route_logits.values)?;
@@ -638,6 +652,7 @@ impl Qwen36StreamingMoe {
             let mut output = self.shared_down.matvec(broker, &shared_hidden.values)?;
             let shared_gate_logit = self.shared_input_gate.dot(broker, &input.values)?;
             output.scale_in_place(1.0 / (1.0 + (-shared_gate_logit).exp()));
+            observer("shared", &output)?;
 
             for (&expert, &weight) in plan.route.ids.iter().zip(&plan.route.weights) {
                 let routed = cache
@@ -645,6 +660,7 @@ impl Qwen36StreamingMoe {
                     .forward(broker, &input.values)?;
                 output.add_scaled_in_place(&routed, weight)?;
             }
+            observer("combined", &output)?;
             Ok(output)
         })();
         // Release pins on both success and failure. The first computation

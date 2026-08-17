@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "fixture_id": "raw-a-16",
+  "prompt": "A",
+  "prompt_tokens": [32],
+  "generated_tokens": [
+    220,
+    16,
+    15,
+    15,
+    15,
+    20332,
+    1740,
+    369,
+    6992,
+    506,
+    220,
+    17,
+    15,
+    295,
+    2600,
+    948
+  ],
+  "model_source_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "oracle_runtime": "llama.cpp",
+  "oracle_revision": "4df29be4f4c3673f428170fda944a5b19f743bb8",
+  "oracle_parameters": [
+    "cpu",
+    "bf16-kv",
+    "context=32",
+    "no-cpu-weight-repack",
+    "greedy",
+    "generated-token-file-sha256=ff5477607baa28069f65c856830816c6ec91aa2ce36ccbe3881d92904afc60a8"
+  ]
+}

@@ -9,7 +9,8 @@ pub mod request;
 pub mod session;
 
 pub use decode::{
-    decode_greedy, DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, LayerStep, RouterTrace,
+    decode_greedy, DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, LayerStep,
+    LogitCandidate, RouterTrace,
 };
 pub use generation::{
     GeneratedOutput, GeneratedToolCall, Qwen36Generator, Qwen36ResidentReferenceGenerator,

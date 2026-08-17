@@ -12,6 +12,7 @@ use crate::error::{ModelError, Result};
 use crate::experts::{Qwen36ResidentMoe, Qwen36StreamingMoe, RouterResult, WholeExpertLfuCache};
 use crate::ids::{Bytes, LayerId, LayerKind};
 use crate::memory::MemoryBroker;
+use crate::runtime::decode::top_logit_candidates;
 use crate::runtime::{DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, RouterTrace};
 
 use super::attention::{split_query_gate_accounted, FullAttentionLayer};
@@ -288,13 +289,8 @@ impl Qwen36ReferenceRuntime {
         let logits = self.lm_head.matvec(&self.broker, &hidden.values)?;
         timings.lm_head = start.elapsed();
         let start = Instant::now();
-        let token = logits
-            .values
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(index, _)| index as u32)
-            .expect("Qwen LM head has fixed nonzero vocabulary");
+        let top_logits = top_logit_candidates(&logits.values);
+        let token = top_logits[0].token;
         timings.sampling = start.elapsed();
         self.decode_index = self.decode_index.saturating_add(1);
         Ok(DecodeToken {
@@ -302,6 +298,7 @@ impl Qwen36ReferenceRuntime {
             diagnostics: DecodeDiagnostics {
                 per_layer_hashes,
                 router_trace,
+                top_logits,
                 timings,
             },
         })
@@ -421,6 +418,8 @@ impl Qwen36BoundedReferenceRuntime {
                 &mut self.expert_cache,
                 layer,
                 &hidden,
+                decode_index,
+                input_token,
             )?;
             timings.layers.push((id, start.elapsed()));
             per_layer_hashes.push(LayerHash {
@@ -443,13 +442,8 @@ impl Qwen36BoundedReferenceRuntime {
         };
         timings.lm_head = start.elapsed();
         let start = Instant::now();
-        let token = logits
-            .values
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(index, _)| index as u32)
-            .expect("Qwen LM head has fixed nonzero vocabulary");
+        let top_logits = top_logit_candidates(&logits.values);
+        let token = top_logits[0].token;
         timings.sampling = start.elapsed();
         self.decode_index = self.decode_index.saturating_add(1);
         Ok(DecodeToken {
@@ -457,6 +451,7 @@ impl Qwen36BoundedReferenceRuntime {
             diagnostics: DecodeDiagnostics {
                 per_layer_hashes,
                 router_trace,
+                top_logits,
                 timings,
             },
         })
@@ -479,32 +474,92 @@ fn bounded_layer_forward(
     expert_cache: &mut WholeExpertLfuCache,
     layer: &mut BoundedLayerState,
     input: &Qwen36Activation,
+    decode_index: u64,
+    input_token: u32,
 ) -> Result<(LayerId, Qwen36Activation, RouterResult)> {
     let id = match layer {
         BoundedLayerState::Gdn { id, .. } | BoundedLayerState::Full { id, .. } => *id,
     };
     let attn_weight = loader.load(TensorRole::AttnNorm, Some(id))?;
     let attn_weight = attn_weight.vector(broker)?;
+    maybe_dump_stage(decode_index, input_token, id, "layer_input", &input.values)?;
     let normalized = Qwen36Activation::qwen_rmsnorm(broker, input, &attn_weight.values)?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "attn_norm",
+        &normalized.values,
+    )?;
     let attended = match layer {
-        BoundedLayerState::Gdn { state, .. } => {
-            bounded_gdn(broker, loader, id, state, &normalized)?
-        }
-        BoundedLayerState::Full { state, .. } => {
-            bounded_full(broker, loader, id, state, &normalized)?
-        }
+        BoundedLayerState::Gdn { state, .. } => bounded_gdn(
+            broker,
+            loader,
+            id,
+            state,
+            &normalized,
+            decode_index,
+            input_token,
+        )?,
+        BoundedLayerState::Full { state, .. } => bounded_full(
+            broker,
+            loader,
+            id,
+            state,
+            &normalized,
+            decode_index,
+            input_token,
+        )?,
     };
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "attn_output",
+        &attended.values,
+    )?;
     let after_attention = Qwen36Activation::residual_add(broker, input, &attended)?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "attn_residual",
+        &after_attention.values,
+    )?;
     let ffn_weight = loader.load(TensorRole::FfnNorm, Some(id))?;
     let ffn_weight = ffn_weight.vector(broker)?;
     let ffn_input = Qwen36Activation::qwen_rmsnorm(broker, &after_attention, &ffn_weight.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "ffn_norm", &ffn_input.values)?;
     let mut moe = Qwen36StreamingMoe::open(loader, id)?;
-    let (moe, route) = moe.forward(loader, expert_cache, broker, &ffn_input)?;
-    Ok((
+    let (moe, route) = moe.forward_with_observer(
+        loader,
+        expert_cache,
+        broker,
+        &ffn_input,
+        |stage, activation| {
+            maybe_dump_stage(
+                decode_index,
+                input_token,
+                id,
+                match stage {
+                    "shared" => "moe_shared_output",
+                    "combined" => "moe_combined_output",
+                    _ => "moe_unknown_output",
+                },
+                &activation.values,
+            )
+        },
+    )?;
+    maybe_dump_stage(decode_index, input_token, id, "moe_output", &moe.values)?;
+    let output = Qwen36Activation::residual_add(broker, &after_attention, &moe)?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
         id,
-        Qwen36Activation::residual_add(broker, &after_attention, &moe)?,
-        route,
-    ))
+        "layer_output",
+        &output.values,
+    )?;
+    Ok((id, output, route))
 }
 
 fn bounded_gdn(
@@ -513,10 +568,13 @@ fn bounded_gdn(
     id: LayerId,
     state: &mut GdnState,
     input: &Qwen36Activation,
+    decode_index: u64,
+    input_token: u32,
 ) -> Result<Qwen36Activation> {
     let qkv = loader
         .load(TensorRole::GdnInProjQkv, Some(id))?
         .matvec(broker, &input.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "gdn_qkv", &qkv.values)?;
     let conv = loader
         .load(TensorRole::GdnConv1d, Some(id))?
         .gdn_conv1d_weights(broker)?;
@@ -524,6 +582,13 @@ fn bounded_gdn(
     state
         .conv_tail_mut()
         .step_without_bias_into(&qkv.values, &conv.values, &mut convolved.values);
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "gdn_conv_silu",
+        &convolved.values,
+    )?;
     let mut q =
         Qwen36Activation::from_slice(broker, &convolved.values[..Qwen36Geometry::GDN_KEY_DIM])?;
     let mut k = Qwen36Activation::from_slice(
@@ -533,15 +598,21 @@ fn bounded_gdn(
     let v =
         Qwen36Activation::from_slice(broker, &convolved.values[Qwen36Geometry::GDN_KEY_DIM * 2..])?;
     qk_norm_in_place(&mut q, &mut k)?;
+    maybe_dump_stage(decode_index, input_token, id, "gdn_q_norm", &q.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "gdn_k_norm", &k.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "gdn_v", &v.values)?;
     let z = loader
         .load(TensorRole::GdnInProjZ, Some(id))?
         .matvec(broker, &input.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "gdn_z", &z.values)?;
     let alpha = loader
         .load(TensorRole::GdnInProjA, Some(id))?
         .matvec(broker, &input.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "gdn_alpha", &alpha.values)?;
     let beta = loader
         .load(TensorRole::GdnInProjB, Some(id))?
         .matvec(broker, &input.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "gdn_beta", &beta.values)?;
     let a_neg_exp = loader.load(TensorRole::GdnALog, Some(id))?.vector(broker)?;
     let dt_bias = loader
         .load(TensorRole::GdnDtBias, Some(id))?
@@ -559,13 +630,35 @@ fn bounded_gdn(
             dt_bias: &dt_bias.values,
         },
     )?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "gdn_recurrent",
+        &recurrent.values,
+    )?;
     let gated_weight = loader
         .load(TensorRole::GdnGatedNorm, Some(id))?
         .vector(broker)?;
     let gated = gated_norm_accounted(broker, &recurrent, &z, &gated_weight.values)?;
-    loader
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "gdn_gated_norm",
+        &gated.values,
+    )?;
+    let output = loader
         .load(TensorRole::GdnOutProj, Some(id))?
-        .matvec(broker, &gated.values)
+        .matvec(broker, &gated.values)?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "gdn_out_projection",
+        &output.values,
+    )?;
+    Ok(output)
 }
 
 fn bounded_full(
@@ -574,17 +667,36 @@ fn bounded_full(
     id: LayerId,
     state: &mut FullAttentionLayer,
     input: &Qwen36Activation,
+    decode_index: u64,
+    input_token: u32,
 ) -> Result<Qwen36Activation> {
     let projected = loader
         .load(TensorRole::AttnQProj, Some(id))?
         .matvec(broker, &input.values)?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "full_q_gate_projection",
+        &projected.values,
+    )?;
     let (mut query, gate) = split_query_gate_accounted(broker, &projected)?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "full_query_raw",
+        &query.values,
+    )?;
+    maybe_dump_stage(decode_index, input_token, id, "full_gate_raw", &gate.values)?;
     let mut key = loader
         .load(TensorRole::AttnKProj, Some(id))?
         .matvec(broker, &input.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "full_key_raw", &key.values)?;
     let value = loader
         .load(TensorRole::AttnVProj, Some(id))?
         .matvec(broker, &input.values)?;
+    maybe_dump_stage(decode_index, input_token, id, "full_value", &value.values)?;
     let q_norm = loader
         .load(TensorRole::AttnQNorm, Some(id))?
         .vector(broker)?;
@@ -600,9 +712,32 @@ fn bounded_full(
         &q_norm.values,
         &k_norm.values,
     )?;
-    loader
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "full_query_rope",
+        &query.values,
+    )?;
+    maybe_dump_stage(decode_index, input_token, id, "full_key_rope", &key.values)?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "full_attn_gated",
+        &attended.values,
+    )?;
+    let output = loader
         .load(TensorRole::AttnOProj, Some(id))?
-        .matvec(broker, &attended.values)
+        .matvec(broker, &attended.values)?;
+    maybe_dump_stage(
+        decode_index,
+        input_token,
+        id,
+        "full_out_projection",
+        &output.values,
+    )?;
+    Ok(output)
 }
 
 impl Qwen36Layer {
@@ -735,6 +870,52 @@ fn maybe_dump_activation(
     let file = std::fs::File::create(path)?;
     let mut writer = BufWriter::new(file);
     for value in &activation.values {
+        writer.write_all(&value.to_bits().to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn maybe_dump_stage(
+    decode_index: u64,
+    input_token: u32,
+    layer: LayerId,
+    stage: &'static str,
+    values: &[f32],
+) -> Result<()> {
+    let Some(directory) = std::env::var_os("TQF_DEV_STAGE_DUMP_DIR") else {
+        return Ok(());
+    };
+    let selected_layer = std::env::var("TQF_DEV_STAGE_DUMP_LAYER")
+        .map_err(|_| {
+            ModelError::Unsupported(
+                "TQF_DEV_STAGE_DUMP_DIR requires TQF_DEV_STAGE_DUMP_LAYER".to_string(),
+            )
+        })?
+        .parse::<u8>()
+        .map_err(|_| {
+            ModelError::Unsupported(
+                "TQF_DEV_STAGE_DUMP_LAYER must be an integer from 0 through 39".to_string(),
+            )
+        })?;
+    if selected_layer as usize >= Qwen36Geometry::NUM_LAYERS {
+        return Err(ModelError::Unsupported(
+            "TQF_DEV_STAGE_DUMP_LAYER must be an integer from 0 through 39".to_string(),
+        )
+        .into());
+    }
+    if layer.0 != selected_layer {
+        return Ok(());
+    }
+    let directory = Path::new(&directory);
+    std::fs::create_dir_all(directory)?;
+    let path = directory.join(format!(
+        "decode-{decode_index:06}-input-{input_token}-layer-{:02}-stage-{stage}.f32le",
+        layer.0
+    ));
+    let file = std::fs::File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    for value in values {
         writer.write_all(&value.to_bits().to_le_bytes())?;
     }
     writer.flush()?;

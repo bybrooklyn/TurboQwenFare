@@ -21,9 +21,10 @@ Implementation coverage now extends through the Phase 18 reference/bounded basel
 full attention, exact MoE routing/shared/routed computation, a 40-layer decode graph, normalized
 OpenAI streaming adapters, canonical download/conversion/receipt startup, and a whole-expert LFU
 cache with exact load plans. A pinned real Q4_K_M checkpoint passes source and installed-container
-topology validation, release headless server probes, and a one-token greedy comparison against a
-pinned external oracle. This is not equivalent to closing every Phase 13-18 exit gate: Phase 15's
-16/128/512-token matrix (especially the required 512-token reference sequence), OS-observed 4 GiB
+topology validation, release headless server probes, and exact 1- and 16-token greedy comparisons
+against a pinned external oracle. This is not equivalent to closing every Phase 13-18 exit gate:
+Phase 15's broader workload matrix and 128/512-token lengths (especially the required 512-token
+reference sequence), OS-observed 4 GiB
 qualification, the >=15 tok/s floor, combined <=1% quality qualification, plain GUI startup, and
 RTX 3070 Ti/CUDA qualification remain open. Phase 19 and later implementation is not started. Check
 the current code, tests, and `docs/research/canonical-source-manifest.md` before making a stronger

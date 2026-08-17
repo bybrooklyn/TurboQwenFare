@@ -12,6 +12,9 @@ back up with the how/when/source of each value.
 - [`upstream-precedent.md`](upstream-precedent.md) — frozen TurboFieldfare
   and NVMAI commit references, the findings table, the "must not copy"
   list, and an experiments-to-reproduce checklist.
+- [`oracles/`](oracles/) — versioned, token-only outputs from pinned external
+  research runtimes. TQF consumes these as qualification inputs; external
+  runtime code is never linked or shipped.
 
 ## Status against spec §272's task list
 
