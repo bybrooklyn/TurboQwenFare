@@ -46,12 +46,38 @@ from the bibliography, not because they were independently re-mined here.
 | R14 | [`2ddf68e`](https://github.com/Pummelchen/NVMAI/commit/2ddf68e48ea29ef60a082abba309b37ef6a64506) | Persistent KV + GDN snapshots |
 | R15 | [`2c3c7b8`](https://github.com/Pummelchen/NVMAI/commit/2c3c7b8ccd8537f4d2d26ce03c66f304b1689012) | CPU MTP drafting (negative result) |
 | R16 | [`7cc8b5e`](https://github.com/Pummelchen/NVMAI/commit/7cc8b5ea98fc788b87fea83941b8181196d521f5) | Targeted `F_RDADVISE` |
-| R17 | production hardening commit (trusted receipts, schema/path/server/GPU failure hardening) — cited by spec but not yet re-fetched here. | |
+| R17 | [`19aafd8`](https://github.com/Pummelchen/NVMAI/commit/19aafd8fe2d99ca2e761c785b4a44f6bf119a79a) | Trusted receipts plus schema/path/server/GPU failure hardening |
 
-None of these commits have been re-cloned/diffed into this repository yet
-— that's real engineering work for the phases that actually port each
-technique (expert I/O parallelism is Phase 19, MoE MSL kernels are Phase
-20, etc.), not something Phase 0 needs to do speculatively.
+### Phase 19–20 re-mining (2026-08-16)
+
+NVMAI was cloned outside the product repository at commit
+`fd8234bd53487c854b0047dc007d5d79d36580c3`. The frozen R9, R11, R13, and
+R16 diffs were inspected directly rather than relying only on their commit
+messages. This clone is research input only; TQF remains one Rust crate and
+does not link or ship NVMAI.
+
+- R9 parallelizes only independently reserved cache misses. Each `pread`
+  writes to a distinct destination slot; bookkeeping publication is locked
+  and happens after the read. The serial path remains available for A/B.
+  Its reported experiment used interleaved fresh servers and 512 greedy
+  tokens, and compared both I/O wall time and end-to-end decode.
+- R16 changed a host-derived default after five interleaved 128-token rounds.
+  It was beneficial on an M3/Q4 deployment and neutral on another host, which
+  confirms TQF's `BENCHMARK-SELECTED` requirement: `F_RDADVISE` cannot be a
+  universal compile-time default.
+- R11 stages the shared 2,048-element activation in threadgroup memory and
+  maps 16 phase-1 rows to a 512-thread group. The porting requirement is the
+  measured technique and its parity test, not a blind copy of NVMAI's affine
+  INT4 physical layout, which differs from canonical GGUF Q4_K.
+- R13 fuses QKV/Z/alpha/beta by dispatching one concatenated row space while
+  preserving the existing per-row math and operand order. Its own measurement
+  improved the stage by 6.6% but did not move end-to-end throughput outside
+  noise. TQF must therefore retain separate and fused paths and reject the
+  fused candidate if its own end-to-end A/B does not win.
+
+No NVMAI source has been copied into TQF at this point. Any later direct code
+adaptation must carry the Apache-2.0 notice and prominent modification marker
+required by the specification.
 
 ### Findings → TQF actions (spec §15, reproduced for local reference)
 
