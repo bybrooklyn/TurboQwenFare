@@ -4,6 +4,8 @@
 //! router and expert math have an unambiguous correctness oracle before any
 //! I/O/cache policy can complicate failures (spec §286, §149-151).
 
+pub mod policy;
+
 use crate::backend::reference::{q4k_gemv, sigmoid, silu};
 use crate::dev::inventory::TensorRole;
 use crate::error::{ModelError, Result};

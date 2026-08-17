@@ -508,6 +508,10 @@ impl LoadedQwen36Expert {
     const UP_BYTES: usize = 589_824;
     const DOWN_BYTES: usize = 589_824;
 
+    pub const fn canonical_stored_bytes() -> Bytes {
+        Bytes((Self::GATE_BYTES + Self::UP_BYTES + Self::DOWN_BYTES) as u64)
+    }
+
     /// Executes this Q4_K whole-expert payload in the canonical SwiGLU
     /// order. The cache retains the bytes; each activation remains a separate
     /// broker-accounted transient allocation.

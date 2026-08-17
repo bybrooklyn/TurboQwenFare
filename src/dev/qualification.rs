@@ -335,6 +335,7 @@ pub fn qualify_oracle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::experts::policy::ExpertRouteTrace;
 
     fn artifact(length: usize) -> GreedyOracleArtifact {
         GreedyOracleArtifact {
@@ -377,6 +378,28 @@ mod tests {
         let error = verify_greedy_sequence(&[10], &[12], |input| Ok(input + 1)).unwrap_err();
         assert!(error.to_string().contains("generated token 0"));
         assert!(error.to_string().contains("expected 12, got 11"));
+    }
+
+    #[test]
+    fn emitted_route_trace_matches_the_phase21_replay_schema() {
+        let trace = QualificationRouteTrace {
+            schema_version: 1,
+            fixture_id: "fixture".to_string(),
+            model_source_sha256: pinned::LANGUAGE_CHECKPOINT_SHA256.to_string(),
+            steps: vec![QualificationRouteStep {
+                decode_step: 1,
+                input_token: 32,
+                output_token: 220,
+                layers: vec![QualificationRouteLayer {
+                    layer: 0,
+                    expert_ids: [0, 1, 2, 3, 4, 5, 6, 7],
+                    weights: [0.125; 8],
+                }],
+            }],
+        };
+        let bytes = serde_json::to_vec(&trace).unwrap();
+        let replay: ExpertRouteTrace = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(replay.steps[0].layers[0].expert_ids[7], 7);
     }
 
     #[test]
