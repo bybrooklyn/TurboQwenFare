@@ -5,7 +5,8 @@
 //! broker, cache, and model loop. This keeps external runtime code out of the
 //! product while making Phase 15's 1/16/128/512-token gate reproducible.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ModelError, Result};
 use crate::format::gguf;
 use crate::ids::Bytes;
-use crate::memory::MemoryBroker;
+use crate::memory::{MemoryBroker, MemoryClass, MemoryOwner};
 use crate::model::qwen36::geometry::Qwen36Geometry;
 use crate::model::qwen36::runtime::Qwen36BoundedReferenceRuntime;
 use crate::source::pinned;
@@ -52,8 +53,54 @@ pub struct GreedyQualificationReport {
     pub broker_reserved_bytes_after_run: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct QualificationRouteTrace {
+    pub schema_version: u32,
+    pub fixture_id: String,
+    pub model_source_sha256: String,
+    pub steps: Vec<QualificationRouteStep>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QualificationRouteStep {
+    pub decode_step: usize,
+    pub input_token: u32,
+    pub output_token: u32,
+    pub layers: Vec<QualificationRouteLayer>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QualificationRouteLayer {
+    pub layer: u8,
+    pub expert_ids: [u16; 8],
+    pub weights: [f32; 8],
+}
+
 fn qualification_error(message: impl Into<String>) -> crate::error::TqfError {
     ModelError::Unsupported(format!("qualification artifact: {}", message.into())).into()
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = PathBuf::from(format!("{}.tmp", path.display()));
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| qualification_error(format!("failed to serialize trace: {error}")))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub fn load_oracle(path: &Path) -> Result<GreedyOracleArtifact> {
@@ -170,6 +217,32 @@ pub fn qualify_oracle(
         context_capacity,
         Bytes(DEFAULT_EXPERT_CACHE_BYTES),
     )?;
+    let route_trace_path = std::env::var_os("TQF_QUALIFICATION_ROUTE_TRACE").map(PathBuf::from);
+    let maximum_decode_steps = artifact
+        .prompt_tokens
+        .len()
+        .checked_add(artifact.generated_tokens.len().saturating_sub(1))
+        .ok_or_else(|| qualification_error("route trace step count overflow"))?;
+    let route_trace_bytes = maximum_decode_steps
+        .checked_mul(Qwen36Geometry::NUM_LAYERS)
+        .and_then(|records| records.checked_mul(128))
+        .ok_or_else(|| qualification_error("route trace reservation overflow"))?;
+    let _route_trace_lease = route_trace_path
+        .as_ref()
+        .map(|_| {
+            broker.reserve(
+                MemoryOwner::Scratch,
+                MemoryClass::Transient,
+                Bytes(route_trace_bytes.max(1) as u64),
+                64,
+            )
+        })
+        .transpose()?;
+    let mut route_steps = Vec::with_capacity(if route_trace_path.is_some() {
+        maximum_decode_steps
+    } else {
+        0
+    });
     let started = Instant::now();
     let mut last_top_logits = None;
     let show_progress = std::env::var("TQF_QUALIFICATION_PROGRESS").as_deref() == Ok("1");
@@ -188,6 +261,23 @@ pub fn qualify_oracle(
             }
             last_top_logits = Some(decoded.diagnostics.top_logits);
             completed_decode_steps += 1;
+            if route_trace_path.is_some() {
+                route_steps.push(QualificationRouteStep {
+                    decode_step: completed_decode_steps,
+                    input_token: input,
+                    output_token: decoded.token,
+                    layers: decoded
+                        .diagnostics
+                        .router_trace
+                        .iter()
+                        .map(|trace| QualificationRouteLayer {
+                            layer: trace.layer.0,
+                            expert_ids: trace.route.ids.map(|expert| expert.0),
+                            weights: trace.route.weights,
+                        })
+                        .collect(),
+                });
+            }
             if show_progress {
                 let cache = runtime.expert_cache_stats();
                 println!(
@@ -216,6 +306,17 @@ pub fn qualify_oracle(
         ))
     })?;
     let cache = runtime.expert_cache_stats();
+    if let Some(path) = route_trace_path {
+        write_json_atomic(
+            &path,
+            &QualificationRouteTrace {
+                schema_version: 1,
+                fixture_id: artifact.fixture_id.clone(),
+                model_source_sha256: artifact.model_source_sha256.clone(),
+                steps: route_steps,
+            },
+        )?;
+    }
     Ok(GreedyQualificationReport {
         fixture_id: artifact.fixture_id.clone(),
         prompt_tokens: artifact.prompt_tokens.len(),
