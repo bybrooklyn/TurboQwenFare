@@ -15,6 +15,9 @@ back up with the how/when/source of each value.
 - [`oracles/`](oracles/) — versioned, token-only outputs from pinned external
   research runtimes. TQF consumes these as qualification inputs; external
   runtime code is never linked or shipped.
+- [`qualification/`](qualification/) — immutable result records tying a TQF
+  commit and canonical source fingerprint to an executed oracle fixture and
+  its measured cache/broker evidence.
 
 ## Status against spec §272's task list
 
