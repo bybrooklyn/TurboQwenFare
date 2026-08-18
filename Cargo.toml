@@ -44,6 +44,7 @@ tokenizers = "0.23.1"
 # manifest's own `metal` compute-backend feature (spec §49: "mature
 # Objective-C/Metal bindings for device/queue/resource management").
 metal-sys = { package = "metal", version = "0.33", optional = true }
+libc = "0.2.189"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

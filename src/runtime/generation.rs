@@ -233,6 +233,23 @@ impl QwenRuntimeInstance {
         }
     }
 
+    /// Phase 26 (spec §298): the resident runtimes prefill a prompt in
+    /// chunked, layer-outer form with expert-set dedup; the bounded
+    /// runtime keeps the per-token loop (its chunked form is a later
+    /// step). Returns the greedy token after the final prompt token.
+    fn prefill(&mut self, prompt: &[u32]) -> Result<u32> {
+        match self {
+            Self::Resident(runtime) => runtime.prefill_greedy(prompt),
+            Self::Bounded(runtime) => {
+                let mut next = 0;
+                for &token in prompt {
+                    next = runtime.decode_greedy(token)?.token;
+                }
+                Ok(next)
+            }
+        }
+    }
+
     fn reset_session(&mut self) {
         match self {
             Self::Resident(runtime) => runtime.reset_session(),
@@ -345,6 +362,38 @@ impl Qwen36ResidentReferenceGenerator {
         })
     }
 
+    /// Phase 25 profile (spec §297): the resident-core streaming runtime -
+    /// attention/GDN/router/shared-expert weights stay resident and
+    /// broker-accounted (~2.13 GiB for the canonical container), while
+    /// routed Q4_K experts stream through the global cache. This removes
+    /// the per-token re-reads of the bounded profile at the cost of
+    /// pinning the core. Selected by the `TQF_DEV_RESIDENT_STREAMING`
+    /// developer control; it becomes the default only after the M4
+    /// assault records a measured end-to-end win.
+    pub fn open_resident_streaming(
+        tqf_path: &Path,
+        tokenizer_gguf_path: &Path,
+        memory_budget: Bytes,
+        max_context: usize,
+        expert_cache_bytes: Bytes,
+    ) -> Result<Self> {
+        let broker = MemoryBroker::new(memory_budget);
+        let gguf = gguf::open_with_broker(tokenizer_gguf_path, &broker)?;
+        let tokenizer = TqfTokenizer::from_gguf(&gguf)?;
+        let runtime = Qwen36ReferenceRuntime::open_streaming(
+            tqf_path,
+            broker,
+            max_context,
+            expert_cache_bytes,
+        )?;
+        Ok(Self {
+            tokenizer: Mutex::new(tokenizer),
+            _tokenizer_source: gguf,
+            runtime: Arc::new(Mutex::new(QwenRuntimeInstance::Resident(runtime))),
+            max_context,
+        })
+    }
+
     fn prompt_tokens(&self, request: &NormalizedRequest) -> Result<Vec<u32>> {
         if !request.vision.is_empty() {
             return Err(ProtocolError::Invalid(
@@ -426,17 +475,35 @@ impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
             tokio::task::spawn_blocking(move || -> Result<(Vec<u32>, bool)> {
                 let mut runtime = runtime.lock().expect("Qwen runtime mutex poisoned");
                 runtime.reset_session();
-                let mut next = 0;
-                for token in prompt {
-                    if cancellation_for_decode.is_cancelled() {
-                        return Err(TqfError::Cancelled);
-                    }
-                    let cache_before = runtime.expert_cache_stats();
-                    let decoded = runtime.decode_greedy(token)?;
-                    let cache_after = runtime.expert_cache_stats();
-                    emit_decode_diagnostics(token, &decoded, cache_before, cache_after);
-                    next = decoded.token;
+                if cancellation_for_decode.is_cancelled() {
+                    return Err(TqfError::Cancelled);
                 }
+                // Phase 26: chunked prefill with expert-set dedup (the
+                // resident runtimes) or the per-token reference loop.
+                let prefill_started = std::time::Instant::now();
+                let cache_before = runtime.expert_cache_stats();
+                let next = runtime.prefill(&prompt)?;
+                let cache_after = runtime.expert_cache_stats();
+                tracing::info!(
+                    prompt_tokens = prompt.len(),
+                    prefill_ms = prefill_started.elapsed().as_secs_f64() * 1000.0,
+                    "Qwen3.6 prefill"
+                );
+                if let (Some(before), Some(after)) = (cache_before, cache_after) {
+                    tracing::info!(
+                        prefill_expert_hits = after.hits.saturating_sub(before.hits),
+                        prefill_expert_misses = after.misses.saturating_sub(before.misses),
+                        prefill_raw_miss_bytes = after
+                            .raw_miss_bytes
+                            .0
+                            .saturating_sub(before.raw_miss_bytes.0),
+                        prefill_demand_io_ms =
+                            after.demand_io_nanos.saturating_sub(before.demand_io_nanos) as f64
+                                / 1e6,
+                        "Qwen3.6 prefill expert I/O"
+                    );
+                }
+                let mut next = next;
                 let mut output = Vec::with_capacity(maximum);
                 let mut reached_eos = false;
                 for _ in 0..maximum {

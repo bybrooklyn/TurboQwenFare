@@ -60,6 +60,11 @@ struct PendingExpert {
     stored_bytes: u32,
     tiles: Vec<ExpertTileRecord>,
     digest: [u8; 32],
+    /// Per-tile BLAKE3 digests in tile order; empty for the canonical
+    /// whole-region layout. Present exactly when the expert index record's
+    /// `EXPERT_INDEX_FLAG_TILE_CHECKSUMS` flag is set, so a reader can
+    /// verify a partial (tile-granular) read instead of the whole extent.
+    tile_digests: Vec<[u8; 32]>,
 }
 
 /// Plain-data, journal-serializable snapshot of a `PendingExtent` (spec
@@ -103,6 +108,10 @@ pub struct RecoveredExpert {
     pub stored_bytes: u32,
     pub tiles: Vec<RecoveredTile>,
     pub digest: [u8; 32],
+    /// Present exactly when the expert index record carries
+    /// `EXPERT_INDEX_FLAG_TILE_CHECKSUMS` (Phase 22 tiled layouts).
+    #[serde(default)]
+    pub tile_digests: Vec<[u8; 32]>,
 }
 
 impl PendingExtent {
@@ -165,6 +174,7 @@ impl PendingExpert {
                 })
                 .collect(),
             digest: self.digest,
+            tile_digests: self.tile_digests.clone(),
         }
     }
 
@@ -196,6 +206,7 @@ impl PendingExpert {
             stored_bytes: r.stored_bytes,
             tiles,
             digest: r.digest,
+            tile_digests: r.tile_digests.clone(),
         })
     }
 }
@@ -417,6 +428,47 @@ impl TqfWriter {
         up: &[u8],
         down: &[u8],
     ) -> Result<RecoveredExpert> {
+        self.write_expert_parts_with_width(
+            layer,
+            expert,
+            quant_layout_id,
+            gate,
+            up,
+            down,
+            super::tiling::NeuronWidth::Whole,
+        )
+    }
+
+    /// Phase 22 tiled form (spec §294): emits neuron-width sub-tiles for
+    /// gate/up and the legal block-aligned widths for down, each with its
+    /// own BLAKE3 digest so a runtime may admit and verify tiles
+    /// independently. The superextent bytes on disk are identical to the
+    /// canonical layout - only the tile metadata gains granularity - so a
+    /// tiled container needs no format migration and remains readable by
+    /// the Phase 6 whole-region path.
+    pub fn write_expert_parts_tiled(
+        &mut self,
+        layer: LayerId,
+        expert: ExpertId,
+        quant_layout_id: u16,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+        width: super::tiling::NeuronWidth,
+    ) -> Result<RecoveredExpert> {
+        self.write_expert_parts_with_width(layer, expert, quant_layout_id, gate, up, down, width)
+    }
+
+    fn write_expert_parts_with_width(
+        &mut self,
+        layer: LayerId,
+        expert: ExpertId,
+        quant_layout_id: u16,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+        width: super::tiling::NeuronWidth,
+    ) -> Result<RecoveredExpert> {
         if self
             .experts
             .iter()
@@ -442,28 +494,67 @@ impl TqfWriter {
         let gate_up_bytes = gate.len() + up.len();
         let stored_bytes = (gate_up_bytes + down.len()) as u32;
 
-        let tiles = vec![
-            ExpertTileRecord {
-                matrix: ExpertMatrix::GateUp,
-                tile_id: TileId(0),
-                neuron_start: 0,
-                neuron_count: 0,
-                relative_offset: 0,
-                stored_bytes: gate_up_bytes as u32,
-                quant_layout_id,
-                flags: 0,
-            },
-            ExpertTileRecord {
-                matrix: ExpertMatrix::Down,
-                tile_id: TileId(1),
-                neuron_start: 0,
-                neuron_count: 0,
-                relative_offset: gate_up_bytes as u32,
-                stored_bytes: down.len() as u32,
-                quant_layout_id,
-                flags: 0,
-            },
-        ];
+        // Non-Qwen synthetic fixtures may not divide at the requested
+        // width; they fall back to the canonical whole-region layout.
+        let divisible = super::tiling::layout_is_divisible(
+            width,
+            gate.len() as u32,
+            up.len() as u32,
+            down.len() as u32,
+        );
+        let mut tiles = if divisible {
+            super::tiling::tile_plan(width, gate.len() as u32, up.len() as u32, down.len() as u32)
+        } else {
+            vec![
+                ExpertTileRecord {
+                    matrix: ExpertMatrix::GateUp,
+                    tile_id: TileId(0),
+                    neuron_start: 0,
+                    neuron_count: 0,
+                    relative_offset: 0,
+                    stored_bytes: gate_up_bytes as u32,
+                    quant_layout_id,
+                    flags: 0,
+                },
+                ExpertTileRecord {
+                    matrix: ExpertMatrix::Down,
+                    tile_id: TileId(1),
+                    neuron_start: 0,
+                    neuron_count: 0,
+                    relative_offset: gate_up_bytes as u32,
+                    stored_bytes: down.len() as u32,
+                    quant_layout_id,
+                    flags: 0,
+                },
+            ]
+        };
+        for tile in &mut tiles {
+            tile.quant_layout_id = quant_layout_id;
+        }
+        if tiles.is_empty() || tiles[0].matrix != ExpertMatrix::GateUp {
+            return Err(ContainerError::MalformedRecord {
+                table: "expert tile plan must begin with a GateUp tile",
+            }
+            .into());
+        }
+        // Phase 22 tiled layouts emit per-tile digests; the canonical
+        // Whole layout stays bit-identical to the Phase 6 container
+        // (whole-extent digest only, no flag). Tiled gate/up tiles never
+        // cross the gate|up boundary, so each digest hashes a slice of
+        // one source matrix directly - no temporary concatenation.
+        let mut tile_digests = Vec::with_capacity(tiles.len());
+        if !width.is_whole() {
+            for tile in &tiles {
+                let start = tile.relative_offset as usize;
+                let end = start + tile.stored_bytes as usize;
+                let bytes = match tile.matrix {
+                    ExpertMatrix::GateUp if start < gate.len() => &gate[start..end],
+                    ExpertMatrix::GateUp => &up[start - gate.len()..end - gate.len()],
+                    ExpertMatrix::Down => &down[start - gate_up_bytes..end - gate_up_bytes],
+                };
+                tile_digests.push(*blake3::hash(bytes).as_bytes());
+            }
+        }
 
         self.experts.push(PendingExpert {
             layer,
@@ -472,6 +563,7 @@ impl TqfWriter {
             stored_bytes,
             tiles,
             digest: *hasher.finalize().as_bytes(),
+            tile_digests,
         });
         self.next_offset = aligned_offset + stored_bytes as u64;
         Ok(self.experts.last().expect("just pushed").to_recovered())
@@ -510,6 +602,15 @@ impl TqfWriter {
                     hash_kind: ChecksumEntry::BLAKE3_256,
                     digest: e.digest,
                 });
+                // Phase 22: per-tile digests follow the whole-extent digest
+                // in tile order; the expert index record's flag bit tells
+                // readers the entries exist.
+                for digest in &e.tile_digests {
+                    checksums.push(ChecksumEntry {
+                        hash_kind: ChecksumEntry::BLAKE3_256,
+                        digest: *digest,
+                    });
+                }
                 idx
             })
             .collect();
@@ -547,7 +648,11 @@ impl TqfWriter {
             let rec = ExpertIndexRecord {
                 layer: ex.layer,
                 expert: ex.expert,
-                flags: 0,
+                flags: if ex.tile_digests.is_empty() {
+                    0
+                } else {
+                    super::records::EXPERT_INDEX_FLAG_TILE_CHECKSUMS
+                },
                 // The index repeats the tile layout so cache admission can
                 // reject an unsupported expert before reading its payload.
                 // `write_expert_parts` always emits at least the GateUp tile.

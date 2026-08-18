@@ -30,6 +30,7 @@ const DEV_SKIP_MODEL_CHECK_ENV: &str = "TQF_DEV_UNSAFE_SKIP_MODEL_CHECK";
 /// Enables the deliberately high-memory Phase-14/15 reference profile. It
 /// is for parity qualification and real protocol wiring, not normal use.
 const DEV_RESIDENT_REFERENCE_ENV: &str = "TQF_DEV_RESIDENT_REFERENCE";
+const DEV_RESIDENT_STREAMING_ENV: &str = "TQF_DEV_RESIDENT_STREAMING";
 /// Enables the Phase-18 whole-expert streaming reference graph. It still
 /// uses the same bounded graph as normal startup; this switch only makes the
 /// developer qualification profile explicit in startup output.
@@ -120,6 +121,29 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 "tqf: starting the developer whole-expert streaming reference server over the \
                  bounded runtime."
             );
+            return runtime.block_on(run_server(cli, config, true, Some(generator)));
+        }
+        if std::env::var(DEV_RESIDENT_STREAMING_ENV).as_deref() == Ok("1") {
+            let receipts_dir = paths::receipts_dir()?;
+            let receipt =
+                receipt::load_trusted_receipt(&receipts_dir, &setup_broker).ok_or_else(|| {
+                    crate::error::ModelError::Unsupported(
+                        "trusted receipt disappeared or failed validation before resident \
+                         streaming runtime load"
+                            .to_string(),
+                    )
+                })?;
+            let budget = config.memory_budget_bytes.unwrap_or(4 * 1024 * 1024 * 1024);
+            let context = config.context_limit_tokens.unwrap_or(128 * 1024) as usize;
+            let generator: Arc<dyn Qwen36Generator> =
+                Arc::new(Qwen36ResidentReferenceGenerator::open_resident_streaming(
+                    &receipt.tqf_path,
+                    &receipt.tokenizer_gguf_path,
+                    Bytes(budget),
+                    context,
+                    Bytes(budget / 4),
+                )?);
+            println!("tqf: starting the Phase 25 resident-core streaming reference server.");
             return runtime.block_on(run_server(cli, config, true, Some(generator)));
         }
         if std::env::var(DEV_RESIDENT_REFERENCE_ENV).as_deref() == Ok("1") {

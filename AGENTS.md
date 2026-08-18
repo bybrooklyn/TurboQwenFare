@@ -64,11 +64,48 @@ workload matrix and its literal 512-token exact-match requirement (two independe
 were made and both diverged on a near-tied logit around token 197 and token 24 respectively — see
 `docs/research/qualification/raw-a-512-divergence-investigation.md` for the full root-cause writeup;
 short version: this looks like ordinary floating-point non-associativity between TQF and the
-independent oracle rather than a defect, but the literal exit gate as worded does not close), OS-observed
-4 GiB qualification, the >=15 tok/s floor, combined <=1% quality qualification, plain GUI startup, and
-RTX 3070 Ti/CUDA qualification. Phase 20's kernel fusion and live-loop wiring, and Phase 22 and later,
-are not started. Check the current code, tests, and `docs/research/canonical-source-manifest.md` before
-making a stronger status claim.
+independent oracle rather than a defect, but the literal exit gate as worded does not close), combined
+<=1% quality qualification, plain GUI startup, and RTX 3070 Ti/CUDA qualification. Phase 20's kernel
+fusion and live-loop wiring are still not wired. Check the current code, tests, and
+`docs/research/canonical-source-manifest.md` before making a stronger status claim.
+
+Phases 22-26 are now implemented and recorded; each has a measured qualification ledger in
+`docs/research/qualification/`:
+
+- **Phase 22 (tiled experts):** neuron-width tile layouts (64/128/256/mixed) with per-tile BLAKE3
+  checksums (`format::tqf::tiling`, `TQF_EXPERT_TILE_NEURONS` conversion control, no format
+  migration), tile-granular verified reads, and an O(1)-LRU tile replay simulator. The real
+  128-token route-trace A/B shows tiling changes fetched bytes by ~0% while multiplying read
+  syscalls 5-9x — **whole-expert admission stays the default (recorded negative result)**.
+  `docs/research/qualification/phase-22-tiled-experts.md`.
+- **Phase 23 (predictive prefetch):** `experts::prefetch` transition/co-routing predictor with
+  decay, offline replay logging precision/recall/timeliness/wasted bytes, and a live opt-in path
+  in the cache (probation entries, `TQF_PREFETCH_ENABLED`/`TQF_PREFETCH_DEPTH`). Replay: 42-57%
+  precision, -19..52% demand-miss bytes at depth 8, but +45..56% total SSD traffic at the
+  capacities where the cache already works (depth 4 wins only below the reuse floor) — **stays
+  off by default pending a live A/B**. `docs/research/qualification/phase-23-predictive-prefetch.md`.
+- **Phase 24 (hard 4G broker):** OS footprint sampler (`memory::os_sampler`, macOS `task_info`/
+  Linux `/proc/self/statm`), per-owner reserved breakdown + peak tracking in the broker, a 200k-step
+  adversarial churn test, and real-checkpoint OS qualification: peak RSS 1,777 MiB vs broker peak
+  1,488 MiB (689 MiB measured overhead envelope) on the resident-core streaming profile.
+  `docs/research/qualification/phase-24-4g-broker-certification.md`.
+- **Phase 25 (M4 assault):** resident-core streaming profile wired (`TQF_DEV_RESIDENT_STREAMING`;
+  2.13 GiB measured core) — fixes the bounded runtime's per-token re-reads and a stale resident-path
+  conv bug; bit-identical NEON Q4_K/Q6_K/Q8_0 dot kernels (`simd/`, differential fuzz-tested,
+  A/B controls `TQF_SIMD_Q4K/Q6K/Q8_0`); activation-quantization hoisting. Measured: 23.4 → 2.34
+  s/token (10x) with exact 16-token oracle parity, but **78% of decode is demand I/O**: the
+  container lives on an external flash drive reading 139 MB/s against ~230-280 MB/token of expert
+  misses. The 15 tok/s floor is NOT closed; the ledger (parallel MoE compute, container placement,
+  LM-head loop, live prefetch) is in `docs/research/qualification/phase-25-m4-assault.md`.
+- **Phase 26 (prefill):** chunked layer-outer prefill with per-(layer, chunk) expert-set dedup
+  (`WholeExpertLfuCache::prepare_batch_route`, `Qwen36StreamingMoe::forward_batch`,
+  `Qwen36ReferenceRuntime::prefill_greedy` with broker-pressure chunk autotuning), wired into the
+  generation loop. Measured 53-token prompt: **1.81x TTFT** (142.7 s → 78.8 s), 2.18x fewer expert
+  fetches/bytes, identical greedy continuation. `docs/research/qualification/phase-26-prefill.md`.
+
+The re-captured exact-router trace for these replays is committed at
+`docs/research/qualification/raw-a-128-route-trace.json` (set `TQF_QUALIFICATION_ROUTE_TRACE` to it
+to re-run the Phase 21-23 replay harnesses).
 
 ## Commands
 

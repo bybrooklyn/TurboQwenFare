@@ -219,6 +219,12 @@ impl TensorExtentRecord {
     }
 }
 
+/// Phase 22 (spec §294): set on an `ExpertIndexRecord` when the checksum
+/// table carries one BLAKE3 digest per tile (in tile order) immediately
+/// after the expert's whole-extent digest. Readers may then verify
+/// tile-granular reads; without the flag, partial reads are refused.
+pub const EXPERT_INDEX_FLAG_TILE_CHECKSUMS: u16 = 1;
+
 /// Layout invented for Phase 6 (spec §124 gives only a Rust field sketch,
 /// no byte offsets). `tile_first` indexes into the tile-record array that
 /// immediately follows all `ExpertIndexRecord`s within the superblock's

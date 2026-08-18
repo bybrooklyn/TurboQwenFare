@@ -445,4 +445,93 @@ mod tests {
         let report = qualify_oracle(Path::new(&tqf), Path::new(&gguf), &artifact).unwrap();
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     }
+
+    /// Phase 24 OS-observed footprint qualification (spec §296, §132):
+    /// runs real greedy decode while sampling the OS resident set against
+    /// the broker's own accounting. The assertion is deliberately not
+    /// "resident <= budget" (the process image, stacks, tokenizer
+    /// metadata, and allocator slack legitimately exceed the *model data*
+    /// budget by a bounded envelope); it is "resident <= budget +
+    /// measured envelope", and the envelope itself is printed so the
+    /// qualification record captures the real overhead. A spike above
+    /// the envelope fails the certification - that is the Phase 24 exit
+    /// gate's adversarial check.
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint; Phase 24 OS footprint qualification"]
+    fn canonical_decode_os_footprint_stays_within_qualified_envelope() {
+        use crate::memory::os_sampler;
+        let tqf = std::env::var("TQF_CANONICAL_TQF").expect("set TQF_CANONICAL_TQF");
+        let steps: usize = std::env::var("TQF_FOOTPRINT_DECODE_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let envelope_mib: u64 = std::env::var("TQF_FOOTPRINT_ENVELOPE_MIB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1536);
+        let broker = MemoryBroker::new(Bytes(FOUR_GIB));
+        let mut runtime = Qwen36BoundedReferenceRuntime::open(
+            Path::new(&tqf),
+            broker.clone(),
+            64,
+            Bytes(DEFAULT_EXPERT_CACHE_BYTES),
+        )
+        .unwrap();
+        let mut token = 32u32; // "A" (raw-a fixtures start here)
+        let mut step = 0usize;
+        let mut peak_sample: Option<os_sampler::OsFootprintSample> = None;
+        for _ in 0..steps {
+            let sample = os_sampler::sample_os_footprint(&broker).unwrap();
+            peak_sample = Some(match peak_sample {
+                None => sample,
+                Some(max) => os_sampler::OsFootprintSample {
+                    resident_bytes: max.resident_bytes.max(sample.resident_bytes),
+                    virtual_bytes: max.virtual_bytes.max(sample.virtual_bytes),
+                    resident_peak_bytes: max.resident_peak_bytes.max(sample.resident_peak_bytes),
+                    broker_reserved_bytes: max
+                        .broker_reserved_bytes
+                        .max(sample.broker_reserved_bytes),
+                    broker_peak_bytes: max.broker_peak_bytes.max(sample.broker_peak_bytes),
+                },
+            });
+            let decoded = runtime.decode_greedy(token).unwrap();
+            step += 1;
+            println!(
+                "footprint_qual step={step} token={token} next={} resident_mib={} broker_reserved_mib={}",
+                decoded.token,
+                sample.resident_bytes / (1024 * 1024),
+                sample.broker_reserved_bytes / (1024 * 1024),
+            );
+            token = decoded.token;
+        }
+        let peak = peak_sample.unwrap();
+        let envelope = FOUR_GIB.saturating_add(envelope_mib * 1024 * 1024);
+        println!(
+            "footprint_qual peak resident_mib={} broker_peak_mib={} overhead_mib={} envelope_mib={}",
+            peak.resident_bytes / (1024 * 1024),
+            peak.broker_peak_bytes / (1024 * 1024),
+            peak.observed_over_broker() / (1024 * 1024),
+            envelope_mib,
+        );
+        let cache = runtime.expert_cache_stats();
+        println!(
+            "footprint_qual cache hits={} misses={} resident_bytes={} prefetched={} prefetch_hits={} wasted={}",
+            cache.hits,
+            cache.misses,
+            cache.resident_bytes.0,
+            cache.prefetched,
+            cache.prefetch_hits,
+            cache.prefetch_wasted_bytes.0,
+        );
+        assert!(
+            peak.resident_bytes <= envelope,
+            "OS footprint {} bytes exceeded the qualified envelope {} bytes",
+            peak.resident_bytes,
+            envelope
+        );
+        assert!(
+            peak.broker_peak_bytes <= FOUR_GIB,
+            "broker peak exceeded the hard budget"
+        );
+    }
 }

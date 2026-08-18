@@ -25,6 +25,13 @@ use crate::model::qwen36::geometry::Qwen36Geometry;
 pub const CONVERSION_FINGERPRINT_LABEL: &[u8] = b"tqf-qwen36-expert-superextents-v2";
 pub const MODEL_FAMILY_LABEL: &[u8] = b"qwen3.6-35b-a3b";
 
+/// Phase 22 developer A/B control (spec §294, invariant #10): converting
+/// with `TQF_EXPERT_TILE_NEURONS=64|128|256|mixed` emits neuron-width
+/// sub-tiles with per-tile checksums; unset keeps the canonical
+/// whole-region layout. A tiled container is readable by both the
+/// whole-expert and the tile-granular paths (no format migration).
+const TILE_NEURONS_ENV: &str = "TQF_EXPERT_TILE_NEURONS";
+
 #[derive(Debug, Clone)]
 pub struct ConversionReport {
     pub path: PathBuf,
@@ -231,14 +238,33 @@ fn write_routed_expert_superextents(
             let gate_range = expert * gate_plane..(expert + 1) * gate_plane;
             let up_range = expert * up_plane..(expert + 1) * up_plane;
             let down_range = expert * down_plane..(expert + 1) * down_plane;
-            transaction.write_expert_parts(
-                layer,
-                id,
-                layout,
-                &gate_bytes[gate_range],
-                &up_bytes[up_range],
-                &down_bytes[down_range],
-            )?;
+            // Phase 22 A/B control (spec §294, invariant #10): a developer
+            // can convert a tiled layout with TQF_EXPERT_TILE_NEURONS
+            // (64/128/256/mixed). Canonical conversion stays whole-region.
+            let tiling = std::env::var(TILE_NEURONS_ENV)
+                .ok()
+                .and_then(|value| crate::format::tqf::tiling::NeuronWidth::from_env_value(&value))
+                .unwrap_or(crate::format::tqf::tiling::NeuronWidth::Whole);
+            if tiling.is_whole() {
+                transaction.write_expert_parts(
+                    layer,
+                    id,
+                    layout,
+                    &gate_bytes[gate_range],
+                    &up_bytes[up_range],
+                    &down_bytes[down_range],
+                )?;
+            } else {
+                transaction.write_expert_parts_tiled(
+                    layer,
+                    id,
+                    layout,
+                    &gate_bytes[gate_range],
+                    &up_bytes[up_range],
+                    &down_bytes[down_range],
+                    tiling,
+                )?;
+            }
         }
     }
     Ok(())

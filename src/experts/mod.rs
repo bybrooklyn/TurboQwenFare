@@ -13,7 +13,10 @@
 //! falls back to the CPU baseline without changing results.
 
 pub mod policy;
+pub mod prefetch;
+pub mod tiling;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "metal")]
@@ -203,6 +206,14 @@ pub struct ExpertCacheStats {
     /// Bytes demanded from SSD on cache misses, before any read-ahead or
     /// compression policy. This is the Phase-18 baseline metric.
     pub raw_miss_bytes: Bytes,
+    /// Phase 23 (spec §295): speculative prefetch accounting.
+    pub prefetched: u64,
+    pub prefetch_hits: u64,
+    pub prefetch_wasted_bytes: Bytes,
+    pub prefetch_late: u64,
+    /// Phase 25 (spec §297): wall time spent inside demand expert reads
+    /// (the SSD-stall component of decode), for the optimization ledger.
+    pub demand_io_nanos: u128,
 }
 
 impl Default for ExpertCacheStats {
@@ -213,6 +224,11 @@ impl Default for ExpertCacheStats {
             evictions: 0,
             resident_bytes: Bytes(0),
             raw_miss_bytes: Bytes(0),
+            prefetched: 0,
+            prefetch_hits: 0,
+            prefetch_wasted_bytes: Bytes(0),
+            prefetch_late: 0,
+            demand_io_nanos: 0,
         }
     }
 }
@@ -235,7 +251,38 @@ struct CachedExpert {
     frequency: u64,
     last_used: u64,
     pin_count: u16,
+    /// Phase 23: entry delivered speculatively by the prefetch path. It
+    /// becomes a normal entry on first pin (which also counts the
+    /// prefetch hit); probation entries evict before any demand entry.
+    probation: bool,
+    arrival_clock: u64,
     value: ExpertValue,
+}
+
+/// Phase 26 (spec §298): a layer/chunk prefill plan pins the *union* of
+/// several exact routes so one distinct expert is fetched at most once
+/// for the whole chunk, then re-used by every row that selected it.
+/// Router IDs and weights stay exactly as the real router produced them
+/// (invariant #7); this only changes fetch scheduling.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchExpertPlan {
+    pub plan_id: u64,
+    pub layer: LayerId,
+    /// Distinct experts demanded by the chunk, in first-demand order.
+    pub distinct: Vec<ExpertId>,
+    /// Per-row route results, unchanged.
+    pub routes: Vec<RouterResult>,
+}
+
+/// A speculative expert load completed by the Phase 23 prefetch worker,
+/// waiting to be drained into the cache. The `LoadedQwen36Expert` owns
+/// its broker lease, so the destination outlives the read (invariant #5)
+/// even while the entry sits in this queue.
+struct PrefetchDelivery {
+    layer: LayerId,
+    expert: ExpertId,
+    value: LoadedQwen36Expert,
+    issued_clock: u64,
 }
 
 /// Global, whole-expert cache. The cache plans from the *actual* router
@@ -259,6 +306,7 @@ pub struct WholeExpertLfuCache {
     clock: u64,
     next_plan_id: u64,
     active_plan: Option<ExpertLoadPlan>,
+    active_batch_plan: Option<BatchExpertPlan>,
     stats: ExpertCacheStats,
     entries: Vec<CachedExpert>,
     io_fanout: ReadFanout,
@@ -273,6 +321,16 @@ pub struct WholeExpertLfuCache {
     /// Whether new cache admissions should be uploaded to GPU buffers.
     #[cfg(feature = "metal")]
     gpu_enabled: bool,
+    /// Phase 23 predictive prefetch (spec §295). Off by default until the
+    /// offline replay and a live A/B record a net win; `TQF_PREFETCH_ENABLED`
+    /// turns it on for that measurement (invariant #10).
+    prefetch_enabled: bool,
+    prefetch_depth: usize,
+    predictor: crate::experts::prefetch::TransitionPredictor,
+    previous_route: Option<(LayerId, Vec<ExpertId>)>,
+    last_demand_clock: std::collections::HashMap<(LayerId, ExpertId), u64>,
+    prefetch_inbox: Arc<Mutex<Vec<PrefetchDelivery>>>,
+    prefetch_in_flight: Arc<AtomicUsize>,
 }
 
 /// Env var read once per cache so a deployment/benchmark can force the
@@ -290,6 +348,35 @@ const CACHE_POLICY_ENV: &str = "TQF_EXPERT_CACHE_POLICY";
 /// is the in-process one. Without a usable Metal device the flag silently
 /// falls back to the CPU baseline rather than failing decode.
 const EXPERT_GPU_ENV: &str = "TQF_EXPERT_GPU_RESIDENT";
+
+/// Phase 23 A/B controls (spec §295, invariant #10): prefetch is off by
+/// default until the offline replay and a live A/B record a net win.
+/// `TQF_PREFETCH_DEPTH` bounds how many experts one prediction submits.
+const PREFETCH_ENABLED_ENV: &str = "TQF_PREFETCH_ENABLED";
+const PREFETCH_DEPTH_ENV: &str = "TQF_PREFETCH_DEPTH";
+const DEFAULT_PREFETCH_DEPTH: usize = TOP_K;
+/// At most one speculative batch in flight; more would contend with
+/// demand reads on a single SSD queue without a measured win.
+const MAX_PREFETCH_BATCHES_IN_FLIGHT: usize = 1;
+
+fn env_enabled(var: &str) -> bool {
+    match std::env::var(var).ok().as_deref() {
+        Some(value) => {
+            value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("true")
+        }
+        None => false,
+    }
+}
+
+fn prefetch_depth_from_env() -> usize {
+    std::env::var(PREFETCH_DEPTH_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PREFETCH_DEPTH)
+        .min(TOP_K)
+}
 
 /// Default decay half-life for `DecayedCostAware`, in cache-route events;
 /// matches the sweep in `policy::tests::qualification_trace_replays_all_phase21_policy_candidates`.
@@ -317,14 +404,7 @@ fn cache_policy_from_env() -> CachePolicyKind {
 
 #[cfg(feature = "metal")]
 fn gpu_enabled_from_env() -> bool {
-    match std::env::var(EXPERT_GPU_ENV).ok().as_deref() {
-        Some(value) => {
-            value.eq_ignore_ascii_case("1")
-                || value.eq_ignore_ascii_case("on")
-                || value.eq_ignore_ascii_case("true")
-        }
-        None => false,
-    }
+    env_enabled(EXPERT_GPU_ENV)
 }
 
 impl WholeExpertLfuCache {
@@ -335,6 +415,7 @@ impl WholeExpertLfuCache {
             clock: 0,
             next_plan_id: 1,
             active_plan: None,
+            active_batch_plan: None,
             stats: ExpertCacheStats::default(),
             entries: Vec::new(),
             io_fanout: ReadFanout::from_env(IO_FANOUT_ENV)
@@ -345,6 +426,13 @@ impl WholeExpertLfuCache {
             gpu_state: None,
             #[cfg(feature = "metal")]
             gpu_enabled: gpu_enabled_from_env(),
+            prefetch_enabled: env_enabled(PREFETCH_ENABLED_ENV),
+            prefetch_depth: prefetch_depth_from_env(),
+            predictor: crate::experts::prefetch::TransitionPredictor::new(),
+            previous_route: None,
+            last_demand_clock: std::collections::HashMap::new(),
+            prefetch_inbox: Arc::new(Mutex::new(Vec::new())),
+            prefetch_in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -473,6 +561,132 @@ impl WholeExpertLfuCache {
         stats
     }
 
+    /// Phase 23: drains speculative loads completed by the prefetch
+    /// worker. Entries demanded by the route being planned become regular
+    /// (probation-flagged) entries so the plan sees them as hits and pins
+    /// them; everything else is either kept as probation (inside the
+    /// cache budget) or dropped as wasted traffic.
+    fn drain_prefetch_inbox(&mut self, demanded: &[ExpertId; TOP_K]) {
+        let deliveries = {
+            let Ok(mut inbox) = self.prefetch_inbox.lock() else {
+                return;
+            };
+            std::mem::take(&mut *inbox)
+        };
+        if deliveries.is_empty() {
+            return;
+        }
+        for delivery in deliveries {
+            self.stats.prefetched = self.stats.prefetched.saturating_add(1);
+            let bytes = delivery.value.stored_bytes();
+            let last_demand = self
+                .last_demand_clock
+                .get(&(delivery.layer, delivery.expert))
+                .copied()
+                .unwrap_or(0);
+            if last_demand > delivery.issued_clock {
+                // The demand it was issued for happened before it
+                // arrived: a late speculative read.
+                self.stats.prefetch_late = self.stats.prefetch_late.saturating_add(1);
+            }
+            let fit = self.resident_bytes.0.saturating_add(bytes.0) <= self.capacity.0;
+            if !fit && !demanded.contains(&delivery.expert) {
+                self.stats.prefetch_wasted_bytes.0 =
+                    self.stats.prefetch_wasted_bytes.0.saturating_add(bytes.0);
+                continue;
+            }
+            self.clock = self.clock.wrapping_add(1);
+            self.resident_bytes.0 = self.resident_bytes.0.saturating_add(bytes.0);
+            self.entries.push(CachedExpert {
+                layer: delivery.layer,
+                expert: delivery.expert,
+                frequency: 1,
+                last_used: self.clock,
+                pin_count: 0,
+                probation: true,
+                arrival_clock: self.clock,
+                value: ExpertValue::Cpu(delivery.value),
+            });
+        }
+        // Capacity discipline stays in `prepare_exact_route`'s eviction
+        // loop (which protects this route's selected experts); the drain
+        // itself never evicts a delivery it just admitted.
+    }
+
+    /// Phase 23 live hook (spec §295): observes the previous route
+    /// transition, predicts the next layer's expert set from the
+    /// statistical transition table, and submits one bounded speculative
+    /// batch to a worker thread. Prediction never touches the exact
+    /// route - it only schedules bytes (invariant #7) - and a wrong
+    /// prediction costs wasted SSD traffic, never a wrong result.
+    pub fn advance_prefetch(
+        &mut self,
+        loader: &Arc<Qwen36WeightLoader>,
+        broker: &MemoryBroker,
+        from_layer: LayerId,
+        to_layer: LayerId,
+        route: &RouterResult,
+    ) {
+        if let Some((previous_layer, previous_route)) = &self.previous_route {
+            self.predictor
+                .observe(*previous_layer, previous_route, from_layer, &route.ids);
+        }
+        self.previous_route = Some((from_layer, route.ids.to_vec()));
+        for expert in route.ids {
+            self.last_demand_clock
+                .insert((from_layer, expert), self.clock);
+        }
+        if !self.prefetch_enabled
+            || self.prefetch_depth == 0
+            || self.prefetch_in_flight.load(Ordering::SeqCst) >= MAX_PREFETCH_BATCHES_IN_FLIGHT
+        {
+            return;
+        }
+        let is_resident = |expert: ExpertId| {
+            self.entries
+                .iter()
+                .any(|entry| entry.layer == to_layer && entry.expert == expert)
+        };
+        let predicted = self.predictor.predict(
+            from_layer,
+            &route.ids,
+            to_layer,
+            self.prefetch_depth,
+            is_resident,
+        );
+        if predicted.is_empty() {
+            return;
+        }
+        self.prefetch_in_flight.fetch_add(1, Ordering::SeqCst);
+        let inbox = Arc::clone(&self.prefetch_inbox);
+        let in_flight = Arc::clone(&self.prefetch_in_flight);
+        let loader = Arc::clone(loader);
+        let issued_clock = self.clock;
+        std::thread::spawn(move || {
+            let mut deliveries = Vec::with_capacity(predicted.len());
+            for expert in predicted {
+                match loader.load_expert(to_layer, expert) {
+                    Ok(value) => deliveries.push(PrefetchDelivery {
+                        layer: to_layer,
+                        expert,
+                        value,
+                        issued_clock,
+                    }),
+                    Err(error) => tracing::debug!(
+                        layer = to_layer.0,
+                        expert = expert.0,
+                        %error,
+                        "prefetch load failed; demand path will retry"
+                    ),
+                }
+            }
+            if let Ok(mut inbox) = inbox.lock() {
+                inbox.extend(deliveries);
+            }
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
     /// Plans an exact route before cache-miss allocations. This gives the
     /// later I/O queue a stable, inspectable demand list without ever letting
     /// a predictor substitute an expert ID or router weight.
@@ -516,13 +730,17 @@ impl WholeExpertLfuCache {
         layer: LayerId,
         route: &RouterResult,
     ) -> Result<ExpertLoadPlan> {
-        if self.active_plan.is_some() {
+        if self.active_plan.is_some() || self.active_batch_plan.is_some() {
             return Err(crate::error::InternalError {
                 incident_id: "expert-plan-overlap".to_string(),
                 message: "whole-expert baseline permits only one active exact route".to_string(),
             }
             .into());
         }
+
+        // Phase 23: admit any speculative loads that finished since the
+        // last route so the plan can treat them as hits.
+        self.drain_prefetch_inbox(&route.ids);
 
         let mut plan = self.plan_exact_route(loader, layer, route)?;
         let misses = plan
@@ -569,9 +787,14 @@ impl WholeExpertLfuCache {
         // partially valid cache entry behind. The staged CPU payloads then
         // become cache values (possibly GPU-resident uploads, Phase 20)
         // before any entry is visible to eviction.
+        let io_started = std::time::Instant::now();
         let staged_cpu = crate::io::fetch_all(self.io_fanout, &misses, |&expert| {
             Ok((expert, loader.load_expert(layer, expert)?))
         })?;
+        self.stats.demand_io_nanos = self
+            .stats
+            .demand_io_nanos
+            .saturating_add(io_started.elapsed().as_nanos());
         let mut staged = self.stage_expert_values(staged_cpu, broker)?;
 
         let plan_id = self.next_plan_id;
@@ -591,6 +814,10 @@ impl WholeExpertLfuCache {
                 entry.frequency = entry.frequency.saturating_add(1);
                 entry.last_used = self.clock;
                 entry.pin_count = entry.pin_count.saturating_add(1);
+                if entry.probation {
+                    entry.probation = false;
+                    self.stats.prefetch_hits = self.stats.prefetch_hits.saturating_add(1);
+                }
                 self.stats.hits = self.stats.hits.saturating_add(1);
                 continue;
             }
@@ -614,6 +841,8 @@ impl WholeExpertLfuCache {
                 frequency: 1,
                 last_used: self.clock,
                 pin_count: 1,
+                probation: false,
+                arrival_clock: self.clock,
                 value,
             });
         }
@@ -693,6 +922,252 @@ impl WholeExpertLfuCache {
         }
     }
 
+    /// Phase 26 (spec §298): materializes one layer/chunk transaction
+    /// whose pin set is the union of several exact routes. Each distinct
+    /// absent expert is fetched exactly once - FlashMoE's "load each
+    /// required expert on-demand exactly once per iteration" - and every
+    /// selected entry is pinned before any row's computation begins.
+    pub fn prepare_batch_route(
+        &mut self,
+        loader: &Qwen36WeightLoader,
+        broker: &MemoryBroker,
+        layer: LayerId,
+        routes: &[RouterResult],
+    ) -> Result<BatchExpertPlan> {
+        if self.active_plan.is_some() || self.active_batch_plan.is_some() {
+            return Err(crate::error::InternalError {
+                incident_id: "expert-batch-plan-overlap".to_string(),
+                message: "only one active exact-route batch is permitted".to_string(),
+            }
+            .into());
+        }
+        for route in routes {
+            route.validate()?;
+        }
+        let mut distinct: Vec<ExpertId> = Vec::new();
+        let mut resident_at_start = std::collections::HashSet::new();
+        for route in routes {
+            for expert in route.ids {
+                if !distinct.contains(&expert) {
+                    distinct.push(expert);
+                }
+            }
+        }
+        let mut miss_bytes = 0u64;
+        let misses: Vec<ExpertId> = distinct
+            .iter()
+            .copied()
+            .filter(|expert| {
+                let resident = self
+                    .entries
+                    .iter()
+                    .any(|entry| entry.layer == layer && entry.expert == *expert);
+                if resident {
+                    resident_at_start.insert(*expert);
+                }
+                !resident
+            })
+            .collect();
+        for &expert in &misses {
+            miss_bytes = miss_bytes.saturating_add(loader.expert_stored_bytes(layer, expert)?.0);
+        }
+        if miss_bytes > self.capacity.0 {
+            return Err(ModelError::Unsupported(format!(
+                "expert cache capacity {} bytes cannot hold the {} distinct experts in one prefill chunk ({} bytes)",
+                self.capacity.0,
+                misses.len(),
+                miss_bytes
+            ))
+            .into());
+        }
+        while self.resident_bytes.0.saturating_add(miss_bytes) > self.capacity.0 {
+            if self
+                .evict_coldest_excluding_many(layer, &distinct)
+                .is_none()
+            {
+                return Err(ModelError::Unsupported(format!(
+                    "expert cache capacity {} bytes cannot pin all distinct experts in one prefill chunk",
+                    self.capacity.0
+                ))
+                .into());
+            }
+        }
+
+        let io_started = std::time::Instant::now();
+        let staged_cpu = crate::io::fetch_all(self.io_fanout, &misses, |&expert| {
+            Ok((expert, loader.load_expert(layer, expert)?))
+        })?;
+        self.stats.demand_io_nanos = self
+            .stats
+            .demand_io_nanos
+            .saturating_add(io_started.elapsed().as_nanos());
+        let mut staged = self.stage_expert_values(staged_cpu, broker)?;
+
+        let plan_id = self.next_plan_id;
+        self.next_plan_id = self.next_plan_id.wrapping_add(1).max(1);
+        let mut plan = BatchExpertPlan {
+            plan_id,
+            layer,
+            distinct: distinct.clone(),
+            routes: routes.to_vec(),
+        };
+        for &expert in &plan.distinct {
+            self.clock = self.clock.wrapping_add(1);
+            if resident_at_start.contains(&expert) {
+                let entry = self
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.layer == layer && entry.expert == expert)
+                    .ok_or_else(|| crate::error::InternalError {
+                        incident_id: format!("expert-batch-plan-{plan_id}-lost-hit"),
+                        message: "batch hit disappeared before plan activation".to_string(),
+                    })?;
+                entry.frequency = entry.frequency.saturating_add(1);
+                entry.last_used = self.clock;
+                entry.pin_count = entry.pin_count.saturating_add(1);
+                if entry.probation {
+                    entry.probation = false;
+                    self.stats.prefetch_hits = self.stats.prefetch_hits.saturating_add(1);
+                }
+                let demands = plan
+                    .routes
+                    .iter()
+                    .filter(|route| route.ids.contains(&expert))
+                    .count() as u64;
+                self.stats.hits = self.stats.hits.saturating_add(demands);
+                continue;
+            }
+            let index = staged
+                .iter()
+                .position(|(id, _)| *id == expert)
+                .ok_or_else(|| crate::error::InternalError {
+                    incident_id: format!("expert-batch-plan-{plan_id}-unstaged-miss"),
+                    message: "batch miss was not present in the staged transaction".to_string(),
+                })?;
+            let (_, value) = staged.swap_remove(index);
+            let stored_bytes = value.stored_bytes();
+            self.resident_bytes.0 = self.resident_bytes.0.saturating_add(stored_bytes.0);
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            self.stats.raw_miss_bytes.0 =
+                self.stats.raw_miss_bytes.0.saturating_add(stored_bytes.0);
+            self.entries.push(CachedExpert {
+                layer,
+                expert,
+                frequency: 1,
+                last_used: self.clock,
+                pin_count: 1,
+                probation: false,
+                arrival_clock: self.clock,
+                value,
+            });
+        }
+        debug_assert!(staged.is_empty());
+        self.active_batch_plan = Some(plan.clone());
+        Ok(plan)
+    }
+
+    /// Executes one batch-planned expert forward (Phase 26). Same
+    /// binding rules as `forward_expert`, against the batch plan's
+    /// union.
+    pub(crate) fn forward_batch_expert(
+        &mut self,
+        plan: &BatchExpertPlan,
+        expert: ExpertId,
+        broker: &MemoryBroker,
+        input: &[f32],
+    ) -> Result<Qwen36Activation> {
+        if self.active_batch_plan.as_ref() != Some(plan) || !plan.distinct.contains(&expert) {
+            return Err(crate::error::InternalError {
+                incident_id: format!("expert-batch-plan-{}-binding", plan.plan_id),
+                message: "batch computation requested an expert outside its active plan"
+                    .to_string(),
+            }
+            .into());
+        }
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.layer == plan.layer && entry.expert == expert && entry.pin_count > 0
+            })
+            .ok_or_else(|| crate::error::InternalError {
+                incident_id: format!("expert-batch-plan-{}-missing", plan.plan_id),
+                message: "active batch plan lost a pinned expert binding".to_string(),
+            })?;
+        #[cfg(feature = "metal")]
+        {
+            if let ExpertValue::Gpu(gpu_expert) = &entry.value {
+                let state = self
+                    .gpu_state
+                    .as_ref()
+                    .ok_or_else(|| crate::error::InternalError {
+                        incident_id: "expert-gpu-state-missing".to_string(),
+                        message: "GPU-resident expert value without GPU execution state"
+                            .to_string(),
+                    })?;
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let values = gpu_expert.forward(&mut guard, input)?;
+                return Qwen36Activation::from_slice(broker, &values);
+            }
+        }
+        match &entry.value {
+            ExpertValue::Cpu(cpu) => cpu.forward(broker, input),
+            #[cfg(feature = "metal")]
+            ExpertValue::Gpu(_) => Err(crate::error::InternalError {
+                incident_id: "expert-gpu-state-missing".to_string(),
+                message: "GPU-resident expert value without GPU execution state".to_string(),
+            }
+            .into()),
+        }
+    }
+
+    pub(crate) fn finish_batch_route(&mut self, plan: &BatchExpertPlan) -> Result<()> {
+        if self.active_batch_plan.as_ref() != Some(plan) {
+            return Err(crate::error::InternalError {
+                incident_id: format!("expert-batch-plan-{}-finish", plan.plan_id),
+                message: "attempted to finish a batch route that is not active".to_string(),
+            }
+            .into());
+        }
+        for expert in &plan.distinct {
+            let entry = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.layer == plan.layer && entry.expert == *expert)
+                .ok_or_else(|| crate::error::InternalError {
+                    incident_id: format!("expert-batch-plan-{}-lost-pin", plan.plan_id),
+                    message: "active batch plan lost a selected expert before release".to_string(),
+                })?;
+            entry.pin_count = entry.pin_count.saturating_sub(1);
+        }
+        self.active_batch_plan = None;
+        Ok(())
+    }
+
+    /// Eviction candidate search for a batch plan: the whole distinct
+    /// union is protected, and `Vec` pin counts continue to protect any
+    /// other active bindings.
+    fn evict_coldest_excluding_many(
+        &mut self,
+        selected_layer: LayerId,
+        selected_experts: &[ExpertId],
+    ) -> Option<()> {
+        let index = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.pin_count == 0
+                    && (entry.layer != selected_layer || !selected_experts.contains(&entry.expert))
+            })
+            .min_by(|(_, left), (_, right)| self.eviction_order(left, right))
+            .map(|(index, _)| index)?;
+        self.remove_entry(index);
+        Some(())
+    }
+
     pub(crate) fn finish_exact_route(&mut self, plan: &ExpertLoadPlan) -> Result<()> {
         if self.active_plan.as_ref() != Some(plan) {
             return Err(crate::error::InternalError {
@@ -757,7 +1232,12 @@ impl WholeExpertLfuCache {
         // destination Vec. All cache evictions above happened first. The
         // loaded payload then becomes a cache value (Phase 20 GPU upload
         // when enabled) before it is exposed to eviction.
+        let io_started = std::time::Instant::now();
         let cpu_value = loader.load_expert(layer, expert)?;
+        self.stats.demand_io_nanos = self
+            .stats
+            .demand_io_nanos
+            .saturating_add(io_started.elapsed().as_nanos());
         let (_, value) = self
             .stage_expert_values(vec![(expert, cpu_value)], broker)?
             .pop()
@@ -774,6 +1254,8 @@ impl WholeExpertLfuCache {
             frequency: 1,
             last_used: self.clock,
             pin_count: 0,
+            probation: false,
+            arrival_clock: self.clock,
             value,
         });
         Ok(&self.entries.last().expect("just pushed cache entry").value)
@@ -810,12 +1292,15 @@ impl WholeExpertLfuCache {
         Some(())
     }
 
-    /// Total order for eviction candidates: lowest policy utility first,
-    /// ties broken by (last_used, layer, expert) so eviction is
-    /// deterministic regardless of `Vec` iteration/storage order.
+    /// Total order for eviction candidates: probation (speculative Phase
+    /// 23) entries first, then lowest policy utility, ties broken by
+    /// (last_used, layer, expert) so eviction is deterministic regardless
+    /// of `Vec` iteration/storage order.
     fn eviction_order(&self, left: &CachedExpert, right: &CachedExpert) -> std::cmp::Ordering {
-        self.utility(left)
-            .total_cmp(&self.utility(right))
+        right
+            .probation
+            .cmp(&left.probation)
+            .then_with(|| self.utility(left).total_cmp(&self.utility(right)))
             .then_with(|| left.last_used.cmp(&right.last_used))
             .then_with(|| left.layer.cmp(&right.layer))
             .then_with(|| left.expert.cmp(&right.expert))
@@ -827,6 +1312,15 @@ impl WholeExpertLfuCache {
             .resident_bytes
             .0
             .saturating_sub(entry.value.stored_bytes().0);
+        if entry.probation {
+            // A speculative load evicted before any demand: wasted SSD
+            // traffic (spec §295's "wasted bytes" metric).
+            self.stats.prefetch_wasted_bytes.0 = self
+                .stats
+                .prefetch_wasted_bytes
+                .0
+                .saturating_add(entry.value.stored_bytes().0);
+        }
         drop(entry);
         self.stats.evictions = self.stats.evictions.saturating_add(1);
     }
@@ -973,7 +1467,7 @@ impl Qwen36StreamingMoe {
 
     pub fn forward(
         &mut self,
-        loader: &Qwen36WeightLoader,
+        loader: &Arc<Qwen36WeightLoader>,
         cache: &mut WholeExpertLfuCache,
         broker: &MemoryBroker,
         input: &Qwen36Activation,
@@ -983,7 +1477,7 @@ impl Qwen36StreamingMoe {
 
     pub fn forward_with_observer<F>(
         &mut self,
-        loader: &Qwen36WeightLoader,
+        loader: &Arc<Qwen36WeightLoader>,
         cache: &mut WholeExpertLfuCache,
         broker: &MemoryBroker,
         input: &Qwen36Activation,
@@ -996,6 +1490,15 @@ impl Qwen36StreamingMoe {
         let route_logits = self.router.matvec(broker, &input.values)?;
         let route = RouterResult::from_logits(&route_logits.values)?;
         let plan = cache.prepare_exact_route(loader, broker, self.layer, &route)?;
+        // Phase 23: schedule speculative reads for the next layer's MoE
+        // while this layer's routed experts compute. Purely an I/O hint -
+        // the exact route above is authoritative (invariant #7).
+        let to_layer = if self.layer.0 + 1 < Qwen36Geometry::NUM_LAYERS as u8 {
+            LayerId(self.layer.0 + 1)
+        } else {
+            LayerId(0)
+        };
+        cache.advance_prefetch(loader, broker, self.layer, to_layer, &route);
         let computed = (|| -> Result<Qwen36Activation> {
             let shared_gate = self.shared_gate.matvec(broker, &input.values)?;
             let shared_up = self.shared_up.matvec(broker, &input.values)?;
@@ -1018,6 +1521,51 @@ impl Qwen36StreamingMoe {
         let output = computed?;
         release?;
         Ok((output, plan.route))
+    }
+}
+
+impl Qwen36StreamingMoe {
+    /// Phase 26 batched MoE (spec §298): routes every chunk row, plans
+    /// the distinct-expert union once, fetches each absent expert once,
+    /// and executes per-row routed accumulation in exact route order.
+    /// The per-row shared-expert path is identical to the single-token
+    /// forward; routed experts come from the shared batch plan.
+    pub fn forward_batch(
+        &mut self,
+        loader: &Arc<Qwen36WeightLoader>,
+        cache: &mut WholeExpertLfuCache,
+        broker: &MemoryBroker,
+        inputs: &[Qwen36Activation],
+    ) -> Result<(Vec<Qwen36Activation>, Vec<RouterResult>)> {
+        let mut routes = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            require_len("Qwen batched MoE input", input.values.len(), HIDDEN)?;
+            let route_logits = self.router.matvec(broker, &input.values)?;
+            routes.push(RouterResult::from_logits(&route_logits.values)?);
+        }
+        let plan = cache.prepare_batch_route(loader, broker, self.layer, &routes)?;
+        let computed = (|| -> Result<Vec<Qwen36Activation>> {
+            let mut outputs = Vec::with_capacity(inputs.len());
+            for (input, route) in inputs.iter().zip(&plan.routes) {
+                let shared_gate = self.shared_gate.matvec(broker, &input.values)?;
+                let shared_up = self.shared_up.matvec(broker, &input.values)?;
+                let shared_hidden = Qwen36Activation::silu_mul(broker, &shared_gate, &shared_up)?;
+                let mut output = self.shared_down.matvec(broker, &shared_hidden.values)?;
+                let shared_gate_logit = self.shared_input_gate.dot(broker, &input.values)?;
+                output.scale_in_place(1.0 / (1.0 + (-shared_gate_logit).exp()));
+                for (&expert, &weight) in route.ids.iter().zip(&route.weights) {
+                    let routed =
+                        cache.forward_batch_expert(&plan, expert, broker, &input.values)?;
+                    output.add_scaled_in_place(&routed, weight)?;
+                }
+                outputs.push(output);
+            }
+            Ok(outputs)
+        })();
+        let release = cache.finish_batch_route(&plan);
+        let outputs = computed?;
+        release?;
+        Ok((outputs, plan.routes))
     }
 }
 
@@ -1110,5 +1658,105 @@ mod tests {
             weights: [0.125; TOP_K],
         };
         assert!(route.validate().is_err());
+    }
+
+    fn synthetic_expert(broker: &MemoryBroker) -> LoadedQwen36Expert {
+        // A minimal broker-accounted expert payload for cache tests; the
+        // forward math is not exercised here, only residency accounting.
+        LoadedQwen36Expert::synthetic_for_tests(broker)
+    }
+
+    #[test]
+    fn probation_entries_evict_before_demand_entries() {
+        let broker = MemoryBroker::new(Bytes(16 * 1024 * 1024));
+        let mut cache = WholeExpertLfuCache::new(Bytes(8 * 1024));
+        cache.clock = 10;
+        let demand = CachedExpert {
+            layer: LayerId(0),
+            expert: ExpertId(1),
+            frequency: 5,
+            last_used: 1,
+            pin_count: 0,
+            probation: false,
+            arrival_clock: 1,
+            value: ExpertValue::Cpu(synthetic_expert(&broker)),
+        };
+        let probation = CachedExpert {
+            layer: LayerId(0),
+            expert: ExpertId(2),
+            frequency: 50,
+            last_used: 9,
+            pin_count: 0,
+            probation: true,
+            arrival_clock: 9,
+            value: ExpertValue::Cpu(synthetic_expert(&broker)),
+        };
+        cache.entries.push(demand);
+        cache.entries.push(probation);
+        cache.resident_bytes = Bytes(2048);
+        // LRU would evict the demand entry (last_used 1 < 9); probation
+        // priority must override recency.
+        cache.evict_coldest().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert!(!cache.entries[0].probation, "demand entry survives");
+        assert_eq!(cache.stats.prefetch_wasted_bytes.0, 1024);
+    }
+
+    #[test]
+    fn prefetch_inbox_delivers_demanded_entries_and_wastes_the_rest() {
+        let broker = MemoryBroker::new(Bytes(16 * 1024 * 1024));
+        let mut cache = WholeExpertLfuCache::new(Bytes(2 * 1024));
+        {
+            let mut inbox = cache.prefetch_inbox.lock().unwrap();
+            inbox.push(PrefetchDelivery {
+                layer: LayerId(1),
+                expert: ExpertId(7),
+                value: synthetic_expert(&broker),
+                issued_clock: 1,
+            });
+            inbox.push(PrefetchDelivery {
+                layer: LayerId(1),
+                expert: ExpertId(9),
+                value: synthetic_expert(&broker),
+                issued_clock: 1,
+            });
+        }
+        let demanded = [
+            ExpertId(7),
+            ExpertId(0),
+            ExpertId(0),
+            ExpertId(0),
+            ExpertId(0),
+            ExpertId(0),
+            ExpertId(0),
+            ExpertId(0),
+        ];
+        cache.clock = 5;
+        cache.drain_prefetch_inbox(&demanded);
+        assert_eq!(cache.stats.prefetched, 2);
+        assert_eq!(cache.entries.len(), 2);
+        // Both fit (2 KiB in a 4 KiB cache); the demanded one is flagged
+        // probation until its route pins it.
+        assert!(cache.entries.iter().all(|entry| entry.probation));
+        assert!(cache
+            .entries
+            .iter()
+            .any(|entry| entry.expert == ExpertId(7) && entry.layer == LayerId(1)));
+
+        // A second delivery beyond capacity for a non-demanded expert is
+        // dropped as wasted traffic.
+        {
+            let mut inbox = cache.prefetch_inbox.lock().unwrap();
+            inbox.push(PrefetchDelivery {
+                layer: LayerId(1),
+                expert: ExpertId(11),
+                value: synthetic_expert(&broker),
+                issued_clock: 2,
+            });
+        }
+        cache.drain_prefetch_inbox(&demanded);
+        assert_eq!(cache.stats.prefetched, 3);
+        assert_eq!(cache.stats.prefetch_wasted_bytes.0, 1024);
+        assert_eq!(cache.entries.len(), 2);
     }
 }

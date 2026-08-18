@@ -10,13 +10,14 @@ mod records;
 mod superblock;
 #[cfg(test)]
 mod tests;
+pub mod tiling;
 mod writer;
 
 pub use importer::{canonical_header, convert_canonical_gguf, ConversionReport};
 pub use reader::TqfReader;
 pub use records::{
     ExpertIndexRecord, ExpertMatrix, ExpertTileRecord, SectionRecord, TensorExtentRecord,
-    TqfSectionKind,
+    TqfSectionKind, EXPERT_INDEX_FLAG_TILE_CHECKSUMS,
 };
 pub use superblock::{Superblock, FORMAT_MAJOR, FORMAT_MINOR};
 pub use writer::{RecoveredExpert, RecoveredExtent, RecoveredTile, TqfHeaderInfo, TqfWriter};

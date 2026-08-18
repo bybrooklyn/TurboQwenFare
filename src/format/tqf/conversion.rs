@@ -406,6 +406,40 @@ impl ConversionTransaction {
         Ok(())
     }
 
+    /// Phase 22 journaled tiled form (spec §294): same bytes on disk as
+    /// `write_expert_parts`, with neuron-width sub-tiles and per-tile
+    /// digests so a tile-granular cache can admit and verify tiles
+    /// independently. Selected by the converter from the
+    /// `TQF_EXPERT_TILE_NEURONS` developer control (spec invariant #10);
+    /// the canonical conversion path does not use it.
+    pub fn write_expert_parts_tiled(
+        &mut self,
+        layer: LayerId,
+        expert: ExpertId,
+        quant_layout_id: u16,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+        width: crate::format::tqf::tiling::NeuronWidth,
+    ) -> Result<()> {
+        self.state = ConversionState::WritingExtents;
+        let recovered = self.writer.write_expert_parts_tiled(
+            layer,
+            expert,
+            quant_layout_id,
+            gate,
+            up,
+            down,
+            width,
+        )?;
+        self.writer.sync_payload()?;
+        self.journal.append(&JournalEntry::ExpertVerified {
+            expert: recovered,
+            verified_at_unix: unix_now(),
+        })?;
+        Ok(())
+    }
+
     /// Finalizes metadata tables, atomically renames `.partial` to the
     /// real file (`TqfWriter::commit`), and only then removes the
     /// conversion journal — matching §126's

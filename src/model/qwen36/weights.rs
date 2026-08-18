@@ -110,6 +110,40 @@ pub struct LoadedQwen36Expert {
     _lease: MemoryLease,
 }
 
+#[cfg(test)]
+impl LoadedQwen36Expert {
+    /// Test-only broker-accounted payload for cache-residency tests; the
+    /// forward math is not exercised on it.
+    pub(crate) fn synthetic_for_tests(broker: &MemoryBroker) -> Self {
+        let lease = broker
+            .reserve(
+                MemoryOwner::ExpertPinned,
+                MemoryClass::Elastic,
+                Bytes(1024),
+                64,
+            )
+            .unwrap();
+        Self {
+            layer: LayerId(0),
+            expert: crate::ids::ExpertId(0),
+            bytes: vec![0u8; 1024],
+            _lease: lease,
+        }
+    }
+}
+
+/// Phase 22 (spec §294): one independently checksummed tile of a routed
+/// expert, for tile-granular cache residency. The byte range covers
+/// `neuron_start..neuron_start+neuron_count` neurons of `matrix` within
+/// the expert's superextent.
+pub struct LoadedExpertTile {
+    pub matrix: crate::format::tqf::ExpertMatrix,
+    pub neuron_start: u16,
+    pub neuron_count: u16,
+    bytes: Vec<u8>,
+    _lease: MemoryLease,
+}
+
 /// Broker-accounted activation produced by the Qwen reference matvec path.
 /// Keeping the lease next to its values prevents a seemingly harmless CPU
 /// fallback from bypassing the hard `--memory` budget.
@@ -644,10 +678,70 @@ fn matvec_payload(
         .into());
     }
     let blocks_per_row = cols / block_elements;
+    // Phase 25 (spec §297): the activation quantization depends only on
+    // each 256-element input chunk, not on the weight row. Hoisting it
+    // out of the row loop removes `rows - 1` redundant quantizations per
+    // matvec while keeping the exact same per-chunk integer bytes, so the
+    // result is bit-identical to the scalar per-row path.
+    // The activation quantization depends only on each input chunk, not
+    // on the weight row; hoisting it out of the row loop removes
+    // `rows - 1` redundant quantizations per matvec while keeping the
+    // exact per-chunk integer bytes, so the result is bit-identical to
+    // the scalar per-row path (Phase 25, spec §297).
+    let pre_quantized_q8k = match dtype {
+        GgmlType::Q4K | GgmlType::Q6K => Some(
+            input
+                .chunks_exact(256)
+                .map(quantize_q8_k)
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    };
+    let pre_quantized_q8_0 = match dtype {
+        GgmlType::Q8_0 => Some(
+            input
+                .chunks_exact(32)
+                .map(|chunk| {
+                    let maximum = chunk
+                        .iter()
+                        .fold(0.0f32, |current, value| current.max(value.abs()));
+                    let activation_scale = maximum / 127.0;
+                    let inverse = if activation_scale == 0.0 {
+                        0.0
+                    } else {
+                        activation_scale.recip()
+                    };
+                    let stored_activation_scale = crate::format::quant::dequant::f16_to_f32(
+                        crate::format::quant::dequant::f32_to_f16(activation_scale),
+                    );
+                    let mut quantized = [0i8; 32];
+                    for (slot, activation) in quantized.iter_mut().zip(chunk) {
+                        *slot = (activation * inverse).round().clamp(-128.0, 127.0) as i8;
+                    }
+                    (quantized, stored_activation_scale)
+                })
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    };
     for (row, output) in values.iter_mut().enumerate() {
         let row_start = row * blocks_per_row * block_bytes;
         let row_bytes = &payload[row_start..row_start + blocks_per_row * block_bytes];
-        *output = matvec_row(dtype, row_bytes, input)?;
+        *output = match dtype {
+            GgmlType::Q4K => q4_k_dot_pre(
+                row_bytes,
+                pre_quantized_q8k.as_ref().expect("q4k quantization"),
+            )?,
+            GgmlType::Q6K => q6_k_dot_pre(
+                row_bytes,
+                pre_quantized_q8k.as_ref().expect("q6k quantization"),
+            )?,
+            GgmlType::Q8_0 => q8_0_dot_pre(
+                row_bytes,
+                pre_quantized_q8_0.as_ref().expect("q8_0 quantization"),
+            )?,
+            _ => matvec_row(dtype, row_bytes, input)?,
+        };
     }
     Ok(Qwen36Activation {
         values,
@@ -730,9 +824,6 @@ fn matvec_row(dtype: GgmlType, row: &[u8], input: &[f32]) -> Result<f32> {
                 ) * input
             })
             .sum()),
-        GgmlType::Q8_0 => q8_0_dot(row, input),
-        GgmlType::Q4K => q4_k_dot(row, input),
-        GgmlType::Q6K => q6_k_dot(row, input),
         GgmlType::Q4_0 => {
             let block_bytes = dtype.block_bytes() as usize;
             let block_elements = dtype.block_size() as usize;
@@ -750,6 +841,12 @@ fn matvec_row(dtype: GgmlType, row: &[u8], input: &[f32]) -> Result<f32> {
             }
             Ok(output)
         }
+        // Q4_K/Q6_K/Q8_0 rows reach `matvec_payload`'s pre-quantized
+        // fast paths instead of this generic row loop.
+        GgmlType::Q4K | GgmlType::Q6K | GgmlType::Q8_0 => Err(ModelError::Unsupported(
+            "quantized row dot must use the pre-quantized matvec path".to_string(),
+        )
+        .into()),
         other => Err(ModelError::Unsupported(format!(
             "Qwen reference matvec does not support GGML type {}",
             other.ggml_id()
@@ -762,42 +859,32 @@ fn matvec_row(dtype: GgmlType, row: &[u8], input: &[f32]) -> Result<f32> {
 /// before taking the integer dot product. Directly multiplying dequantized
 /// weights by f32 activations is close, but it is a different operation and
 /// accumulated enough drift to break the real greedy-sequence gate.
-fn q8_0_dot(row: &[u8], input: &[f32]) -> Result<f32> {
-    const ELEMENTS: usize = crate::format::quant::dequant::Q8_0_BLOCK_ELEMENTS;
+fn q8_0_dot_pre(row: &[u8], quantized: &[([i8; 32], f32)]) -> Result<f32> {
     const BYTES: usize = 34;
-    if input.len() % ELEMENTS != 0 || row.len() != input.len() / ELEMENTS * BYTES {
+    if row.len() != quantized.len() * BYTES {
         return Err(ModelError::Shape {
             tensor: "Qwen Q8_0 dot payload",
-            expected: input.len() / ELEMENTS * BYTES,
+            expected: quantized.len() * BYTES,
             actual: row.len(),
         }
         .into());
     }
+    // Phase 25 SIMD seam: the NEON path over the same quantized bytes
+    // yields the exact integer dot of the scalar loop (fuzz-tested in
+    // `simd`); the f32 combination is unchanged.
+    if let Some(output) = crate::simd::q8_0_row_dot(row, quantized) {
+        return Ok(output);
+    }
     let mut output = 0.0f32;
-    for (weight, activation) in row.chunks_exact(BYTES).zip(input.chunks_exact(ELEMENTS)) {
+    for (weight, (quantized, stored_activation_scale)) in row.chunks_exact(BYTES).zip(quantized) {
         let weight_scale =
             crate::format::quant::dequant::f16_to_f32(u16::from_le_bytes([weight[0], weight[1]]));
-        let maximum = activation
-            .iter()
-            .fold(0.0f32, |current, value| current.max(value.abs()));
-        let activation_scale = maximum / 127.0;
-        let inverse = if activation_scale == 0.0 {
-            0.0
-        } else {
-            activation_scale.recip()
-        };
-        let stored_activation_scale = crate::format::quant::dequant::f16_to_f32(
-            crate::format::quant::dequant::f32_to_f16(activation_scale),
-        );
         let integer_dot = weight[2..]
             .iter()
-            .zip(activation)
-            .map(|(weight, activation)| {
-                let quantized = (activation * inverse).round().clamp(-128.0, 127.0) as i32;
-                (*weight as i8 as i32) * quantized
-            })
+            .zip(quantized)
+            .map(|(weight, quantized)| *weight as i8 as i32 * *quantized as i32)
             .sum::<i32>();
-        output += integer_dot as f32 * (weight_scale * stored_activation_scale);
+        output += integer_dot as f32 * (weight_scale * *stored_activation_scale);
     }
     Ok(output)
 }
@@ -854,52 +941,76 @@ fn q4_k_scale_min(index: usize, packed: &[u8]) -> (u8, u8) {
     }
 }
 
-fn q4_k_dot(row: &[u8], input: &[f32]) -> Result<f32> {
+fn q4_k_dot_pre(row: &[u8], quantized: &[QuantizedQ8K]) -> Result<f32> {
     const ELEMENTS: usize = 256;
     const BYTES: usize = 144;
-    if input.len() % ELEMENTS != 0 || row.len() != input.len() / ELEMENTS * BYTES {
+    if row.len() != quantized.len() * BYTES {
         return Err(ModelError::Shape {
             tensor: "Qwen Q4_K dot payload",
-            expected: input.len() / ELEMENTS * BYTES,
+            expected: quantized.len() * BYTES,
             actual: row.len(),
         }
         .into());
     }
     let mut sums = [0.0f32; 8];
     let mut minimum_sum = 0.0f32;
-    for (weight, activation) in row.chunks_exact(BYTES).zip(input.chunks_exact(ELEMENTS)) {
-        let quantized = quantize_q8_k(activation);
+    for (weight, quantized) in row.chunks_exact(BYTES).zip(quantized) {
         let weight_scale =
             crate::format::quant::dequant::f16_to_f32(u16::from_le_bytes([weight[0], weight[1]]));
         let minimum_scale =
             crate::format::quant::dequant::f16_to_f32(u16::from_le_bytes([weight[2], weight[3]]));
-        let packed_scales = &weight[4..16];
-        let packed_values = &weight[16..];
-        let mut unpacked = [0i8; ELEMENTS];
-        for chunk in 0..4 {
-            let source = &packed_values[chunk * 32..(chunk + 1) * 32];
-            let base = chunk * 64;
-            for index in 0..32 {
-                unpacked[base + index] = (source[index] & 0x0f) as i8;
-                unpacked[base + 32 + index] = (source[index] >> 4) as i8;
-            }
-        }
+        let packed_scales: &[u8; 12] = weight[4..16].try_into().map_err(|_| ModelError::Shape {
+            tensor: "Qwen Q4_K packed scales",
+            expected: 12,
+            actual: weight.len(),
+        })?;
+        let packed_values: &[u8; 128] = weight[16..].try_into().map_err(|_| ModelError::Shape {
+            tensor: "Qwen Q4_K packed values",
+            expected: 128,
+            actual: weight.len(),
+        })?;
 
-        let mut lane_sums = [0i32; 8];
         let mut block_minimum_sum = 0i32;
         for subblock in 0..8 {
-            let (scale, minimum) = q4_k_scale_min(subblock, packed_scales);
-            let start = subblock * 32;
+            let (_, minimum) = q4_k_scale_min(subblock, packed_scales);
             block_minimum_sum += minimum as i32
                 * (quantized.sums[subblock * 2] as i32 + quantized.sums[subblock * 2 + 1] as i32);
-            for quarter in 0..4 {
-                for lane in 0..8 {
-                    let index = start + quarter * 8 + lane;
-                    lane_sums[lane] +=
-                        scale as i32 * quantized.values[index] as i32 * unpacked[index] as i32;
-                }
-            }
         }
+
+        // Phase 25 SIMD seam (spec §56): the NEON kernel produces the
+        // exact integer lane sums of the scalar loop below (differential
+        // fuzz-tested in `simd`); the f32 combination is identical in
+        // both paths, so this switch is bit-identical and oracle-safe.
+        let lane_sums =
+            match crate::simd::q4k_block_lane_sums(packed_values, packed_scales, &quantized.values)
+            {
+                Some(lane_sums) => lane_sums,
+                None => {
+                    let mut unpacked = [0i8; ELEMENTS];
+                    for chunk in 0..4 {
+                        let source = &packed_values[chunk * 32..(chunk + 1) * 32];
+                        let base = chunk * 64;
+                        for index in 0..32 {
+                            unpacked[base + index] = (source[index] & 0x0f) as i8;
+                            unpacked[base + 32 + index] = (source[index] >> 4) as i8;
+                        }
+                    }
+                    let mut lane_sums = [0i32; 8];
+                    for subblock in 0..8 {
+                        let (scale, _) = q4_k_scale_min(subblock, packed_scales);
+                        let start = subblock * 32;
+                        for quarter in 0..4 {
+                            for lane in 0..8 {
+                                let index = start + quarter * 8 + lane;
+                                lane_sums[lane] += scale as i32
+                                    * quantized.values[index] as i32
+                                    * unpacked[index] as i32;
+                            }
+                        }
+                    }
+                    lane_sums
+                }
+            };
         let combined_scale = weight_scale * quantized.scale;
         for (sum, integer) in sums.iter_mut().zip(lane_sums) {
             *sum += combined_scale * integer as f32;
@@ -909,55 +1020,76 @@ fn q4_k_dot(row: &[u8], input: &[f32]) -> Result<f32> {
     Ok(minimum_sum + sums.into_iter().sum::<f32>())
 }
 
-fn q6_k_dot(row: &[u8], input: &[f32]) -> Result<f32> {
-    const ELEMENTS: usize = 256;
+fn q6_k_dot_pre(row: &[u8], quantized: &[QuantizedQ8K]) -> Result<f32> {
     const BYTES: usize = 210;
-    if input.len() % ELEMENTS != 0 || row.len() != input.len() / ELEMENTS * BYTES {
+    if row.len() != quantized.len() * BYTES {
         return Err(ModelError::Shape {
             tensor: "Qwen Q6_K dot payload",
-            expected: input.len() / ELEMENTS * BYTES,
+            expected: quantized.len() * BYTES,
             actual: row.len(),
         }
         .into());
     }
     let mut sums = [0.0f32; 8];
-    for (weight, activation) in row.chunks_exact(BYTES).zip(input.chunks_exact(ELEMENTS)) {
-        let quantized = quantize_q8_k(activation);
-        let ql = &weight[..128];
-        let qh = &weight[128..192];
-        let scales = &weight[192..208];
+    for (weight, quantized) in row.chunks_exact(BYTES).zip(quantized) {
+        let ql: &[u8; 128] = weight[..128].try_into().map_err(|_| ModelError::Shape {
+            tensor: "Qwen Q6_K low nibbles",
+            expected: 128,
+            actual: weight.len(),
+        })?;
+        let qh: &[u8; 64] = weight[128..192].try_into().map_err(|_| ModelError::Shape {
+            tensor: "Qwen Q6_K high bits",
+            expected: 64,
+            actual: weight.len(),
+        })?;
+        let scales: &[u8; 16] = weight[192..208].try_into().map_err(|_| ModelError::Shape {
+            tensor: "Qwen Q6_K scales",
+            expected: 16,
+            actual: weight.len(),
+        })?;
         let weight_scale = crate::format::quant::dequant::f16_to_f32(u16::from_le_bytes([
             weight[208],
             weight[209],
         ]));
-        let mut unpacked = [0i8; ELEMENTS];
-        for half in 0..2 {
-            let low = &ql[half * 64..(half + 1) * 64];
-            let high = &qh[half * 32..(half + 1) * 32];
-            let base = half * 128;
-            for index in 0..32 {
-                unpacked[base + index] =
-                    ((low[index] & 0x0f) | ((high[index] & 0x03) << 4)) as i8 - 32;
-                unpacked[base + index + 32] =
-                    ((low[index + 32] & 0x0f) | (((high[index] >> 2) & 0x03) << 4)) as i8 - 32;
-                unpacked[base + index + 64] =
-                    ((low[index] >> 4) | (((high[index] >> 4) & 0x03) << 4)) as i8 - 32;
-                unpacked[base + index + 96] =
-                    ((low[index + 32] >> 4) | (((high[index] >> 6) & 0x03) << 4)) as i8 - 32;
-            }
-        }
-        let mut lane_sums = [0i32; 8];
-        for group in 0..16 {
-            let scale = scales[group] as i8 as i32;
-            let start = group * 16;
-            for half in 0..2 {
-                for lane in 0..8 {
-                    let index = start + half * 8 + lane;
-                    lane_sums[lane] +=
-                        scale * quantized.values[index] as i32 * unpacked[index] as i32;
+        // Phase 25 SIMD seam: bit-identical lane sums (differential
+        // fuzz-tested in `simd`), same f32 combination as the scalar
+        // baseline below.
+        let lane_sums = match crate::simd::q6k_block_lane_sums(ql, qh, scales, &quantized.values) {
+            Some(lane_sums) => lane_sums,
+            None => {
+                let mut unpacked = [0i8; 256];
+                for half in 0..2 {
+                    let low = &ql[half * 64..(half + 1) * 64];
+                    let high = &qh[half * 32..(half + 1) * 32];
+                    let base = half * 128;
+                    for index in 0..32 {
+                        unpacked[base + index] =
+                            ((low[index] & 0x0f) | ((high[index] & 0x03) << 4)) as i8 - 32;
+                        unpacked[base + index + 32] =
+                            ((low[index + 32] & 0x0f) | (((high[index] >> 2) & 0x03) << 4)) as i8
+                                - 32;
+                        unpacked[base + index + 64] =
+                            ((low[index] >> 4) | (((high[index] >> 4) & 0x03) << 4)) as i8 - 32;
+                        unpacked[base + index + 96] =
+                            ((low[index + 32] >> 4) | (((high[index] >> 6) & 0x03) << 4)) as i8
+                                - 32;
+                    }
                 }
+                let mut lane_sums = [0i32; 8];
+                for group in 0..16 {
+                    let scale = scales[group] as i8 as i32;
+                    let start = group * 16;
+                    for half in 0..2 {
+                        for lane in 0..8 {
+                            let index = start + half * 8 + lane;
+                            lane_sums[lane] +=
+                                scale * quantized.values[index] as i32 * unpacked[index] as i32;
+                        }
+                    }
+                }
+                lane_sums
             }
-        }
+        };
         let combined_scale = weight_scale * quantized.scale;
         for (sum, integer) in sums.iter_mut().zip(lane_sums) {
             *sum += combined_scale * integer as f32;
@@ -1264,10 +1396,12 @@ impl Qwen36WeightLoader {
         Ok(Bytes(index.stored_bytes as u64))
     }
 
-    /// Loads one canonical routed expert from its two-tile superextent. This
-    /// is intentionally narrower than the old rank-three resident tensors:
-    /// selected gate, up, and down matrices become one broker-accounted cache
-    /// entry, with no route-dependent reinterpretation of their bytes.
+    /// Loads one canonical routed expert from its superextent. The tile
+    /// table may be the Phase 6 canonical layout (one whole-region tile per
+    /// matrix) or any Phase 22 tiled partition that exactly covers the
+    /// canonical gate/up/down bytes (spec §294) - the cache stores the
+    /// whole extent either way, so the forward path is unchanged. Tile
+    /// records are Q4_K passthrough in both cases.
     pub fn load_expert(
         &self,
         layer: LayerId,
@@ -1275,25 +1409,23 @@ impl Qwen36WeightLoader {
     ) -> Result<LoadedQwen36Expert> {
         let (index, tiles) = self.manifest.reader.expert(layer, expert)?;
         let q4k_layout = TQF_QUANT_PASSTHROUGH_Q4_K as u16;
-        if index.layout_id != q4k_layout
-            || ggml_type_for_quant_layout(index.layout_id as u32) != Some(GgmlType::Q4K)
-            || tiles.len() != 2
-            || tiles[0].matrix != ExpertMatrix::GateUp
-            || tiles[0].relative_offset != 0
-            || tiles[0].quant_layout_id != q4k_layout
-            || tiles[0].stored_bytes
-                != (LoadedQwen36Expert::GATE_BYTES + LoadedQwen36Expert::UP_BYTES) as u32
-            || tiles[1].matrix != ExpertMatrix::Down
-            || tiles[1].relative_offset != tiles[0].stored_bytes
-            || tiles[1].quant_layout_id != q4k_layout
-            || tiles[1].stored_bytes != LoadedQwen36Expert::DOWN_BYTES as u32
-            || index.stored_bytes
-                != (LoadedQwen36Expert::GATE_BYTES
-                    + LoadedQwen36Expert::UP_BYTES
-                    + LoadedQwen36Expert::DOWN_BYTES) as u32
-        {
+        let canonical_bytes = (LoadedQwen36Expert::GATE_BYTES
+            + LoadedQwen36Expert::UP_BYTES
+            + LoadedQwen36Expert::DOWN_BYTES) as u32;
+        let gate_up_bytes = (LoadedQwen36Expert::GATE_BYTES + LoadedQwen36Expert::UP_BYTES) as u32;
+        let valid_partition = index.layout_id == q4k_layout
+            && ggml_type_for_quant_layout(index.layout_id as u32) == Some(GgmlType::Q4K)
+            && index.stored_bytes == canonical_bytes
+            && tiles.iter().all(|tile| tile.quant_layout_id == q4k_layout)
+            && crate::format::tqf::tiling::classify_partition(
+                tiles,
+                gate_up_bytes,
+                LoadedQwen36Expert::DOWN_BYTES as u32,
+            )
+            .is_ok();
+        if !valid_partition {
             return Err(ModelError::Unsupported(
-                "TQF routed expert tiles are not canonical Qwen3.6 Q4_K matrices".to_string(),
+                "TQF routed expert tiles are not a valid Qwen3.6 Q4_K partition".to_string(),
             )
             .into());
         }
@@ -1312,6 +1444,48 @@ impl Qwen36WeightLoader {
         Ok(LoadedQwen36Expert {
             layer,
             expert,
+            bytes,
+            _lease: lease,
+        })
+    }
+
+    /// Phase 22 tile-granular load (spec §294): reads one tile of a routed
+    /// expert into broker-accounted storage, verifying its per-tile digest.
+    /// Only usable on containers whose expert index carries
+    /// `EXPERT_INDEX_FLAG_TILE_CHECKSUMS`; a partial-residency cache must
+    /// treat each returned tile as one independent lease-holding unit.
+    pub fn load_expert_tile(
+        &self,
+        layer: LayerId,
+        expert: crate::ids::ExpertId,
+        tile_ordinal: usize,
+    ) -> Result<LoadedExpertTile> {
+        let (index, tiles) = self.manifest.reader.expert(layer, expert)?;
+        let tile = tiles.get(tile_ordinal).ok_or(ModelError::Shape {
+            tensor: "expert tile ordinal",
+            expected: tiles.len(),
+            actual: tile_ordinal,
+        })?;
+        let lease = self.broker.reserve(
+            MemoryOwner::ExpertPinned,
+            MemoryClass::Elastic,
+            Bytes(tile.stored_bytes as u64),
+            64,
+        )?;
+        let mut bytes = vec![0; tile.stored_bytes as usize];
+        if let Err(error) =
+            self.manifest
+                .reader
+                .read_expert_tile_into(index, tile_ordinal, &mut bytes)
+        {
+            drop(bytes);
+            drop(lease);
+            return Err(error);
+        }
+        Ok(LoadedExpertTile {
+            matrix: tile.matrix,
+            neuron_start: tile.neuron_start,
+            neuron_count: tile.neuron_count,
             bytes,
             _lease: lease,
         })
@@ -1429,6 +1603,7 @@ mod tests {
         omit: Option<(TensorRole, LayerId)>,
         bad_shape: Option<(TensorRole, LayerId)>,
         expert_count: usize,
+        expert_width: crate::format::tqf::tiling::NeuronWidth,
     ) {
         let mut writer =
             TqfWriter::create_partial(path, canonical_header(&"ab".repeat(32)).unwrap()).unwrap();
@@ -1496,16 +1671,30 @@ mod tests {
         }
         let expert_bytes = vec![0u8; LoadedQwen36Expert::GATE_BYTES];
         for expert in 0..expert_count {
-            writer
-                .write_expert_parts(
-                    LayerId(0),
-                    crate::ids::ExpertId(expert as u16),
-                    TQF_QUANT_PASSTHROUGH_Q4_K as u16,
-                    &expert_bytes,
-                    &expert_bytes,
-                    &expert_bytes,
-                )
-                .unwrap();
+            if expert_width.is_whole() {
+                writer
+                    .write_expert_parts(
+                        LayerId(0),
+                        crate::ids::ExpertId(expert as u16),
+                        TQF_QUANT_PASSTHROUGH_Q4_K as u16,
+                        &expert_bytes,
+                        &expert_bytes,
+                        &expert_bytes,
+                    )
+                    .unwrap();
+            } else {
+                writer
+                    .write_expert_parts_tiled(
+                        LayerId(0),
+                        crate::ids::ExpertId(expert as u16),
+                        TQF_QUANT_PASSTHROUGH_Q4_K as u16,
+                        &expert_bytes,
+                        &expert_bytes,
+                        &expert_bytes,
+                        expert_width,
+                    )
+                    .unwrap();
+            }
         }
         writer.commit().unwrap();
     }
@@ -1513,7 +1702,13 @@ mod tests {
     #[test]
     fn complete_fixed_graph_is_accepted() {
         let path = fixture_path("complete.tqf");
-        build_complete_fixture(&path, None, None, 0);
+        build_complete_fixture(
+            &path,
+            None,
+            None,
+            0,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
         Qwen36WeightManifest::open(&path).unwrap();
         std::fs::remove_file(path).unwrap();
     }
@@ -1530,11 +1725,84 @@ mod tests {
         Qwen36WeightManifest::open_with_broker(&path, &broker).unwrap();
     }
 
+    /// Phase 24/25 planning seam: sums the stored bytes of every tensor
+    /// the resident-core streaming profile would pin (everything except
+    /// the routed-expert superextents), so the resident-core/expert-cache
+    /// split can be sized from the real container's metadata without
+    /// reading a single payload.
+    #[test]
+    #[ignore = "requires the converted canonical TQF"]
+    fn canonical_tqf_hot_tensor_dtypes() {
+        use crate::format::quant::GgmlType;
+        let path = std::env::var_os("TQF_CANONICAL_TQF")
+            .map(std::path::PathBuf::from)
+            .expect("set TQF_CANONICAL_TQF to the converted canonical container");
+        let broker = MemoryBroker::new(Bytes(4 * 1024 * 1024 * 1024));
+        let manifest = Qwen36WeightManifest::open_with_broker(&path, &broker).unwrap();
+        for (name, role, layer) in [
+            ("embedding", TensorRole::TokenEmbedding, None),
+            ("lm_head", TensorRole::LmHead, None),
+            ("gdn_qkv", TensorRole::GdnInProjQkv, Some(LayerId(1))),
+            ("gdn_z", TensorRole::GdnInProjZ, Some(LayerId(1))),
+            ("gdn_out", TensorRole::GdnOutProj, Some(LayerId(1))),
+            ("attn_q", TensorRole::AttnQProj, Some(LayerId(3))),
+            ("attn_o", TensorRole::AttnOProj, Some(LayerId(3))),
+            (
+                "shared_gate",
+                TensorRole::SharedExpertGate,
+                Some(LayerId(1)),
+            ),
+            (
+                "shared_down",
+                TensorRole::SharedExpertDown,
+                Some(LayerId(1)),
+            ),
+            ("router", TensorRole::RouterGate, Some(LayerId(1))),
+        ] {
+            let extent = manifest.reader().tensor(role as u32, layer).unwrap();
+            println!(
+                "dtype {name}: ggml_type_id={} stored_bytes={}",
+                extent.dtype_id, extent.stored_bytes
+            );
+            if let Ok(dtype) = GgmlType::from_ggml_id(extent.dtype_id) {
+                println!("  => {dtype:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the converted canonical TQF"]
+    fn canonical_tqf_resident_core_stored_bytes() {
+        let path = std::env::var_os("TQF_CANONICAL_TQF")
+            .map(std::path::PathBuf::from)
+            .expect("set TQF_CANONICAL_TQF to the converted canonical container");
+        let broker = MemoryBroker::new(Bytes(4 * 1024 * 1024 * 1024));
+        let manifest = Qwen36WeightManifest::open_with_broker(&path, &broker).unwrap();
+        let mut core = 0u64;
+        let mut experts = 0u64;
+        for extent in manifest.reader().extents_iter() {
+            core = core.saturating_add(extent.stored_bytes);
+        }
+        for expert in manifest.reader().experts_iter() {
+            experts = experts.saturating_add(expert.stored_bytes as u64);
+        }
+        println!(
+            "resident_core_stored_bytes={core} expert_pool_stored_bytes={experts} total={}",
+            core.saturating_add(experts)
+        );
+    }
+
     #[test]
     fn a_missing_full_attention_role_rejects_installation() {
         let path = fixture_path("missing.tqf");
         let layer = LayerId(3);
-        build_complete_fixture(&path, Some((TensorRole::AttnQProj, layer)), None, 0);
+        build_complete_fixture(
+            &path,
+            Some((TensorRole::AttnQProj, layer)),
+            None,
+            0,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
         assert!(Qwen36WeightManifest::open(&path).is_err());
         std::fs::remove_file(path).unwrap();
     }
@@ -1543,7 +1811,13 @@ mod tests {
     fn a_transposed_or_flattened_tensor_rejects_installation() {
         let path = fixture_path("bad-shape.tqf");
         let layer = LayerId(3);
-        build_complete_fixture(&path, None, Some((TensorRole::AttnQProj, layer)), 0);
+        build_complete_fixture(
+            &path,
+            None,
+            Some((TensorRole::AttnQProj, layer)),
+            0,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
         assert!(Qwen36WeightManifest::open(&path).is_err());
         std::fs::remove_file(path).unwrap();
     }
@@ -1551,7 +1825,13 @@ mod tests {
     #[test]
     fn loader_reserves_before_reading_and_releases_with_tensor() {
         let path = fixture_path("loader.tqf");
-        build_complete_fixture(&path, None, None, 0);
+        build_complete_fixture(
+            &path,
+            None,
+            None,
+            0,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
         let broker = MemoryBroker::new(Bytes(1024 * 1024));
         let loader = Qwen36WeightLoader::open(&path, broker.clone()).unwrap();
         let metadata_bytes = broker.snapshot().reserved.0;
@@ -1568,7 +1848,13 @@ mod tests {
     #[test]
     fn routed_expert_load_is_broker_accounted_and_validates_two_tiles() {
         let path = fixture_path("expert-loader.tqf");
-        build_complete_fixture(&path, None, None, 1);
+        build_complete_fixture(
+            &path,
+            None,
+            None,
+            1,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
         let expected = (LoadedQwen36Expert::GATE_BYTES * 3) as u64;
         let broker = MemoryBroker::new(Bytes(expected + 1024 * 1024));
         let loader = Qwen36WeightLoader::open(&path, broker.clone()).unwrap();
@@ -1592,9 +1878,114 @@ mod tests {
     }
 
     #[test]
+    fn batch_route_plan_dedupes_distinct_experts_and_pins_the_union() {
+        use crate::experts::RouterResult;
+        let path = fixture_path("expert-batch-plan.tqf");
+        build_complete_fixture(
+            &path,
+            None,
+            None,
+            16,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
+        let broker = MemoryBroker::new(Bytes(256 * 1024 * 1024));
+        let loader = Qwen36WeightLoader::open(&path, broker.clone()).unwrap();
+        let mut cache =
+            WholeExpertLfuCache::new(Bytes(LoadedQwen36Expert::canonical_stored_bytes().0 * 20));
+        // Pre-resident experts 2 and 3.
+        for expert in [crate::ids::ExpertId(2), crate::ids::ExpertId(3)] {
+            cache
+                .get_or_load(&loader, &broker, LayerId(0), expert)
+                .unwrap();
+        }
+        let route_a = RouterResult {
+            ids: [
+                crate::ids::ExpertId(0),
+                crate::ids::ExpertId(1),
+                crate::ids::ExpertId(2),
+                crate::ids::ExpertId(3),
+                crate::ids::ExpertId(4),
+                crate::ids::ExpertId(5),
+                crate::ids::ExpertId(6),
+                crate::ids::ExpertId(7),
+            ],
+            weights: [0.125; 8],
+        };
+        let route_b = RouterResult {
+            ids: [
+                crate::ids::ExpertId(2),
+                crate::ids::ExpertId(3),
+                crate::ids::ExpertId(8),
+                crate::ids::ExpertId(9),
+                crate::ids::ExpertId(10),
+                crate::ids::ExpertId(11),
+                crate::ids::ExpertId(12),
+                crate::ids::ExpertId(13),
+            ],
+            weights: [0.125; 8],
+        };
+        let before = cache.stats();
+        let plan = cache
+            .prepare_batch_route(&loader, &broker, LayerId(0), &[route_a, route_b])
+            .unwrap();
+        assert_eq!(plan.distinct.len(), 14);
+        // The batch fetches exactly the 12 absent distinct experts once;
+        // the two pre-resident ones are hits on every route that
+        // selected them (2 and 3 each appear in both routes).
+        assert_eq!(cache.stats().hits - before.hits, 4);
+        assert_eq!(cache.stats().misses - before.misses, 12);
+        assert_eq!(
+            cache.stats().raw_miss_bytes.0 - before.raw_miss_bytes.0,
+            LoadedQwen36Expert::canonical_stored_bytes().0 * 12
+        );
+        cache.finish_batch_route(&plan).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tiled_expert_load_accepts_a_partitioned_extent_and_verified_tile_reads() {
+        use crate::format::tqf::tiling::NeuronWidth;
+        let path = fixture_path("expert-tiled-loader.tqf");
+        build_complete_fixture(&path, None, None, 1, NeuronWidth::N128);
+        let expected = (LoadedQwen36Expert::GATE_BYTES * 3) as u64;
+        let broker = MemoryBroker::new(Bytes(expected + 1024 * 1024));
+        let loader = Qwen36WeightLoader::open(&path, broker.clone()).unwrap();
+        let metadata_bytes = broker.snapshot().reserved.0;
+
+        // Whole-expert load assembles the same canonical bytes as the
+        // whole-region layout.
+        let expert = loader
+            .load_expert(LayerId(0), crate::ids::ExpertId(0))
+            .unwrap();
+        assert_eq!(expert.stored_bytes(), Bytes(expected));
+        drop(expert);
+        assert_eq!(broker.snapshot().reserved, Bytes(metadata_bytes));
+
+        // Tile-granular loads are checksum-verified and broker-accounted.
+        for ordinal in 0..10 {
+            let tile = loader
+                .load_expert_tile(LayerId(0), crate::ids::ExpertId(0), ordinal)
+                .unwrap();
+            assert!(broker.snapshot().reserved.0 > metadata_bytes);
+            drop(tile);
+            assert_eq!(broker.snapshot().reserved, Bytes(metadata_bytes));
+        }
+        assert!(loader
+            .load_expert_tile(LayerId(0), crate::ids::ExpertId(0), 10)
+            .is_err());
+        drop(loader);
+        assert_eq!(broker.snapshot().reserved, Bytes(0));
+        std::fs::remove_file(path).unwrap();
+    }
     fn expert_cache_evicts_the_least_frequent_whole_superextent_before_reading() {
         let path = fixture_path("expert-cache.tqf");
-        build_complete_fixture(&path, None, None, 3);
+        build_complete_fixture(
+            &path,
+            None,
+            None,
+            3,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
         let expert_bytes = (LoadedQwen36Expert::GATE_BYTES * 3) as u64;
         let broker = MemoryBroker::new(Bytes(expert_bytes * 2 + 1024 * 1024));
         let loader = Qwen36WeightLoader::open(&path, broker.clone()).unwrap();
@@ -1653,7 +2044,13 @@ mod tests {
     #[test]
     fn cache_policy_is_pluggable_between_lfu_and_lru_for_the_same_access_pattern() {
         let path = fixture_path("expert-cache-policy.tqf");
-        build_complete_fixture(&path, None, None, 3);
+        build_complete_fixture(
+            &path,
+            None,
+            None,
+            3,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
         let expert_bytes = (LoadedQwen36Expert::GATE_BYTES * 3) as u64;
         let layer = LayerId(0);
 
@@ -1978,7 +2375,13 @@ mod tests {
     #[test]
     fn exact_route_transaction_pins_all_selected_experts_until_finish() {
         let path = fixture_path("expert-plan.tqf");
-        build_complete_fixture(&path, None, None, 9);
+        build_complete_fixture(
+            &path,
+            None,
+            None,
+            9,
+            crate::format::tqf::tiling::NeuronWidth::Whole,
+        );
         let expert_bytes = (LoadedQwen36Expert::GATE_BYTES * 3) as u64;
         let broker = MemoryBroker::new(Bytes(expert_bytes * 8 + 1024 * 1024));
         let loader = Qwen36WeightLoader::open(&path, broker.clone()).unwrap();

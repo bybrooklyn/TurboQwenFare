@@ -224,6 +224,27 @@ impl TqfReader {
                 }
                 .into());
             }
+            let tile_start = e.tile_first as usize;
+            if !super::tiling::partition_is_contiguous(&tiles[tile_start..tile_end], e.stored_bytes)
+            {
+                return Err(ContainerError::MalformedRecord {
+                    table: "expert tile partition",
+                }
+                .into());
+            }
+            if e.flags & super::records::EXPERT_INDEX_FLAG_TILE_CHECKSUMS != 0 {
+                let checksum_entries = checksum_table.len() / super::records::CHECKSUM_ENTRY_SIZE;
+                let required = (e.checksum_index as usize)
+                    .checked_add(1)
+                    .and_then(|index| index.checked_add(e.tile_count as usize))
+                    .ok_or(ContainerError::IntegerOverflow)?;
+                if required > checksum_entries {
+                    return Err(ContainerError::MalformedRecord {
+                        table: "expert per-tile checksum range",
+                    }
+                    .into());
+                }
+            }
         }
 
         let mut checksums = Vec::new();
@@ -275,6 +296,17 @@ impl TqfReader {
 
     pub fn tensor_name(&self, extent: &TensorExtentRecord) -> Result<String> {
         read_string_at(&self.string_table, extent.name_string_offset)
+    }
+
+    /// Metadata-only iteration for planning/sealing tooling (Phase 24/25
+    /// sizing): all tensor extents, no payload reads.
+    pub fn extents_iter(&self) -> impl Iterator<Item = &TensorExtentRecord> {
+        self.extents.iter()
+    }
+
+    /// Metadata-only iteration over the expert index records.
+    pub fn experts_iter(&self) -> impl Iterator<Item = &ExpertIndexRecord> {
+        self.experts.iter()
     }
 
     pub fn expert(
@@ -359,6 +391,60 @@ impl TqfReader {
         }
         self.file.read_exact_at(destination, idx.file_offset)?;
         self.verify_checksum(idx.checksum_index, destination)
+    }
+
+    /// Phase 22 tile-granular read (spec §294): reads one tile of an
+    /// expert's superextent into caller-owned storage. Integrity requires
+    /// the converter to have emitted per-tile digests
+    /// (`EXPERT_INDEX_FLAG_TILE_CHECKSUMS`); without them this refuses
+    /// rather than reading unverifiable bytes - a partially resident
+    /// expert is only admissible on a container that can vouch for every
+    /// tile independently.
+    pub fn read_expert_tile_into(
+        &self,
+        idx: &ExpertIndexRecord,
+        tile_ordinal: usize,
+        destination: &mut [u8],
+    ) -> Result<()> {
+        let tile = self
+            .expert_tile(idx, tile_ordinal)
+            .ok_or(ContainerError::MalformedRecord {
+                table: "expert tile ordinal",
+            })?;
+        if tile.stored_bytes as usize != destination.len() {
+            return Err(ContainerError::MalformedRecord {
+                table: "expert tile destination length",
+            }
+            .into());
+        }
+        if idx.flags & super::records::EXPERT_INDEX_FLAG_TILE_CHECKSUMS == 0 {
+            return Err(ContainerError::MalformedRecord {
+                table: "expert per-tile checksums (tile-granular read refused)",
+            }
+            .into());
+        }
+        let offset = idx
+            .file_offset
+            .checked_add(tile.relative_offset as u64)
+            .ok_or(ContainerError::IntegerOverflow)?;
+        self.file.read_exact_at(destination, offset)?;
+        let checksum_index = (idx.checksum_index as usize)
+            .checked_add(1)
+            .and_then(|index| index.checked_add(tile_ordinal))
+            .ok_or(ContainerError::IntegerOverflow)?;
+        self.verify_checksum(checksum_index as u32, destination)
+    }
+
+    /// Returns the tile record for one ordinal within an expert's tile
+    /// table, or `None` if the ordinal is out of range.
+    pub fn expert_tile(
+        &self,
+        idx: &ExpertIndexRecord,
+        tile_ordinal: usize,
+    ) -> Option<&ExpertTileRecord> {
+        let start = idx.tile_first as usize;
+        let end = start.checked_add(idx.tile_count as usize)?;
+        self.tiles.get(start..end)?.get(tile_ordinal)
     }
 
     fn verify_checksum(&self, index: u32, data: &[u8]) -> Result<()> {

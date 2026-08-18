@@ -5,6 +5,7 @@
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::dev::inventory::TensorRole;
@@ -74,7 +75,7 @@ struct Qwen36Layer {
 /// The bounded out-of-core profile does not replace this oracle.
 pub struct Qwen36ReferenceRuntime {
     broker: MemoryBroker,
-    loader: Qwen36WeightLoader,
+    loader: Arc<Qwen36WeightLoader>,
     expert_cache: Option<WholeExpertLfuCache>,
     embedding: LoadedQwen36Tensor,
     final_norm: LoadedQwen36Tensor,
@@ -91,7 +92,7 @@ pub struct Qwen36ReferenceRuntime {
 /// later phases select the fast mapped/GPU policy.
 pub struct Qwen36BoundedReferenceRuntime {
     broker: MemoryBroker,
-    loader: Qwen36WeightLoader,
+    loader: Arc<Qwen36WeightLoader>,
     expert_cache: WholeExpertLfuCache,
     layers: Vec<BoundedLayerState>,
     decode_index: u64,
@@ -110,7 +111,7 @@ enum BoundedLayerState {
 
 impl Qwen36ReferenceRuntime {
     pub fn open_resident(path: &Path, broker: MemoryBroker, max_context: usize) -> Result<Self> {
-        let loader = Qwen36WeightLoader::open(path, broker.clone())?;
+        let loader = Arc::new(Qwen36WeightLoader::open(path, broker.clone())?);
         let embedding = loader.load(TensorRole::TokenEmbedding, None)?;
         let final_norm = loader.load(TensorRole::FinalNorm, None)?;
         let lm_head = loader.load(TensorRole::LmHead, None)?;
@@ -174,7 +175,7 @@ impl Qwen36ReferenceRuntime {
         max_context: usize,
         expert_cache_bytes: Bytes,
     ) -> Result<Self> {
-        let loader = Qwen36WeightLoader::open(path, broker.clone())?;
+        let loader = Arc::new(Qwen36WeightLoader::open(path, broker.clone())?);
         if !loader.manifest().uses_expert_superextents() {
             return Err(ModelError::Unsupported(
                 "streaming reference runtime requires canonical expert-superextent TQF conversion"
@@ -236,6 +237,114 @@ impl Qwen36ReferenceRuntime {
 
     pub fn expert_cache_stats(&self) -> Option<crate::experts::ExpertCacheStats> {
         self.expert_cache.as_ref().map(WholeExpertLfuCache::stats)
+    }
+
+    /// Phase 26 chunked prefill (spec §298): layer-outer processing of a
+    /// prompt with per-(layer, chunk) expert-set dedup. Each layer's
+    /// attention/recurrent state advances per token in exact order, so
+    /// the result is identical to the per-token loop; the MoE tail
+    /// instead routes every chunk row, fetches each *distinct* absent
+    /// expert once, and re-uses it for every row that selected it.
+    /// The chunk size auto-halves when the broker cannot reserve chunk
+    /// scratch (spec §152: "chunk size auto-reduces when context/scratch
+    /// pressure would violate --memory"). `TQF_PREFILL_CHUNK` overrides
+    /// the seed (default 4096).
+    pub fn prefill_greedy(&mut self, prompt: &[u32]) -> Result<u32> {
+        if prompt.is_empty() {
+            return Err(ModelError::Unsupported(
+                "chunked prefill requires a nonempty prompt".to_string(),
+            )
+            .into());
+        }
+        let seed: usize = std::env::var("TQF_PREFILL_CHUNK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4096)
+            .max(1);
+        for chunk in prompt[..prompt.len() - 1].chunks(seed) {
+            let mut chunk_size = chunk.len();
+            loop {
+                match self.prefill_chunk(&chunk[..chunk_size]) {
+                    Ok(()) => break,
+                    Err(crate::error::TqfError::Memory(_)) if chunk_size > 1 => {
+                        chunk_size /= 2;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if chunk_size < chunk.len() {
+                for remainder in chunk[chunk_size..].chunks(chunk_size.max(1)) {
+                    self.prefill_chunk(remainder)?;
+                }
+            }
+        }
+        // The final prompt token must produce real logits for greedy
+        // selection; one ordinary decode step does that.
+        let decoded = self.decode_greedy(prompt[prompt.len() - 1])?;
+        Ok(decoded.token)
+    }
+
+    fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let mut hiddens: Vec<Qwen36Activation> = tokens
+            .iter()
+            .map(|token| {
+                if *token as usize >= Qwen36Geometry::VOCAB_SIZE {
+                    return Err(ModelError::Shape {
+                        tensor: "Qwen prefill token",
+                        expected: Qwen36Geometry::VOCAB_SIZE,
+                        actual: *token as usize,
+                    }
+                    .into());
+                }
+                self.embedding.row(&self.broker, *token as usize)
+            })
+            .collect::<Result<_>>()?;
+        for layer in &mut self.layers {
+            let mut ffn_inputs = Vec::with_capacity(hiddens.len());
+            let mut after_attention = Vec::with_capacity(hiddens.len());
+            for hidden in &hiddens {
+                let attn_weight = layer.common.attn_norm.vector(&self.broker)?;
+                let normalized =
+                    Qwen36Activation::qwen_rmsnorm(&self.broker, hidden, &attn_weight.values)?;
+                let attended = match &mut layer.attention {
+                    AttentionLayer::Gdn(gdn) => run_gdn(&self.broker, gdn, &normalized)?,
+                    AttentionLayer::Full(full) => {
+                        run_full_attention(&self.broker, full, &normalized)?
+                    }
+                };
+                let after = Qwen36Activation::residual_add(&self.broker, hidden, &attended)?;
+                let ffn_weight = layer.common.ffn_norm.vector(&self.broker)?;
+                ffn_inputs.push(Qwen36Activation::qwen_rmsnorm(
+                    &self.broker,
+                    &after,
+                    &ffn_weight.values,
+                )?);
+                after_attention.push(after);
+            }
+            let moe_outputs = match &mut layer.common.moe {
+                BoundMoe::Streaming(moe) => {
+                    let cache = self.expert_cache.as_mut().ok_or_else(|| {
+                        ModelError::Unsupported(
+                            "streaming MoE missing global expert cache".to_string(),
+                        )
+                    })?;
+                    moe.forward_batch(&self.loader, cache, &self.broker, &ffn_inputs)?
+                        .0
+                }
+                BoundMoe::Resident(moe) => ffn_inputs
+                    .iter()
+                    .map(|input| moe.forward(&self.broker, input).map(|(output, _)| output))
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            for ((hidden, after), moe) in hiddens.iter_mut().zip(after_attention).zip(moe_outputs) {
+                *hidden = Qwen36Activation::residual_add(&self.broker, &after, &moe)?;
+            }
+        }
+        self.decode_index = self.decode_index.saturating_add(tokens.len() as u64);
+        Ok(())
     }
 
     /// Phase 20 A/B seam: toggles the GPU-resident expert path on the
@@ -336,7 +445,7 @@ impl Qwen36BoundedReferenceRuntime {
         max_context: usize,
         expert_cache_bytes: Bytes,
     ) -> Result<Self> {
-        let loader = Qwen36WeightLoader::open(path, broker.clone())?;
+        let loader = Arc::new(Qwen36WeightLoader::open(path, broker.clone())?);
         if !loader.manifest().uses_expert_superextents() {
             return Err(ModelError::Unsupported(
                 "bounded runtime requires canonical expert-superextent TQF conversion".to_string(),
@@ -489,7 +598,7 @@ impl Qwen36BoundedReferenceRuntime {
 
 fn bounded_layer_forward(
     broker: &MemoryBroker,
-    loader: &Qwen36WeightLoader,
+    loader: &Arc<Qwen36WeightLoader>,
     expert_cache: &mut WholeExpertLfuCache,
     layer: &mut BoundedLayerState,
     input: &Qwen36Activation,
@@ -763,7 +872,7 @@ impl Qwen36Layer {
     fn forward(
         &mut self,
         broker: &MemoryBroker,
-        loader: &Qwen36WeightLoader,
+        loader: &Arc<Qwen36WeightLoader>,
         expert_cache: Option<&mut WholeExpertLfuCache>,
         input: &Qwen36Activation,
     ) -> Result<(Qwen36Activation, RouterResult)> {
@@ -801,7 +910,10 @@ fn run_gdn(
     input: &Qwen36Activation,
 ) -> Result<Qwen36Activation> {
     let qkv = layer.qkv.matvec(broker, &input.values)?;
-    let conv_weight = layer.conv.vector(broker)?;
+    // Canonical GGUF stores ssm_conv1d.weight as rank-two {4, 8192}
+    // consumed as channel-major depthwise weights; the naive vector view
+    // was replaced by this decoding in the Phase 16 parity work.
+    let conv_weight = layer.conv.gdn_conv1d_weights(broker)?;
     let mut convolved = Qwen36Activation::zeros(broker, Qwen36Geometry::GDN_CONV_CHANNELS)?;
     layer.state.conv_tail_mut().step_without_bias_into(
         &qkv.values,
@@ -1000,6 +1112,178 @@ mod canonical_checkpoint_tests {
     /// Start token 32 ("A", per `docs/research/oracles/raw-a-16.json`
     /// prompt_tokens) so no tokenizer is needed. `TQF_DECODE_AB_TOKENS`
     /// overrides the token count (default 16).
+    /// Phase 26 prefill A/B (spec §298): tokenize a fixed multi-token
+    /// prompt, then run it through (a) the per-token decode loop and
+    /// (b) chunked prefill, asserting identical greedy continuation and
+    /// reporting TTFT for both. The per-token loop is the Phase 26
+    /// baseline; chunked prefill is expected to win via expert-set dedup
+    /// (fewer distinct fetches per layer/chunk).
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint; Phase 26 prefill A/B"]
+    fn chunked_prefill_parity_and_ttft() {
+        let tqf_path = std::env::var("TQF_CANONICAL_TQF")
+            .expect("set TQF_CANONICAL_TQF to the converted canonical container");
+        let gguf_path = std::env::var("TQF_CANONICAL_GGUF")
+            .expect("set TQF_CANONICAL_GGUF to the verified canonical source");
+        let prompt = std::env::var("TQF_PREFILL_PROMPT").unwrap_or_else(|_| {
+            "Once upon a time, in a quiet valley between two mountains, there lived a              small village of craftsmen who built everything they needed with their own              hands, from wooden carts to iron tools, and they believed that patience was              the finest skill of all."
+                .to_string()
+        });
+        let broker = MemoryBroker::new(Bytes(4 * 1024 * 1024 * 1024));
+        let tokenizer_source = gguf::open_with_broker(Path::new(&gguf_path), &broker).unwrap();
+        let tokenizer = TqfTokenizer::from_gguf(&tokenizer_source).unwrap();
+        let tokens = tokenizer.encode(&prompt, false).unwrap();
+        assert!(
+            tokens.len() >= 8,
+            "A/B prompt must tokenize to several tokens"
+        );
+
+        let open = || {
+            Qwen36ReferenceRuntime::open_streaming(
+                Path::new(&tqf_path),
+                MemoryBroker::new(Bytes(4 * 1024 * 1024 * 1024)),
+                tokens.len() + 16,
+                Bytes(1024 * 1024 * 1024),
+            )
+            .unwrap()
+        };
+
+        let started = Instant::now();
+        let mut per_token_runtime = open();
+        let mut per_token_next = 0;
+        for &token in &tokens {
+            per_token_next = per_token_runtime.decode_greedy(token).unwrap().token;
+        }
+        let per_token_ms = started.elapsed().as_secs_f64() * 1e3;
+        let per_token_cache = per_token_runtime.expert_cache_stats().unwrap();
+
+        let started = Instant::now();
+        let mut chunked_runtime = open();
+        let chunked_next = chunked_runtime.prefill_greedy(&tokens).unwrap();
+        let chunked_ms = started.elapsed().as_secs_f64() * 1e3;
+        let chunked_cache = chunked_runtime.expert_cache_stats().unwrap();
+
+        println!(
+            "phase26_prefill prompt_tokens={} per_token_ms={per_token_ms:.1} chunked_ms={chunked_ms:.1} speedup={:.2}x",
+            tokens.len(),
+            per_token_ms / chunked_ms
+        );
+        println!(
+            "phase26_prefill per_token_misses={} per_token_bytes={}",
+            per_token_cache.misses, per_token_cache.raw_miss_bytes.0
+        );
+        println!(
+            "phase26_prefill chunked_misses={} chunked_bytes={}",
+            chunked_cache.misses, chunked_cache.raw_miss_bytes.0
+        );
+        assert_eq!(
+            per_token_next, chunked_next,
+            "chunked prefill diverged from the per-token loop"
+        );
+    }
+
+    /// Phase 25 M4 assault harness (spec §297): the resident-core
+    /// streaming profile - attention/GDN/router/shared weights resident,
+    /// routed Q4_K experts streamed through the global cache - timed
+    /// token-by-token against the pinned raw-a-16 greedy oracle. Prints
+    /// per-stage wall times, per-token milliseconds, expert-cache I/O
+    /// counters, and the sustained tok/s, so the optimization ledger can
+    /// record exactly where the time goes. `TQF_DECODE_AB_TOKENS`
+    /// overrides the token count (default 16).
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint; Phase 25 M4 assault"]
+    fn resident_streaming_decode_benchmark() {
+        let tqf_path = std::env::var("TQF_CANONICAL_TQF")
+            .expect("set TQF_CANONICAL_TQF to the converted canonical container");
+        let tokens: usize = std::env::var("TQF_DECODE_AB_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let budget = Bytes(4 * 1024 * 1024 * 1024);
+        let mut runtime = Qwen36ReferenceRuntime::open_streaming(
+            Path::new(&tqf_path),
+            MemoryBroker::new(budget),
+            64,
+            Bytes(1024 * 1024 * 1024),
+        )
+        .unwrap();
+        // Pinned raw-a-16 oracle: prompt token 32 -> 220, 16, 15, 15, ...
+        let oracle: [u32; 16] = [
+            220, 16, 15, 15, 15, 20332, 1740, 369, 6992, 506, 220, 17, 15, 295, 2600, 948,
+        ];
+        let mut current = 32u32;
+        let mut per_token_ms = Vec::with_capacity(tokens);
+        let mut embedding_ms = Vec::with_capacity(tokens);
+        let mut layer_ms = Vec::with_capacity(tokens);
+        let mut lm_head_ms = Vec::with_capacity(tokens);
+        for step in 0..tokens {
+            let start = Instant::now();
+            let decoded = runtime.decode_greedy(current).unwrap();
+            let elapsed = start.elapsed();
+            per_token_ms.push(elapsed.as_secs_f64() * 1e3);
+            embedding_ms.push(decoded.diagnostics.timings.embedding.as_secs_f64() * 1e3);
+            layer_ms.push(
+                decoded
+                    .diagnostics
+                    .timings
+                    .layers
+                    .iter()
+                    .map(|(_, duration)| duration.as_secs_f64() * 1e3)
+                    .sum::<f64>(),
+            );
+            lm_head_ms.push(decoded.diagnostics.timings.lm_head.as_secs_f64() * 1e3);
+            let expected = if step < oracle.len() { oracle[step] } else { 0 };
+            if step < oracle.len() {
+                assert_eq!(
+                    decoded.token, expected,
+                    "resident-core streaming decode diverged from the raw-a-16 oracle at step {step}"
+                );
+            }
+            let cache = runtime.expert_cache_stats().unwrap();
+            let mut slowest: Vec<(u8, f64)> = decoded
+                .diagnostics
+                .timings
+                .layers
+                .iter()
+                .map(|(layer, duration)| (layer.0, duration.as_secs_f64() * 1e3))
+                .collect();
+            slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let top_layers: Vec<String> = slowest
+                .iter()
+                .take(5)
+                .map(|(layer, ms)| format!("L{layer}={ms:.0}ms"))
+                .collect();
+            println!(
+                "phase25_resident_stream step={step} input={current} next={} wall_ms={:.1} embedding_ms={:.1} layers_ms={:.1} lm_head_ms={:.1} cache_hits={} cache_misses={} resident_bytes={} slowest=[{}]",
+                decoded.token,
+                per_token_ms[step],
+                embedding_ms[step],
+                layer_ms[step],
+                lm_head_ms[step],
+                cache.hits,
+                cache.misses,
+                cache.resident_bytes.0,
+                top_layers.join(", "),
+            );
+            current = decoded.token;
+        }
+        let total_ms: f64 = per_token_ms.iter().sum();
+        let tok_per_s = tokens as f64 / (total_ms / 1000.0);
+        println!(
+            "phase25_resident_stream summary tokens={tokens} total_ms={total_ms:.1} tok_per_s={tok_per_s:.2} avg_token_ms={:.1} avg_layers_ms={:.1} avg_lm_head_ms={:.1}",
+            total_ms / tokens as f64,
+            layer_ms.iter().sum::<f64>() / tokens as f64,
+            lm_head_ms.iter().sum::<f64>() / tokens as f64,
+        );
+        let cache = runtime.expert_cache_stats().unwrap();
+        println!("phase25_resident_stream cache={:?}", cache);
+        println!(
+            "phase25_resident_stream io_total_ms={:.0} io_avg_ms_per_token={:.1}",
+            cache.demand_io_nanos as f64 / 1e6,
+            cache.demand_io_nanos as f64 / 1e6 / tokens as f64,
+        );
+    }
+
     #[test]
     #[ignore = "requires the canonical .tqf checkpoint; Phase 20 decode-loop GPU/CPU A/B"]
     fn decode_loop_ab_gpu_vs_cpu_experts() {
