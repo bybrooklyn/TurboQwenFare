@@ -238,6 +238,17 @@ impl Qwen36ReferenceRuntime {
         self.expert_cache.as_ref().map(WholeExpertLfuCache::stats)
     }
 
+    /// Phase 20 A/B seam: toggles the GPU-resident expert path on the
+    /// streaming whole-expert cache (a no-op on the resident runtime, which
+    /// has no expert cache). Call before decode; already-resident values
+    /// stay correct either way — this only steers future admissions, the
+    /// same contract as `WholeExpertLfuCache::set_gpu_enabled`.
+    pub fn set_expert_gpu_enabled(&mut self, enabled: bool) {
+        if let Some(cache) = self.expert_cache.as_mut() {
+            cache.set_gpu_enabled(enabled);
+        }
+    }
+
     /// Runs one actual checkpoint token through embedding, all forty
     /// attention/GDN+MoE layers, final norm, Q6_K LM head, and greedy
     /// selection.  The returned diagnostics are the Phase-15 qualification
@@ -389,6 +400,14 @@ impl Qwen36BoundedReferenceRuntime {
 
     pub fn expert_cache_stats(&self) -> crate::experts::ExpertCacheStats {
         self.expert_cache.stats()
+    }
+
+    /// Phase 20 A/B seam: toggles the GPU-resident expert path on the
+    /// whole-expert cache. Call before decode; already-resident values stay
+    /// correct either way — this only steers future admissions, the same
+    /// contract as `WholeExpertLfuCache::set_gpu_enabled`.
+    pub fn set_expert_gpu_enabled(&mut self, enabled: bool) {
+        self.expert_cache.set_gpu_enabled(enabled);
     }
 
     pub fn decode_greedy(&mut self, input_token: u32) -> Result<DecodeToken> {
@@ -965,5 +984,92 @@ mod canonical_checkpoint_tests {
         if let Ok(expected) = std::env::var("TQF_EXPECTED_GREEDY_TOKEN") {
             assert_eq!(decoded.token, expected.parse::<u32>().unwrap());
         }
+    }
+
+    /// Phase 20 decode-loop A/B: the same greedy continuation run twice —
+    /// once with the streaming expert cache's GPU-resident path enabled
+    /// (`TQF_EXPERT_GPU_RESIDENT` semantics, in-process via
+    /// `set_expert_gpu_enabled`), once with the CPU baseline — comparing
+    /// per-token wall time and the emitted greedy token sequence. Spec §1005:
+    /// the isolated microbenchmark's 2.07x staged16 win must survive a real
+    /// decode loop before any default flip is considered. Token parity is
+    /// asserted exactly: the staged16 kernel's real-weight parity is
+    /// effectively exact, so a divergence would be a genuine A/B finding,
+    /// not an expected rounding artifact.
+    ///
+    /// Start token 32 ("A", per `docs/research/oracles/raw-a-16.json`
+    /// prompt_tokens) so no tokenizer is needed. `TQF_DECODE_AB_TOKENS`
+    /// overrides the token count (default 16).
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint; Phase 20 decode-loop GPU/CPU A/B"]
+    fn decode_loop_ab_gpu_vs_cpu_experts() {
+        let tqf_path = std::env::var("TQF_CANONICAL_TQF")
+            .expect("set TQF_CANONICAL_TQF to the converted canonical container");
+        let tokens: usize = std::env::var("TQF_DECODE_AB_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+
+        let open = |gpu: bool| {
+            let broker = MemoryBroker::new(Bytes(4 * 1024 * 1024 * 1024));
+            let mut runtime = Qwen36BoundedReferenceRuntime::open(
+                Path::new(&tqf_path),
+                broker,
+                64,
+                Bytes(1024 * 1024 * 1024),
+            )
+            .unwrap();
+            runtime.set_expert_gpu_enabled(gpu);
+            (runtime, gpu)
+        };
+
+        let (mut gpu_runtime, _) = open(true);
+        let (mut cpu_runtime, _) = open(false);
+        let mut current = 32u32;
+        let mut gpu_tokens = Vec::with_capacity(tokens);
+        let mut cpu_tokens = Vec::with_capacity(tokens);
+        let mut gpu_ms = Vec::with_capacity(tokens);
+        let mut cpu_ms = Vec::with_capacity(tokens);
+        for step in 0..tokens {
+            let start = Instant::now();
+            let decoded = gpu_runtime.decode_greedy(current).unwrap();
+            gpu_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            let gpu_token = decoded.token;
+
+            let start = Instant::now();
+            let decoded = cpu_runtime.decode_greedy(current).unwrap();
+            cpu_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            let cpu_token = decoded.token;
+
+            println!(
+                "phase20_decode_ab step={step} token={current} gpu_ms={:.1} cpu_ms={:.1} gpu_next={gpu_token} cpu_next={cpu_token}",
+                gpu_ms[step],
+                cpu_ms[step]
+            );
+            gpu_tokens.push(gpu_token);
+            cpu_tokens.push(cpu_token);
+            current = cpu_token;
+            assert_eq!(
+                gpu_token, cpu_token,
+                "GPU/CPU expert paths diverged at decode step {step}: gpu={gpu_token} cpu={cpu_token}"
+            );
+        }
+
+        let gpu_total: f64 = gpu_ms.iter().sum();
+        let cpu_total: f64 = cpu_ms.iter().sum();
+        let speedup = cpu_total / gpu_total.max(f64::MIN_POSITIVE);
+        println!(
+            "phase20_decode_ab summary tokens={tokens} gpu_total_ms={gpu_total:.1} cpu_total_ms={cpu_total:.1} speedup={speedup:.2}x"
+        );
+        println!(
+            "phase20_decode_ab gpu_cache={:?}",
+            gpu_runtime.expert_cache_stats()
+        );
+        println!(
+            "phase20_decode_ab cpu_cache={:?}",
+            cpu_runtime.expert_cache_stats()
+        );
+        println!("phase20_decode_ab gpu_tokens={gpu_tokens:?}");
+        println!("phase20_decode_ab cpu_tokens={cpu_tokens:?}");
     }
 }

@@ -30,11 +30,45 @@ impl PipelineCache {
         function_name: &str,
         specialization: &str,
     ) -> Result<&ComputePipelineState> {
+        self.get_or_compile_with_constants(device, library, function_name, specialization, &[])
+    }
+
+    /// Same as `get_or_compile`, but compiles the function with the given
+    /// MSL function-constant values (`[[function_constant(index)]]` →
+    /// u32 value). Phase 20's shape specialization uses this so a kernel
+    /// family can compile one pipeline per Qwen shape (e.g. blocks-per-row
+    /// 2 vs 8) and the Metal compiler unrolls on the constant. The
+    /// `specialization` string is the cache key and must encode the
+    /// constants uniquely.
+    pub fn get_or_compile_with_constants(
+        &mut self,
+        device: &metal_sys::Device,
+        library: &Library,
+        function_name: &str,
+        specialization: &str,
+        constants: &[(u32, u32)],
+    ) -> Result<&ComputePipelineState> {
         let key = (function_name.to_string(), specialization.to_string());
         if !self.entries.contains_key(&key) {
-            let function = library.get_function(function_name, None).map_err(|e| {
-                BackendError::Gpu(format!("function {function_name:?} not found: {e}"))
-            })?;
+            let function = if constants.is_empty() {
+                library.get_function(function_name, None).map_err(|e| {
+                    BackendError::Gpu(format!("function {function_name:?} not found: {e}"))
+                })?
+            } else {
+                let values = metal_sys::FunctionConstantValues::new();
+                for (index, value) in constants {
+                    values.set_constant_value_at_index(
+                        (value as *const u32).cast(),
+                        metal_sys::MTLDataType::UInt,
+                        *index as u64,
+                    );
+                }
+                library
+                    .get_function(function_name, Some(values))
+                    .map_err(|e| {
+                        BackendError::Gpu(format!("function {function_name:?} not found: {e}"))
+                    })?
+            };
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&function)
                 .map_err(|e| {

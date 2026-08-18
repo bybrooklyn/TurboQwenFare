@@ -26,7 +26,10 @@ use super::pipeline::PipelineCache;
 
 pub const Q4K_GEMV_FUNCTION: &str = "tqf_q4k_gemv";
 pub const Q4K_GEMV_STAGED16_FUNCTION: &str = "tqf_q4k_gemv_staged16";
+pub const Q4K_GEMV_STAGED16_SPEC_FUNCTION: &str = "tqf_q4k_gemv_staged16_spec";
 pub const Q4K_GEMM_FUNCTION: &str = "tqf_q4k_gemm";
+pub const Q8_GEMV_FUNCTION: &str = "tqf_q8_gemv";
+pub const Q8_GEMV_FUSED_GDN_FUNCTION: &str = "tqf_q8_gemv_fused_gdn";
 pub const RMSNORM_FUNCTION: &str = "tqf_rmsnorm";
 pub const RESIDUAL_ADD_FUNCTION: &str = "tqf_residual_add";
 pub const SILU_FUNCTION: &str = "tqf_silu";
@@ -113,6 +116,99 @@ kernel void tqf_q4k_gemv(
         }
     }
     out[row] = acc;
+}
+
+// Phase 20 function-constant shape specialization (spec §292, §51):
+// the staged16 kernel with `blocks_per_row` promoted to a compile-time
+// function constant, so the Metal compiler can unroll the block loop and
+// fold per-row strip offsets for a known Qwen shape (gate/up: 8 blocks,
+// down: 2 blocks). Same buffer signature as `tqf_q4k_gemv_staged16` — the
+// host binds the same five buffers; only the pipeline differs.
+constant uint spec_blocks_per_row [[function_constant(0)]];
+
+kernel void tqf_q4k_gemv_staged16_spec(
+    device const uchar* weights [[buffer(0)]],
+    device const float* vec [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup uchar w_stage[16 * 144];
+    threadgroup float v_stage[256];
+    threadgroup float sums[16 * 256];
+    uint blocks_per_row = spec_blocks_per_row;
+    uint row_base = gid * 16;
+    uint row_count = min(16u, rows - row_base);
+    if (row_base >= rows) return;
+
+    device const uchar* strip_base = weights + (ulong)row_base * (ulong)blocks_per_row * 144;
+    float acc[16];
+    for (uint r = 0; r < 16; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        for (uint i = tid; i < 16 * 144; i += 256) {
+            uint r = i / 144;
+            if (r < row_count) {
+                w_stage[i] = strip_base[(ulong)r * (ulong)blocks_per_row * 144 + (ulong)b * 144 + (i % 144)];
+            }
+        }
+        if (tid < 256) {
+            v_stage[tid] = vec[(ulong)b * 256 + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < 256) {
+            uint p = tid / 32;
+            // Pairs (2g, 2g+1) share qs bytes [32g, 32g+32): the even pair
+            // owns the low nibble, the odd pair the high nibble.
+            uint nib_byte = (p / 2) * 32 + (tid % 32);
+            uint nib_shift = 4 * (p % 2);
+            float v = v_stage[tid];
+            for (uint r = 0; r < row_count; ++r) {
+                threadgroup const uchar* w = w_stage + r * 144;
+                half d_h = as_type<half>(ushort(ushort(w[0]) | (ushort(w[1]) << 8)));
+                half dmin_h = as_type<half>(ushort(ushort(w[2]) | (ushort(w[3]) << 8)));
+                // scale/min pair for sub-block p from the 12 staged bytes
+                // (identical branch structure to get_scale_min_k4).
+                uchar sc, mm;
+                if (p < 4) {
+                    sc = w[4 + p] & 63;
+                    mm = w[4 + p + 4] & 63;
+                } else {
+                    sc = (w[4 + p + 4] & 0x0F) | ((w[4 + p - 4] >> 6) << 4);
+                    mm = (w[4 + p + 4] >> 4) | ((w[4 + p] >> 6) << 4);
+                }
+                uint nib = (w[16 + nib_byte] >> nib_shift) & 0xF;
+                float value = float(d_h) * float(sc) * float(nib) - float(dmin_h) * float(mm);
+                acc[r] += v * value;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Cross-thread reduction: each thread owns element `tid`'s partial
+    // contribution to every row's dot product; sum the 256 per-row partials
+    // in threadgroup memory (tree reduce).
+    for (uint r = 0; r < row_count; ++r) {
+        sums[r * 256 + tid] = acc[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        for (uint r = 0; r < row_count; ++r) {
+            if (tid < stride) {
+                sums[r * 256 + tid] += sums[r * 256 + tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        for (uint r = 0; r < row_count; ++r) {
+            out[row_base + r] = sums[r * 256];
+        }
+    }
 }
 
 // Phase 20 NVMAI-derived MoE phase-1 staged variant (spec §292): 16 rows
@@ -298,6 +394,94 @@ kernel void tqf_sigmoid(
     float v = x[id];
     out[id] = 1.0f / (1.0f + exp(-v));
 }
+
+// Q8_0 GEMV (GDN/attention dense projections): one thread per output row,
+// accumulating in exactly the CPU reference's order (`d * q * v` per
+// element, blocks in row order) so this kernel is the oracle-matched
+// baseline the fused GDN kernel must agree with.
+kernel void tqf_q8_gemv(
+    device const uchar* weights [[buffer(0)]],
+    device const float* vec [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    uint row [[thread_position_in_grid]])
+{
+    if (row >= rows) return;
+    uint blocks_per_row = cols / 32;
+    device const uchar* row_base = weights + (ulong)row * (ulong)blocks_per_row * 34;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        device const uchar* block = row_base + (ulong)b * 34;
+        half d = as_type<half>(ushort(ushort(block[0]) | (ushort(block[1]) << 8)));
+        float df = float(d);
+        device const float* vblock = vec + (ulong)b * 32;
+        for (uint j = 0; j < 32; ++j) {
+            acc += df * float(char(block[2 + j])) * vblock[j];
+        }
+    }
+    out[row] = acc;
+}
+
+// Phase 20 GDN four-way projection fusion (spec §292): one launch computes
+// all four dense projections (qkv, z, a, b) from one pass over the shared
+// hidden-state input, which each threadgroup stages once instead of every
+// output row re-reading it. Per-row dot order matches `tqf_q8_gemv`
+// exactly (blocks in order, `d * q * v` per element), so each fused row
+// agrees with the four-launch baseline. Rows are laid out
+// [qkv | z | a | b] in `out`; `cols` must be 2048 (the GDN hidden size).
+kernel void tqf_q8_gemv_fused_gdn(
+    device const uchar* qkv_weights [[buffer(0)]],
+    device const uchar* z_weights [[buffer(1)]],
+    device const uchar* a_weights [[buffer(2)]],
+    device const uchar* b_weights [[buffer(3)]],
+    device const float* hidden [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint& cols [[buffer(6)]],
+    constant uint& qkv_rows [[buffer(7)]],
+    constant uint& z_rows [[buffer(8)]],
+    constant uint& a_rows [[buffer(9)]],
+    constant uint& b_rows [[buffer(10)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float staged[2048];
+    uint blocks_per_row = cols / 32;
+    for (uint i = tid; i < cols; i += 256) {
+        staged[i] = hidden[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = gid * 256 + tid;
+    uint total = qkv_rows + z_rows + a_rows + b_rows;
+    if (row >= total) return;
+    device const uchar* weights = qkv_weights;
+    uint local_row = row;
+    if (row >= qkv_rows) {
+        if (row < qkv_rows + z_rows) {
+            local_row = row - qkv_rows;
+            weights = z_weights;
+        } else if (row < qkv_rows + z_rows + a_rows) {
+            local_row = row - qkv_rows - z_rows;
+            weights = a_weights;
+        } else {
+            local_row = row - qkv_rows - z_rows - a_rows;
+            weights = b_weights;
+        }
+    }
+    device const uchar* row_base = weights + (ulong)local_row * (ulong)blocks_per_row * 34;
+    float acc = 0.0f;
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        device const uchar* block = row_base + (ulong)b * 34;
+        half d = as_type<half>(ushort(ushort(block[0]) | (ushort(block[1]) << 8)));
+        float df = float(d);
+        threadgroup const float* vblock = staged + b * 32;
+        for (uint j = 0; j < 32; ++j) {
+            acc += df * float(char(block[2 + j])) * vblock[j];
+        }
+    }
+    out[row] = acc;
+}
 "#;
 
 pub fn load_reference_kernel_library(ctx: &MetalContext) -> Result<Library> {
@@ -367,7 +551,7 @@ pub fn q4k_gemv(
         rows,
         cols,
         Q4K_GEMV_FUNCTION,
-        false,
+        GemvDispatch::Reference,
     )
 }
 
@@ -403,7 +587,7 @@ pub fn q4k_gemv_persistent_weights(
         rows,
         cols,
         Q4K_GEMV_FUNCTION,
-        false,
+        GemvDispatch::Reference,
     )
 }
 
@@ -439,8 +623,53 @@ pub fn q4k_gemv_persistent_weights_staged16(
         rows,
         cols,
         Q4K_GEMV_STAGED16_FUNCTION,
-        true,
+        GemvDispatch::Staged16,
     )
+}
+
+/// Phase 20 function-constant specialization of the staged16 kernel: the
+/// same computation with `blocks_per_row` fixed at pipeline compile time so
+/// the Metal compiler unrolls the block loop for a known Qwen shape. Same
+/// contract/buffers as `q4k_gemv_persistent_weights_staged16`; the caller
+/// must only use it with shapes it has compiled a specialization for (this
+/// wrapper specializes per `cols` on demand).
+pub fn q4k_gemv_persistent_weights_staged16_spec(
+    ctx: &MetalContext,
+    library: &Library,
+    pipelines: &mut PipelineCache,
+    weights_buf: &BufferLease,
+    vector: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>> {
+    let block_bytes = GgmlType::Q4K.block_bytes() as usize;
+    let expected = (rows * blocks_per_row(cols) * block_bytes) as u64;
+    assert_eq!(
+        weights_buf.length(),
+        expected,
+        "persistent weights buffer is {} bytes, expected {expected} for a {rows}x{cols} Q4_K matrix",
+        weights_buf.length()
+    );
+    dispatch_q4k_gemv_buffer(
+        ctx,
+        library,
+        pipelines,
+        weights_buf,
+        vector,
+        rows,
+        cols,
+        Q4K_GEMV_STAGED16_SPEC_FUNCTION,
+        GemvDispatch::Staged16Spec {
+            blocks_per_row: blocks_per_row(cols) as u32,
+        },
+    )
+}
+
+/// Which of the Phase 20 Q4_K GEMV kernel variants a dispatch runs.
+enum GemvDispatch {
+    Reference,
+    Staged16,
+    Staged16Spec { blocks_per_row: u32 },
 }
 
 fn dispatch_q4k_gemv_buffer(
@@ -452,7 +681,7 @@ fn dispatch_q4k_gemv_buffer(
     rows: usize,
     cols: usize,
     function_name: &str,
-    staged: bool,
+    dispatch: GemvDispatch,
 ) -> Result<Vec<f32>> {
     assert_eq!(
         vector.len(),
@@ -466,7 +695,32 @@ fn dispatch_q4k_gemv_buffer(
     let cols_buf = ctx.allocate_buffer_with_data(&(cols as u32).to_le_bytes(), "q4k-gemv-cols");
     let rows_buf = ctx.allocate_buffer_with_data(&(rows as u32).to_le_bytes(), "q4k-gemv-rows");
 
-    let pipeline = pipelines.get_or_compile(ctx.device(), library, function_name, "")?;
+    let (pipeline, threads_per_group, groups) = match dispatch {
+        GemvDispatch::Reference => (
+            pipelines.get_or_compile(ctx.device(), library, function_name, "")?,
+            MTLSize::new(64, 1, 1),
+            MTLSize::new((rows as u64).max(1).div_ceil(64), 1, 1),
+        ),
+        GemvDispatch::Staged16 => (
+            pipelines.get_or_compile(ctx.device(), library, function_name, "")?,
+            MTLSize::new(256, 1, 1),
+            MTLSize::new((rows as u64).max(1).div_ceil(16), 1, 1),
+        ),
+        GemvDispatch::Staged16Spec { blocks_per_row } => {
+            let key = format!("bpr-{blocks_per_row}");
+            (
+                pipelines.get_or_compile_with_constants(
+                    ctx.device(),
+                    library,
+                    function_name,
+                    &key,
+                    &[(0, blocks_per_row)],
+                )?,
+                MTLSize::new(256, 1, 1),
+                MTLSize::new((rows as u64).max(1).div_ceil(16), 1, 1),
+            )
+        }
+    };
     let command_buffer = ctx.queue().new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(pipeline);
@@ -475,17 +729,6 @@ fn dispatch_q4k_gemv_buffer(
     encoder.set_buffer(2, Some(out_buf.metal_buffer()), 0);
     encoder.set_buffer(3, Some(cols_buf.metal_buffer()), 0);
     encoder.set_buffer(4, Some(rows_buf.metal_buffer()), 0);
-    let (threads_per_group, groups) = if staged {
-        // One 256-thread threadgroup covers 16 rows; a partial last group is
-        // guarded inside the kernel.
-        let threads_per_group = MTLSize::new(256, 1, 1);
-        let groups = MTLSize::new((rows as u64).max(1).div_ceil(16), 1, 1);
-        (threads_per_group, groups)
-    } else {
-        let threads_per_group = MTLSize::new(64, 1, 1);
-        let groups = MTLSize::new((rows as u64).max(1).div_ceil(64), 1, 1);
-        (threads_per_group, groups)
-    };
     encoder.dispatch_thread_groups(groups, threads_per_group);
     encoder.end_encoding();
     command_buffer.commit();
@@ -691,6 +934,141 @@ pub fn sigmoid(
 /// vocab/hidden shape asserted rather than a distinct kernel family. Later
 /// phases may fuse a max/top-k sampling path onto this (spec §51's LM-head
 /// specialization row) without changing this function's contract.
+/// Q8_0 dense GEMV (GDN/attention projection primitive): `weights` is
+/// `rows` rows of `cols/32` contiguous 34-byte Q8_0 blocks, row-major.
+/// Oracle-matched accumulation order (see the kernel comment).
+pub fn q8_gemv(
+    ctx: &MetalContext,
+    library: &Library,
+    pipelines: &mut PipelineCache,
+    weights: &[u8],
+    vector: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>> {
+    let block_bytes = GgmlType::Q8_0.block_bytes() as usize;
+    assert_eq!(
+        weights.len(),
+        rows * (cols / 32) * block_bytes,
+        "q8 weights length mismatch for {rows}x{cols}"
+    );
+    assert_eq!(vector.len(), cols, "q8 vector length mismatch");
+
+    let weights_buf = ctx.allocate_buffer_with_data(weights, "q8-gemv-weights");
+    let vector_buf = ctx.allocate_buffer_with_data(f32_slice_to_bytes(vector), "q8-gemv-vector");
+    let out_buf = ctx.allocate_buffer((rows * 4).max(4) as u64, "q8-gemv-out");
+    let cols_buf = ctx.allocate_buffer_with_data(&(cols as u32).to_le_bytes(), "q8-gemv-cols");
+    let rows_buf = ctx.allocate_buffer_with_data(&(rows as u32).to_le_bytes(), "q8-gemv-rows");
+
+    let pipeline = pipelines.get_or_compile(ctx.device(), library, Q8_GEMV_FUNCTION, "")?;
+    let command_buffer = ctx.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(weights_buf.metal_buffer()), 0);
+    encoder.set_buffer(1, Some(vector_buf.metal_buffer()), 0);
+    encoder.set_buffer(2, Some(out_buf.metal_buffer()), 0);
+    encoder.set_buffer(3, Some(cols_buf.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(rows_buf.metal_buffer()), 0);
+    let threads_per_group = MTLSize::new(64, 1, 1);
+    let groups = MTLSize::new((rows as u64).max(1).div_ceil(64), 1, 1);
+    encoder.dispatch_thread_groups(groups, threads_per_group);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    Ok(bytes_to_f32_vec(out_buf.as_slice()))
+}
+
+/// Phase 20 GDN four-way projection fusion (spec §292): computes
+/// `qkv | z | a | b` projections of one 2048-wide hidden state in a single
+/// launch whose threadgroups stage the input once. Returns
+/// `(qkv, z, a, b)`; each row's dot order matches `q8_gemv`, so the two
+/// paths must agree to floating-point contraction tolerance.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_fused_projection(
+    ctx: &MetalContext,
+    library: &Library,
+    pipelines: &mut PipelineCache,
+    qkv_weights: &[u8],
+    z_weights: &[u8],
+    a_weights: &[u8],
+    b_weights: &[u8],
+    hidden: &[f32],
+    qkv_rows: usize,
+    z_rows: usize,
+    a_rows: usize,
+    b_rows: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    const GDN_HIDDEN: usize = 2048;
+    assert_eq!(
+        hidden.len(),
+        GDN_HIDDEN,
+        "fused GDN projection requires the canonical 2048-wide hidden state"
+    );
+    let block_bytes = GgmlType::Q8_0.block_bytes() as usize;
+    let blocks = GDN_HIDDEN / 32;
+    for (weights, rows, name) in [
+        (qkv_weights, qkv_rows, "qkv"),
+        (z_weights, z_rows, "z"),
+        (a_weights, a_rows, "a"),
+        (b_weights, b_rows, "b"),
+    ] {
+        assert_eq!(
+            weights.len(),
+            rows * blocks * block_bytes,
+            "gdn {name} weights length mismatch for {rows}x{GDN_HIDDEN}"
+        );
+    }
+
+    let qkv_buf = ctx.allocate_buffer_with_data(qkv_weights, "gdn-qkv");
+    let z_buf = ctx.allocate_buffer_with_data(z_weights, "gdn-z");
+    let a_buf = ctx.allocate_buffer_with_data(a_weights, "gdn-a");
+    let b_buf = ctx.allocate_buffer_with_data(b_weights, "gdn-b");
+    let hidden_buf = ctx.allocate_buffer_with_data(f32_slice_to_bytes(hidden), "gdn-hidden");
+    let total_rows = qkv_rows + z_rows + a_rows + b_rows;
+    let out_buf = ctx.allocate_buffer((total_rows * 4).max(4) as u64, "gdn-out");
+    let cols_buf = ctx.allocate_buffer_with_data(&(GDN_HIDDEN as u32).to_le_bytes(), "gdn-cols");
+    let qkv_rows_buf =
+        ctx.allocate_buffer_with_data(&(qkv_rows as u32).to_le_bytes(), "gdn-qkv-rows");
+    let z_rows_buf = ctx.allocate_buffer_with_data(&(z_rows as u32).to_le_bytes(), "gdn-z-rows");
+    let a_rows_buf = ctx.allocate_buffer_with_data(&(a_rows as u32).to_le_bytes(), "gdn-a-rows");
+    let b_rows_buf = ctx.allocate_buffer_with_data(&(b_rows as u32).to_le_bytes(), "gdn-b-rows");
+
+    let pipeline =
+        pipelines.get_or_compile(ctx.device(), library, Q8_GEMV_FUSED_GDN_FUNCTION, "")?;
+    let command_buffer = ctx.queue().new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(qkv_buf.metal_buffer()), 0);
+    encoder.set_buffer(1, Some(z_buf.metal_buffer()), 0);
+    encoder.set_buffer(2, Some(a_buf.metal_buffer()), 0);
+    encoder.set_buffer(3, Some(b_buf.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(hidden_buf.metal_buffer()), 0);
+    encoder.set_buffer(5, Some(out_buf.metal_buffer()), 0);
+    encoder.set_buffer(6, Some(cols_buf.metal_buffer()), 0);
+    encoder.set_buffer(7, Some(qkv_rows_buf.metal_buffer()), 0);
+    encoder.set_buffer(8, Some(z_rows_buf.metal_buffer()), 0);
+    encoder.set_buffer(9, Some(a_rows_buf.metal_buffer()), 0);
+    encoder.set_buffer(10, Some(b_rows_buf.metal_buffer()), 0);
+    let threads_per_group = MTLSize::new(256, 1, 1);
+    let groups = MTLSize::new((total_rows as u64).max(1).div_ceil(256), 1, 1);
+    encoder.dispatch_thread_groups(groups, threads_per_group);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    let values = bytes_to_f32_vec(out_buf.as_slice());
+    let z_start = qkv_rows;
+    let a_start = z_start + z_rows;
+    let b_start = a_start + a_rows;
+    Ok((
+        values[..z_start].to_vec(),
+        values[z_start..a_start].to_vec(),
+        values[a_start..b_start].to_vec(),
+        values[b_start..].to_vec(),
+    ))
+}
+
 pub fn lm_head_logits(
     ctx: &MetalContext,
     library: &Library,
@@ -842,6 +1220,16 @@ mod tests {
                 cols,
             )
             .unwrap();
+            let specialized = q4k_gemv_persistent_weights_staged16_spec(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &weights_buf,
+                &vector,
+                rows,
+                cols,
+            )
+            .unwrap();
             let reference = q4k_gemv_persistent_weights(
                 &ctx,
                 &library,
@@ -855,6 +1243,7 @@ mod tests {
             let cpu = reference::q4k_gemv(&weights, &vector, rows, cols);
 
             assert_eq!(staged.len(), cpu.len());
+            assert_eq!(specialized.len(), cpu.len());
             for (s, c) in staged.iter().zip(&cpu) {
                 // The staged kernel reduces partials in a tree over threads
                 // rather than sequentially, so this is a relative-tolerance
@@ -865,10 +1254,22 @@ mod tests {
                     "staged16={s} cpu={c} at {rows}x{cols}"
                 );
             }
+            for (s, c) in specialized.iter().zip(&cpu) {
+                assert!(
+                    (s - c).abs() < (1e-4 * c.abs()).max(1e-2),
+                    "staged16-spec={s} cpu={c} at {rows}x{cols}"
+                );
+            }
             for (s, r) in staged.iter().zip(&reference) {
                 assert!(
                     (s - r).abs() < (1e-4 * r.abs()).max(1e-2),
                     "staged16={s} reference-kernel={r} at {rows}x{cols}"
+                );
+            }
+            for (s, r) in specialized.iter().zip(&staged) {
+                assert!(
+                    (s - r).abs() < (1e-4 * r.abs()).max(1e-2),
+                    "staged16-spec={s} staged16={r} at {rows}x{cols}"
                 );
             }
         }
@@ -1007,6 +1408,119 @@ mod tests {
         assert_eq!(logits.len(), vocab);
         for (g, c) in logits.iter().zip(&cpu) {
             assert!((g - c).abs() < 1e-2, "gpu={g} cpu={c}");
+        }
+    }
+
+    /// Synthetic Q8_0 weights: real block codec bytes (f16 scale + 32 int8
+    /// quants per 34-byte block), LCG-filled.
+    fn synthetic_q8_weights(rows: usize, cols: usize, seed: u32) -> Vec<u8> {
+        let block_bytes = GgmlType::Q8_0.block_bytes() as usize;
+        let n_blocks = rows * (cols / 32);
+        let mut out = vec![0u8; n_blocks * block_bytes];
+        let mut counter = seed;
+        for block in out.chunks_exact_mut(block_bytes) {
+            block[0..2].copy_from_slice(&0x3800u16.to_le_bytes()); // scale 0.5
+            for b in block[2..].iter_mut() {
+                counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *b = ((counter >> 16) & 0xFF) as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn q8_gemv_matches_cpu_reference() {
+        let Some(ctx) = ctx_or_skip() else { return };
+        let library = load_reference_kernel_library(&ctx).unwrap();
+        let mut pipelines = PipelineCache::new();
+
+        for (rows, cols) in [(1, 32), (17, 64), (8192, 2048)] {
+            let weights = synthetic_q8_weights(rows, cols, 31);
+            let vector: Vec<f32> = (0..cols).map(|i| ((i % 11) as f32) * 0.3 - 1.5).collect();
+            let gpu = q8_gemv(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &weights,
+                &vector,
+                rows,
+                cols,
+            )
+            .unwrap();
+            let cpu = reference::q8_gemv(&weights, &vector, rows, cols);
+            assert_eq!(gpu.len(), cpu.len());
+            for (g, c) in gpu.iter().zip(&cpu) {
+                // The Metal compiler may contract `a*b+c` into FMA while the
+                // scalar CPU reference does not; on near-cancellation dots
+                // (|result| << sum|terms|) that shows up above the bare
+                // 1e-4 relative line, so bound with an absolute floor —
+                // the same convention as the staged16 Q4_K parity test.
+                assert!(
+                    (g - c).abs() < (1e-4 * c.abs()).max(1e-2),
+                    "q8 gpu={g} cpu={c} at {rows}x{cols}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fused_gdn_projection_matches_four_separate_q8_gemvs() {
+        let Some(ctx) = ctx_or_skip() else { return };
+        let library = load_reference_kernel_library(&ctx).unwrap();
+        let mut pipelines = PipelineCache::new();
+
+        // Real GDN geometry: qkv 8192 rows, z 4096, a 32, b 32, hidden 2048.
+        let (qkv_rows, z_rows, a_rows, b_rows) = (8192usize, 4096, 32, 32);
+        let cols = 2048usize;
+        let qkv = synthetic_q8_weights(qkv_rows, cols, 41);
+        let z = synthetic_q8_weights(z_rows, cols, 43);
+        let a = synthetic_q8_weights(a_rows, cols, 47);
+        let b = synthetic_q8_weights(b_rows, cols, 53);
+        let hidden: Vec<f32> = (0..cols).map(|i| ((i % 11) as f32) * 0.3 - 1.5).collect();
+
+        let (g_qkv, g_z, g_a, g_b) = gdn_fused_projection(
+            &ctx,
+            &library,
+            &mut pipelines,
+            &qkv,
+            &z,
+            &a,
+            &b,
+            &hidden,
+            qkv_rows,
+            z_rows,
+            a_rows,
+            b_rows,
+        )
+        .unwrap();
+        let s_qkv = q8_gemv(
+            &ctx,
+            &library,
+            &mut pipelines,
+            &qkv,
+            &hidden,
+            qkv_rows,
+            cols,
+        )
+        .unwrap();
+        let s_z = q8_gemv(&ctx, &library, &mut pipelines, &z, &hidden, z_rows, cols).unwrap();
+        let s_a = q8_gemv(&ctx, &library, &mut pipelines, &a, &hidden, a_rows, cols).unwrap();
+        let s_b = q8_gemv(&ctx, &library, &mut pipelines, &b, &hidden, b_rows, cols).unwrap();
+
+        for (fused, separate, name) in [
+            (&g_qkv, &s_qkv, "qkv"),
+            (&g_z, &s_z, "z"),
+            (&g_a, &s_a, "a"),
+            (&g_b, &s_b, "b"),
+        ] {
+            assert_eq!(fused.len(), separate.len());
+            for (f, s) in fused.iter().zip(separate) {
+                let relative = (f - s).abs() / s.abs().max(1.0);
+                assert!(
+                    relative < 1e-4,
+                    "gdn {name}: fused={f} separate={s} relative={relative}"
+                );
+            }
         }
     }
 }

@@ -37,29 +37,33 @@ use super::buffer::BufferLease;
 use super::context::MetalContext;
 use super::kernels::{
     load_reference_kernel_library, q4k_gemv_persistent_weights,
-    q4k_gemv_persistent_weights_staged16, silu,
+    q4k_gemv_persistent_weights_staged16, q4k_gemv_persistent_weights_staged16_spec, silu,
 };
 use super::pipeline::PipelineCache;
 
 /// Which Phase 20 GEMV kernel the GPU-resident expert path dispatches.
 /// Selected once per process from `TQF_EXPERT_GPU_KERNEL` (values:
-/// `reference` or `staged16`). `staged16` is the default: the real-weight
-/// canonical-checkpoint A/B measured a 2.07x per-forward wall-time win
-/// (1.94 ms vs 4.01 ms, gate/up/down chain including readbacks) with
-/// effectively exact parity against the CPU oracle, so the benchmark
-/// selected it — the env switch keeps the reference kernel reachable for
-/// regression A/B (spec §1005: microbenchmarks first, decode A/B before
-/// flipping a default; the decode-loop A/B remains outstanding).
+/// `reference`, `staged16`, or `staged16-spec`). `staged16` is the default:
+/// the real-weight canonical-checkpoint A/B measured a 2.07x per-forward
+/// wall-time win (1.94 ms vs 4.01 ms, gate/up/down chain including
+/// readbacks) with effectively exact parity against the CPU oracle, so the
+/// benchmark selected it. `staged16-spec` is the Phase 20 function-constant
+/// shape specialization (blocks-per-row fixed at pipeline compile time) and
+/// is itself subject to the same measured A/B discipline before it could
+/// become the default; the env switch keeps every variant reachable (spec
+/// §1005: microbenchmarks first, decode A/B before flipping a default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuKernelKind {
     Reference,
     Staged16,
+    Staged16Spec,
 }
 
 impl GpuKernelKind {
     pub fn from_env() -> Self {
         match std::env::var("TQF_EXPERT_GPU_KERNEL").as_deref() {
             Ok("reference") => Self::Reference,
+            Ok("staged16-spec") => Self::Staged16Spec,
             _ => Self::Staged16,
         }
     }
@@ -178,6 +182,15 @@ impl GpuResidentExpert {
     ) -> Result<Vec<f32>> {
         match state.kernel_kind {
             GpuKernelKind::Staged16 => q4k_gemv_persistent_weights_staged16(
+                &state.ctx,
+                &state.library,
+                &mut state.pipelines,
+                weights_buf,
+                vector,
+                rows,
+                cols,
+            ),
+            GpuKernelKind::Staged16Spec => q4k_gemv_persistent_weights_staged16_spec(
                 &state.ctx,
                 &state.library,
                 &mut state.pipelines,
@@ -396,7 +409,11 @@ mod tests {
         .unwrap();
 
         let mut results = Vec::new();
-        for kind in [GpuKernelKind::Reference, GpuKernelKind::Staged16] {
+        for kind in [
+            GpuKernelKind::Reference,
+            GpuKernelKind::Staged16,
+            GpuKernelKind::Staged16Spec,
+        ] {
             state.kernel_kind = kind;
             results.push((kind, gpu_expert.forward(&mut state, &input).unwrap()));
         }
@@ -427,11 +444,19 @@ mod tests {
         }
         let (_, reference) = &results[0];
         let (_, staged) = &results[1];
+        let (_, specialized) = &results[2];
         for (r, s) in reference.iter().zip(staged) {
             let relative = (r - s).abs() / r.abs().max(1.0);
             assert!(
                 relative < 5e-2,
                 "kernel kinds disagree at real expert shapes: reference={r} staged16={s} relative={relative}"
+            );
+        }
+        for (s, p) in staged.iter().zip(specialized) {
+            let relative = (s - p).abs() / s.abs().max(1.0);
+            assert!(
+                relative < 5e-2,
+                "kernel kinds disagree at real expert shapes: staged16={s} staged16-spec={p} relative={relative}"
             );
         }
     }

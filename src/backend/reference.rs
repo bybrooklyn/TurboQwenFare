@@ -14,6 +14,35 @@
 use crate::format::quant::dequant::dequantize_q4_k;
 use crate::format::quant::GgmlType;
 
+/// `weights` is `rows` rows of `cols / 32` contiguous Q8_0 blocks
+/// (34 bytes: f16 scale + 32 int8 quantized values), row-major. Accumulates
+/// per element in row order exactly like the loaded-tensor CPU path
+/// (`decode_values` then a row dot), so the GPU Q8 kernels' oracle matches
+/// the live GDN/attention projection math, not just the quant format.
+pub fn q8_gemv(weights: &[u8], vector: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let block_bytes = GgmlType::Q8_0.block_bytes() as usize;
+    let blocks_per_row = cols / 32;
+    (0..rows)
+        .map(|row| {
+            let row_base = row * blocks_per_row * block_bytes;
+            let mut acc = 0.0f32;
+            for b in 0..blocks_per_row {
+                let block = &weights[row_base + b * block_bytes..row_base + (b + 1) * block_bytes];
+                let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let vblock = &vector[b * 32..(b + 1) * 32];
+                for j in 0..32 {
+                    acc += d * (block[2 + j] as i8) as f32 * vblock[j];
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    crate::format::quant::dequant::f16_to_f32(bits)
+}
+
 /// `weights` is `rows` rows of `cols / 256` contiguous Q4_K blocks,
 /// row-major. Panics (via slice indexing) on malformed input — callers own
 /// shape validation, same contract as the GPU kernels' host wrappers.

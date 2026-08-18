@@ -31,21 +31,27 @@ real foundational work but is not wired into the live decode loop yet:
   `WholeExpertLfuCache::prepare_exact_route` (`src/experts/mod.rs`); the Phase 18 serial path stays
   selectable via `TQF_EXPERT_IO_FANOUT` for A/B. Measured on the real checkpoint: 29.5x wall-time
   reduction for one exact route's independent misses (107ms serial vs 3ms parallel).
-- **Phase 20 (Metal perf ports):** broker-registered Metal buffer allocation
-  (`MetalContext::allocate_broker_buffer*`, closing a previously-documented gap) and
-  `backend::metal::expert::GpuResidentExpert` (uploads one expert's Q4_K weights to persistent GPU
-  buffers once, reused across forward calls instead of re-uploading per matvec), now wired into the
-  live decode loop: `WholeExpertLfuCache` entries are `ExpertValue::{Cpu,Gpu}`
-  (`TQF_EXPERT_GPU_RESIDENT`, sole-backing-store accounting) and the streaming site calls
-  `forward_expert`. The NVMAI-style 16-row threadgroup-staged fused GEMV
-  (`tqf_q4k_gemv_staged16`, `TQF_EXPERT_GPU_KERNEL`) exists with one-hot per-element parity
-  against the CPU dequant oracle plus single-GEMV and chained-forward parity tests; on the real
-  canonical checkpoint it measured **2.07x per-expert-forward wall time vs the reference kernel
-  (1.94 ms vs 4.01 ms) with effectively exact parity**, and is benchmark-selected as the GPU
-  path's default kernel. Full record: `docs/research/qualification/phase-20-gpu-resident-expert.md`.
-  Remaining Phase 20 ports: function-constant shape specialization, GDN four-way projection
-  fusion; a decode-loop A/B (not just the isolated microbenchmark) is still owed before any
-  default-path flip, and the GPU path itself stays opt-in.
+- **Phase 20 (Metal perf ports):** all four ports delivered with measured A/B records:
+  broker-registered Metal buffer allocation (`MetalContext::allocate_broker_buffer*`, closing a
+  previously-documented gap); `backend::metal::expert::GpuResidentExpert` (uploads one expert's
+  Q4_K weights to persistent GPU buffers once, reused across forward calls instead of
+  re-uploading per matvec) wired into the live decode loop — `WholeExpertLfuCache` entries are
+  `ExpertValue::{Cpu,Gpu}` (`TQF_EXPERT_GPU_RESIDENT`, sole-backing-store accounting) and the
+  streaming site calls `forward_expert`; the NVMAI-style 16-row threadgroup-staged fused GEMV
+  (`tqf_q4k_gemv_staged16`, `TQF_EXPERT_GPU_KERNEL`, default `staged16`) with one-hot
+  per-element parity against the CPU dequant oracle plus single-GEMV and chained-forward parity
+  tests; function-constant shape specialization (`tqf_q4k_gemv_staged16_spec`,
+  `staged16-spec`, pipeline-cache `FunctionConstantValues` plumbing) — parity holds but the
+  real-weight A/B shows no consistent win, so it is not the default; and GDN four-way
+  projection fusion (`tqf_q8_gemv_fused_gdn` + `tqf_q8_gemv` baseline) with CPU-oracle parity
+  on real Q8_0 GDN weights and a measured **1.47x** over four separate launches (2.88 ms vs
+  4.22 ms) — delivered as a kernel + microbenchmark, not yet wired into the live loop.
+  **Decode-loop A/B done (8 greedy steps, canonical container): GPU vs CPU expert paths produce
+  identical tokens but 0.96x wall time — no end-to-end win, so the GPU path stays opt-in
+  (recorded negative result; decode is dominated by CPU reference projection stages and
+  expert-miss I/O).** Full record: `docs/research/qualification/phase-20-gpu-resident-expert.md`.
+  Remaining: wiring the fused GDN projection into the live decode loop (GPU-resident GDN
+  weights + accounting + a fresh decode A/B — Phase 25 assault work).
 - **Phase 21 (global expert cache):** `WholeExpertLfuCache`'s eviction policy is now pluggable
   (`CachePolicyKind::{Lru,Lfu,DecayedCostAware}`, `TQF_EXPERT_CACHE_POLICY`/`set_policy`). A real
   128-token/40-layer route trace from the live checkpoint was captured and replayed offline

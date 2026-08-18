@@ -1784,31 +1784,195 @@ mod tests {
             GpuResidentExpert::upload(&state.ctx, &broker, gate, up, down, expert_width, hidden)
                 .unwrap();
 
-        let iterations = 10;
-        for kind in [GpuKernelKind::Reference, GpuKernelKind::Staged16] {
-            state.kernel_kind = kind;
-            let start = std::time::Instant::now();
-            let mut output = Vec::new();
-            for _ in 0..iterations {
-                output = gpu_expert.forward(&mut state, &input).unwrap();
+        // Interleaved measurement: machine state (thermals, background load)
+        // drifts on the seconds scale, so each kind gets one timed forward
+        // per round instead of a contiguous block; min/mean per kind is the
+        // reported number.
+        let kinds = [
+            GpuKernelKind::Reference,
+            GpuKernelKind::Staged16,
+            GpuKernelKind::Staged16Spec,
+        ];
+        let rounds = 20;
+        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); kinds.len()];
+        let mut outputs: Vec<Vec<f32>> = vec![Vec::new(); kinds.len()];
+        for _ in 0..rounds {
+            for (slot, kind) in kinds.iter().enumerate() {
+                state.kernel_kind = *kind;
+                let start = std::time::Instant::now();
+                let output = gpu_expert.forward(&mut state, &input).unwrap();
+                samples[slot].push(start.elapsed().as_secs_f64() * 1e3);
+                outputs[slot] = output;
             }
-            let per_forward = start.elapsed() / iterations;
-            let max_relative = output
+        }
+        for (slot, kind) in kinds.iter().enumerate() {
+            let min = samples[slot].iter().cloned().fold(f64::INFINITY, f64::min);
+            let mean = samples[slot].iter().sum::<f64>() / samples[slot].len() as f64;
+            let max_relative = outputs[slot]
                 .iter()
                 .zip(&cpu)
                 .map(|(g, c)| (g - c).abs() / c.abs().max(1.0))
                 .fold(0f32, f32::max);
             println!(
-                "phase20_real_expert_ab {:?} per_forward_ms={:.3} max_relative={:.6}",
-                kind,
-                per_forward.as_secs_f64() * 1e3,
-                max_relative
+                "phase20_real_expert_ab {:?} per_forward_min_ms={min:.3} per_forward_mean_ms={mean:.3} max_relative={max_relative:.6}",
+                kind
             );
             assert!(
                 max_relative < 5e-2,
                 "{kind:?} kernel vs CPU oracle on real Q4_K weights: max relative {max_relative}"
             );
         }
+    }
+
+    /// Phase 20 GDN four-way projection fusion, real-checkpoint A/B: loads
+    /// one GDN layer's real Q8_0 projection payloads (qkv/z/a/b), checks
+    /// both the fused single-launch kernel and the four-separate-`q8_gemv`
+    /// baseline against the CPU oracle on the real bytes, and reports the
+    /// interleaved wall-time comparison (spec §1005: microbenchmark first,
+    /// live-loop wiring later).
+    #[test]
+    #[cfg(feature = "metal")]
+    #[ignore = "requires the canonical .tqf checkpoint; Phase 20 GDN fusion real-weight A/B"]
+    fn gdn_fused_projection_matches_cpu_on_canonical_weights() {
+        use crate::backend::metal::context::MetalContext;
+        use crate::backend::metal::kernels::{
+            gdn_fused_projection, load_reference_kernel_library, q8_gemv,
+        };
+        use crate::backend::metal::pipeline::PipelineCache;
+        use crate::backend::reference;
+
+        let tqf = std::env::var("TQF_CANONICAL_TQF").expect("set TQF_CANONICAL_TQF");
+        let broker = MemoryBroker::new(Bytes(4 * 1024 * 1024 * 1024));
+        let loader = Qwen36WeightLoader::open(Path::new(&tqf), broker.clone()).unwrap();
+        let layer = (0..40u8)
+            .map(LayerId)
+            .find(|candidate| {
+                crate::model::qwen36::geometry::Qwen36Geometry::layer_kind(*candidate)
+                    == LayerKind::GatedDeltaNet
+            })
+            .expect("canonical checkpoint must contain GDN layers");
+        let qkv = loader.load(TensorRole::GdnInProjQkv, Some(layer)).unwrap();
+        let z = loader.load(TensorRole::GdnInProjZ, Some(layer)).unwrap();
+        let a = loader.load(TensorRole::GdnInProjA, Some(layer)).unwrap();
+        let b = loader.load(TensorRole::GdnInProjB, Some(layer)).unwrap();
+        for tensor in [&qkv, &z, &a, &b] {
+            assert_eq!(
+                tensor.dtype,
+                GgmlType::Q8_0,
+                "canonical GDN projections must be Q8_0"
+            );
+        }
+        let (qkv_rows, z_rows, a_rows, b_rows, cols) = (
+            qkv.dims[1] as usize,
+            z.dims[1] as usize,
+            a.dims[1] as usize,
+            b.dims[1] as usize,
+            qkv.dims[0] as usize,
+        );
+        assert_eq!(cols, 2048, "canonical GDN hidden size");
+
+        let hidden: Vec<f32> = (0..cols).map(|i| ((i % 11) as f32) * 0.3 - 1.5).collect();
+        let cpu_qkv = reference::q8_gemv(&qkv.bytes, &hidden, qkv_rows, cols);
+        let cpu_z = reference::q8_gemv(&z.bytes, &hidden, z_rows, cols);
+        let cpu_a = reference::q8_gemv(&a.bytes, &hidden, a_rows, cols);
+        let cpu_b = reference::q8_gemv(&b.bytes, &hidden, b_rows, cols);
+
+        let ctx = MetalContext::init().unwrap();
+        let library = load_reference_kernel_library(&ctx).unwrap();
+        let mut pipelines = PipelineCache::new();
+
+        let rounds = 20;
+        let mut separate_ms = Vec::with_capacity(rounds);
+        let mut fused_ms = Vec::with_capacity(rounds);
+        let mut fused_outputs = None;
+        for _ in 0..rounds {
+            let start = std::time::Instant::now();
+            let s_qkv = q8_gemv(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &qkv.bytes,
+                &hidden,
+                qkv_rows,
+                cols,
+            )
+            .unwrap();
+            let s_z = q8_gemv(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &z.bytes,
+                &hidden,
+                z_rows,
+                cols,
+            )
+            .unwrap();
+            let s_a = q8_gemv(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &a.bytes,
+                &hidden,
+                a_rows,
+                cols,
+            )
+            .unwrap();
+            let s_b = q8_gemv(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &b.bytes,
+                &hidden,
+                b_rows,
+                cols,
+            )
+            .unwrap();
+            separate_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            let _ = (s_qkv, s_z, s_a, s_b);
+
+            let start = std::time::Instant::now();
+            let fused = gdn_fused_projection(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &qkv.bytes,
+                &z.bytes,
+                &a.bytes,
+                &b.bytes,
+                &hidden,
+                qkv_rows,
+                z_rows,
+                a_rows,
+                b_rows,
+            )
+            .unwrap();
+            fused_ms.push(start.elapsed().as_secs_f64() * 1e3);
+            fused_outputs = Some(fused);
+        }
+
+        let (f_qkv, f_z, f_a, f_b) = fused_outputs.unwrap();
+        for (fused, cpu, name) in [
+            (&f_qkv, &cpu_qkv, "qkv"),
+            (&f_z, &cpu_z, "z"),
+            (&f_a, &cpu_a, "a"),
+            (&f_b, &cpu_b, "b"),
+        ] {
+            for (f, c) in fused.iter().zip(cpu) {
+                assert!(
+                    (f - c).abs() < (1e-4 * c.abs()).max(1e-2),
+                    "gdn {name}: fused={f} cpu={c} on real Q8_0 weights"
+                );
+            }
+        }
+        let sep_min = separate_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+        let sep_mean = separate_ms.iter().sum::<f64>() / separate_ms.len() as f64;
+        let fus_min = fused_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+        let fus_mean = fused_ms.iter().sum::<f64>() / fused_ms.len() as f64;
+        println!(
+            "phase20_real_gdn_ab layer={} separate_min_ms={sep_min:.3} separate_mean_ms={sep_mean:.3} fused_min_ms={fus_min:.3} fused_mean_ms={fus_mean:.3} speedup={:.2}x",
+            layer.0,
+            sep_mean / fus_mean.max(f64::MIN_POSITIVE)
+        );
     }
 
     #[test]
