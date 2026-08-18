@@ -45,6 +45,9 @@ tokenizers = "0.23.1"
 # Objective-C/Metal bindings for device/queue/resource management").
 metal-sys = { package = "metal", version = "0.33", optional = true }
 libc = "0.2.189"
+# IEEE-754 binary16 conversions for TQKV per-page quantization scales (spec
+# §157-159 store scales as FP16, not BF16 like the reference attention cache).
+half = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

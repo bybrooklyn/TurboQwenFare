@@ -534,4 +534,48 @@ mod tests {
             "broker peak exceeded the hard budget"
         );
     }
+
+    /// Phase 27 TQKV qualification (spec §299, §158-159): runs real greedy
+    /// decode on the canonical checkpoint and prints the exact token
+    /// sequence plus which KV backend produced it. This test does not
+    /// itself flip `TQF_TQKV_ENABLED` (the A/B switch is a process-global
+    /// `OnceLock`, so a single process cannot exercise both backends); it is
+    /// meant to be run twice from the shell — once unset (BF16 reference)
+    /// and once with `TQF_TQKV_ENABLED=1` (`TQF_TQKV_PRECISION=q8`/`q4`) —
+    /// and the two printed token sequences compared by hand. The measured
+    /// result of doing exactly that is recorded in
+    /// `docs/research/qualification/phase-27-tqkv-baseline.md`.
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint; Phase 27 TQKV qualification"]
+    fn canonical_decode_prints_greedy_sequence_for_tqkv_ab_comparison() {
+        let tqf = std::env::var("TQF_CANONICAL_TQF").expect("set TQF_CANONICAL_TQF");
+        let steps: usize = std::env::var("TQF_TQKV_QUAL_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let broker = MemoryBroker::new(Bytes(FOUR_GIB));
+        let mut runtime = Qwen36BoundedReferenceRuntime::open(
+            Path::new(&tqf),
+            broker.clone(),
+            64,
+            Bytes(DEFAULT_EXPERT_CACHE_BYTES),
+        )
+        .unwrap();
+        let mut token = 32u32; // "A" (matches the raw-a fixtures' first prompt token)
+        let mut sequence = Vec::with_capacity(steps);
+        let started = Instant::now();
+        for _ in 0..steps {
+            let decoded = runtime.decode_greedy(token).unwrap();
+            sequence.push(decoded.token);
+            token = decoded.token;
+        }
+        println!(
+            "tqkv_qual tqkv_enabled={} tqkv_precision_env={:?} steps={} elapsed_ms={} tokens={:?}",
+            crate::context::tqkv::tqkv_enabled(),
+            std::env::var("TQF_TQKV_PRECISION").ok(),
+            steps,
+            started.elapsed().as_millis(),
+            sequence,
+        );
+    }
 }

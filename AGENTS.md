@@ -107,6 +107,32 @@ The re-captured exact-router trace for these replays is committed at
 `docs/research/qualification/raw-a-128-route-trace.json` (set `TQF_QUALIFICATION_ROUTE_TRACE` to it
 to re-run the Phase 21-23 replay harnesses).
 
+Phases 27-28 land the first long-context (TQKV) work:
+
+- **Phase 27 (TQKV Q8/Q4 baseline):** `context::tqkv` — 256-token sealed
+  pages with a 128-byte header (little-endian, BLAKE3-checksummed), a
+  high-precision mutable tail, and symmetric per-page Q8/Q4 Key/Value
+  quantization (real IEEE-754 FP16 scales via the `half` crate), wired live
+  into `FullAttentionLayer` as a `KvCacheBackend::{Bf16,Tqkv}` choice
+  (`TQF_TQKV_ENABLED`/`TQF_TQKV_PRECISION`, off by default). A 261-step
+  differential test against the BF16 oracle through the real production
+  attention code path stays under 0.05 max abs error across a sealed-page
+  boundary; on the real checkpoint, BF16 and TQKV-Q8 produced **identical**
+  8-token greedy continuations. 128K capacity accounting (broker-reservation
+  math, not a live 128K decode): BF16 2.50 GiB / TQKV-Q8 ~1.28 GiB / TQKV-Q4
+  ~0.66 GiB across the ten full-attention layers.
+  `docs/research/qualification/phase-27-tqkv-baseline.md`.
+- **Phase 28 (advanced TQKV candidates):** `context::tqkv::candidates` —
+  standalone Q3 symmetric, Q2 asymmetric, Rotated-Q4 (randomized Hadamard
+  transform), outlier-split Q4, and pre-RoPE Q4 encode/decode pairs, per
+  spec §300's explicit instruction not to build a mixed-precision
+  controller before individual encodings are qualified — **none of these
+  are wired into the live cache**. Candidate-matrix measurement: rotation
+  cuts max error 2.3x on frequent-skew synthetic data at no byte cost;
+  outlier-split cuts max error 13.3x on rare-outlier data for +12 bytes;
+  Q3 trades ~25% smaller payload for ~2.3x the Q4 baseline's error.
+  `docs/research/qualification/phase-28-advanced-tqkv.md`.
+
 ## Commands
 
 ```sh

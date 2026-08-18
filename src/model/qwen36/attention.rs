@@ -4,6 +4,7 @@
 //! to its source KV head at consumption time instead of expanding cache pages.
 
 use crate::backend::reference::q4k_gemv;
+use crate::context::tqkv::{tqkv_enabled, tqkv_precision, TqkvPagedCache};
 use crate::error::{ModelError, Result};
 use crate::ids::{Bytes, LayerId};
 use crate::memory::{MemoryBroker, MemoryClass, MemoryLease, MemoryOwner};
@@ -215,29 +216,146 @@ impl<'a> Q4FullAttentionWeights<'a> {
     }
 }
 
+/// Backend selector for `FullAttentionLayer`'s K/V history. `Bf16` is the
+/// Phase 13 correctness oracle and stays the default; `Tqkv` is the Phase 27
+/// paged Q8/Q4 backend, opt-in via `TQF_TQKV_ENABLED` (crate invariant #10 —
+/// every optimization must be A/B-disableable, and ordinary users never see
+/// this switch).
+enum KvCacheBackend {
+    Bf16(Bf16KvCache),
+    Tqkv(TqkvPagedCache),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BackendChoice {
+    Bf16,
+    Tqkv(crate::context::tqkv::TqkvPrecision),
+}
+
+impl KvCacheBackend {
+    fn new(broker: &MemoryBroker, layer: LayerId, max_tokens: usize) -> Result<Self> {
+        Self::with_choice(
+            broker,
+            layer,
+            max_tokens,
+            if tqkv_enabled() {
+                BackendChoice::Tqkv(tqkv_precision())
+            } else {
+                BackendChoice::Bf16
+            },
+        )
+    }
+
+    /// Explicit-choice constructor bypassing the process-global env var —
+    /// used by differential tests so both backends can be exercised in one
+    /// test binary regardless of process-wide `OnceLock` A/B state.
+    fn with_choice(
+        broker: &MemoryBroker,
+        layer: LayerId,
+        max_tokens: usize,
+        choice: BackendChoice,
+    ) -> Result<Self> {
+        match choice {
+            BackendChoice::Tqkv(precision) => Ok(KvCacheBackend::Tqkv(TqkvPagedCache::new(
+                broker, layer, max_tokens, precision,
+            )?)),
+            BackendChoice::Bf16 => Ok(KvCacheBackend::Bf16(Bf16KvCache::new(
+                broker, layer, max_tokens,
+            )?)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            KvCacheBackend::Bf16(cache) => cache.len(),
+            KvCacheBackend::Tqkv(cache) => cache.len(),
+        }
+    }
+
+    fn push(&mut self, key: &[f32], value: &[f32]) -> Result<()> {
+        match self {
+            KvCacheBackend::Bf16(cache) => cache.push(key, value),
+            KvCacheBackend::Tqkv(cache) => cache.push(key, value),
+        }
+    }
+
+    fn key(&self, token: usize, kv_head: usize) -> [f32; HEAD_DIM] {
+        match self {
+            KvCacheBackend::Bf16(cache) => {
+                let mut out = [0f32; HEAD_DIM];
+                for (dst, &src) in out.iter_mut().zip(cache.key(token, kv_head)) {
+                    *dst = bf16_to_f32(src);
+                }
+                out
+            }
+            KvCacheBackend::Tqkv(cache) => cache.key(token, kv_head),
+        }
+    }
+
+    fn value(&self, token: usize, kv_head: usize) -> [f32; HEAD_DIM] {
+        match self {
+            KvCacheBackend::Bf16(cache) => {
+                let mut out = [0f32; HEAD_DIM];
+                for (dst, &src) in out.iter_mut().zip(cache.value(token, kv_head)) {
+                    *dst = bf16_to_f32(src);
+                }
+                out
+            }
+            KvCacheBackend::Tqkv(cache) => cache.value(token, kv_head),
+        }
+    }
+
+    /// Clears logical content while keeping the same broker lease/capacity —
+    /// mirrors the pre-existing `Bf16KvCache` reset behavior (same reserved
+    /// bytes, just logically empty) rather than re-reserving.
+    fn reset(&mut self) {
+        match self {
+            KvCacheBackend::Bf16(cache) => {
+                cache.keys.clear();
+                cache.values.clear();
+            }
+            KvCacheBackend::Tqkv(cache) => cache.reset(),
+        }
+    }
+}
+
 /// Stateful reference layer. The output of `decode_projected` is gated
 /// attention output before `o_proj`; `decode_q4` includes the output
 /// projection and residual addition.
 pub struct FullAttentionLayer {
-    cache: Bf16KvCache,
+    cache: KvCacheBackend,
     position: u64,
 }
 
 impl FullAttentionLayer {
     pub fn new(broker: &MemoryBroker, layer: LayerId, max_tokens: usize) -> Result<Self> {
         Ok(Self {
-            cache: Bf16KvCache::new(broker, layer, max_tokens)?,
+            cache: KvCacheBackend::new(broker, layer, max_tokens)?,
             position: 0,
         })
     }
 
-    pub fn cache(&self) -> &Bf16KvCache {
-        &self.cache
+    /// Explicit-backend constructor for differential A/B tests (see
+    /// `BackendChoice`); production call sites always use `new`, which
+    /// reads the `TQF_TQKV_ENABLED`/`TQF_TQKV_PRECISION` A/B controls.
+    pub(crate) fn new_with_backend(
+        broker: &MemoryBroker,
+        layer: LayerId,
+        max_tokens: usize,
+        choice: BackendChoice,
+    ) -> Result<Self> {
+        Ok(Self {
+            cache: KvCacheBackend::with_choice(broker, layer, max_tokens, choice)?,
+            position: 0,
+        })
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
     }
 
     pub fn reset(&mut self) {
-        self.cache.keys.clear();
-        self.cache.values.clear();
+        self.cache.reset();
         self.position = 0;
     }
 
@@ -312,7 +430,7 @@ impl FullAttentionLayer {
                 let score = q
                     .iter()
                     .zip(self.cache.key(token, kv_head))
-                    .map(|(&q, &k)| q * bf16_to_f32(k))
+                    .map(|(&q, k)| q * k)
                     .sum::<f32>()
                     * 0.0625;
                 max_score = max_score.max(score);
@@ -325,8 +443,8 @@ impl FullAttentionLayer {
             let target = &mut output.values[q_head * HEAD_DIM..(q_head + 1) * HEAD_DIM];
             for (token, score) in scores.into_iter().enumerate() {
                 let probability = (score - max_score).exp() / denominator;
-                for (target, &value) in target.iter_mut().zip(self.cache.value(token, kv_head)) {
-                    *target += probability * bf16_to_f32(value);
+                for (target, value) in target.iter_mut().zip(self.cache.value(token, kv_head)) {
+                    *target += probability * value;
                 }
             }
         }
@@ -389,7 +507,7 @@ impl FullAttentionLayer {
                 let score = q
                     .iter()
                     .zip(self.cache.key(token, kv_head))
-                    .map(|(&q, &k)| q * bf16_to_f32(k))
+                    .map(|(&q, k)| q * k)
                     .sum::<f32>()
                     * 0.0625; // 256^-0.5
                 max_score = max_score.max(score);
@@ -399,8 +517,8 @@ impl FullAttentionLayer {
             let target = &mut out[q_head * HEAD_DIM..(q_head + 1) * HEAD_DIM];
             for (token, score) in scores.into_iter().enumerate() {
                 let probability = (score - max_score).exp() / denom;
-                for (target, &v) in target.iter_mut().zip(self.cache.value(token, kv_head)) {
-                    *target += probability * bf16_to_f32(v);
+                for (target, v) in target.iter_mut().zip(self.cache.value(token, kv_head)) {
+                    *target += probability * v;
                 }
             }
         }
@@ -557,7 +675,7 @@ mod tests {
         let out = layer
             .decode_projected(q, &gate, k, &v, &vec![1.0; HEAD_DIM], &vec![1.0; HEAD_DIM])
             .unwrap();
-        assert_eq!(layer.cache().len(), 1);
+        assert_eq!(layer.cache_len(), 1);
         assert!((out[0] - 3.0).abs() < 0.02);
         assert!((out[7 * HEAD_DIM] - 3.0).abs() < 0.02);
         assert!((out[8 * HEAD_DIM] - 9.0).abs() < 0.02);
@@ -583,5 +701,66 @@ mod tests {
             .unwrap();
         assert!((one[0] - 2.0).abs() < 0.02);
         assert!((two[0] - 4.0).abs() < 0.02);
+    }
+
+    fn xorshift_activation(state: &mut u64) -> f32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        ((*state as f64 / u64::MAX as f64) * 2.0 - 1.0) as f32 * 3.0
+    }
+
+    /// Phase 27 production-path differential test: the same
+    /// `FullAttentionLayer::decode_projected` call sequence, run once against
+    /// each backend via `new_with_backend` (so both share the exact
+    /// normalize/RoPE/softmax/gate code — only the K/V storage differs).
+    /// The sequence spans one full sealed page plus a partial tail so both
+    /// the quantized-page and mutable-tail decode paths are exercised.
+    #[test]
+    fn tqkv_q8_backend_matches_bf16_reference_within_tolerance() {
+        let steps = crate::context::tqkv::PAGE_TOKENS + 5;
+        let broker_bf16 = broker();
+        let broker_tqkv = broker();
+        let mut bf16_layer =
+            FullAttentionLayer::new_with_backend(&broker_bf16, LayerId(3), steps, BackendChoice::Bf16)
+                .unwrap();
+        let mut tqkv_layer = FullAttentionLayer::new_with_backend(
+            &broker_tqkv,
+            LayerId(3),
+            steps,
+            BackendChoice::Tqkv(crate::context::tqkv::TqkvPrecision::Q8),
+        )
+        .unwrap();
+
+        let q_norm = vec![1.0; HEAD_DIM];
+        let k_norm = vec![1.0; HEAD_DIM];
+        let mut state = 0xC0FFEEu64;
+        let mut max_abs_diff = 0f32;
+        for _ in 0..steps {
+            let q: Vec<f32> = (0..HEADS * HEAD_DIM)
+                .map(|_| xorshift_activation(&mut state))
+                .collect();
+            let gate: Vec<f32> = (0..HEADS * HEAD_DIM).map(|_| 4.0).collect();
+            let k: Vec<f32> = (0..KV_WIDTH).map(|_| xorshift_activation(&mut state)).collect();
+            let v: Vec<f32> = (0..KV_WIDTH).map(|_| xorshift_activation(&mut state)).collect();
+
+            let bf16_out = bf16_layer
+                .decode_projected(q.clone(), &gate, k.clone(), &v, &q_norm, &k_norm)
+                .unwrap();
+            let tqkv_out = tqkv_layer
+                .decode_projected(q, &gate, k, &v, &q_norm, &k_norm)
+                .unwrap();
+            for (a, b) in bf16_out.iter().zip(&tqkv_out) {
+                max_abs_diff = max_abs_diff.max((a - b).abs());
+            }
+        }
+        assert_eq!(bf16_layer.cache_len(), steps);
+        assert_eq!(tqkv_layer.cache_len(), steps);
+        // Q8 is a compressed *oracle*, not bit-exact (spec section 158); the
+        // gated output stays close across a page-boundary-crossing sequence.
+        assert!(
+            max_abs_diff < 0.05,
+            "TQKV-Q8 vs BF16 output diverged too far: {max_abs_diff}"
+        );
     }
 }
