@@ -3,9 +3,21 @@
 //! Phase 14 intentionally starts with every routed expert resident so the
 //! router and expert math have an unambiguous correctness oracle before any
 //! I/O/cache policy can complicate failures (spec §286, §149-151).
+//!
+//! Phase 20 (spec §112 row 20) adds an A/B-able GPU-resident expert path:
+//! with `TQF_EXPERT_GPU_RESIDENT=1` (or `WholeExpertLfuCache::set_gpu_enabled`)
+//! a freshly loaded expert is uploaded once into broker-registered Metal
+//! buffers (`backend::metal::GpuResidentExpert`) and the CPU copy is dropped,
+//! so the same Q4_K bytes are charged to the broker exactly once. The GPU
+//! path is a developer A/B control (invariant #10): absent a Metal device it
+//! falls back to the CPU baseline without changing results.
 
 pub mod policy;
 
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "metal")]
+use crate::backend::metal::{GpuExecutionState, GpuResidentExpert};
 use crate::backend::reference::{q4k_gemv, sigmoid, silu};
 use crate::dev::inventory::TensorRole;
 use crate::error::{ModelError, Result};
@@ -17,6 +29,70 @@ use crate::model::qwen36::geometry::Qwen36Geometry;
 use crate::model::qwen36::weights::{
     LoadedQwen36Expert, LoadedQwen36Tensor, Qwen36Activation, Qwen36WeightLoader,
 };
+
+/// Placeholder so the cache's spawn/forward API compiles identically on
+/// non-Metal backends; it is never constructed there.
+#[cfg(not(feature = "metal"))]
+pub(crate) type GpuExecutionState = ();
+
+/// The backing store for one routed expert in the cache. `Cpu` keeps the
+/// Phase 18 Q4_K payload bytes; `Gpu` (Phase 20, metal only) keeps the same
+/// bytes uploaded once into persistent Metal buffers. Both compute the same
+/// SwiGLU forward — the CPU and GPU variants must stay result-identical -
+/// and both charge the same `stored_bytes` to the broker (a GPU value is
+/// produced by moving the payload, never by copying it alongside the CPU
+/// bytes).
+pub enum ExpertValue {
+    Cpu(LoadedQwen36Expert),
+    #[cfg(feature = "metal")]
+    Gpu(GpuResidentExpert),
+}
+
+impl ExpertValue {
+    pub fn stored_bytes(&self) -> Bytes {
+        match self {
+            ExpertValue::Cpu(cpu) => cpu.stored_bytes(),
+            #[cfg(feature = "metal")]
+            ExpertValue::Gpu(gpu) => gpu.stored_bytes(),
+        }
+    }
+
+    /// Executes the canonical SwiGLU expert forward on the backing store
+    /// this value was admitted with. GPU values require the cache's GPU
+    /// execution state (device/library/pipeline cache) to still exist;
+    /// losing it mid-route is a violated internal invariant.
+    #[cfg(feature = "metal")]
+    pub fn forward(
+        &self,
+        broker: &MemoryBroker,
+        gpu: Option<&mut GpuExecutionState>,
+        input: &[f32],
+    ) -> Result<Qwen36Activation> {
+        match self {
+            ExpertValue::Cpu(cpu) => cpu.forward(broker, input),
+            ExpertValue::Gpu(expert) => {
+                let state = gpu.ok_or_else(|| crate::error::InternalError {
+                    incident_id: "expert-gpu-state-missing".to_string(),
+                    message: "GPU-resident expert value without GPU execution state".to_string(),
+                })?;
+                let values = expert.forward(state, input)?;
+                Qwen36Activation::from_slice(broker, &values)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "metal"))]
+    pub fn forward(
+        &self,
+        broker: &MemoryBroker,
+        _gpu: Option<&mut GpuExecutionState>,
+        input: &[f32],
+    ) -> Result<Qwen36Activation> {
+        match self {
+            ExpertValue::Cpu(cpu) => cpu.forward(broker, input),
+        }
+    }
+}
 
 const HIDDEN: usize = Qwen36Geometry::HIDDEN_SIZE;
 const EXPERT_WIDTH: usize = Qwen36Geometry::ROUTED_EXPERT_WIDTH;
@@ -159,7 +235,7 @@ struct CachedExpert {
     frequency: u64,
     last_used: u64,
     pin_count: u16,
-    value: LoadedQwen36Expert,
+    value: ExpertValue,
 }
 
 /// Global, whole-expert cache. The cache plans from the *actual* router
@@ -188,6 +264,15 @@ pub struct WholeExpertLfuCache {
     io_fanout: ReadFanout,
     policy: CachePolicyKind,
     half_life_events: u64,
+    /// Phase 20 GPU-resident expert path. The state (device/library/pipeline
+    /// cache) is created lazily on first use and shared behind a mutex so
+    /// the cache stays `Send` even though Metal objects are not. `None`
+    /// once the CPU fallback is selected (no device available).
+    #[cfg(feature = "metal")]
+    gpu_state: Option<Arc<Mutex<GpuExecutionState>>>,
+    /// Whether new cache admissions should be uploaded to GPU buffers.
+    #[cfg(feature = "metal")]
+    gpu_enabled: bool,
 }
 
 /// Env var read once per cache so a deployment/benchmark can force the
@@ -199,6 +284,12 @@ const IO_FANOUT_ENV: &str = "TQF_EXPERT_IO_FANOUT";
 /// for the same A/B purpose. Unset or unparseable values keep the Phase
 /// 15-18-proven LFU default.
 const CACHE_POLICY_ENV: &str = "TQF_EXPERT_CACHE_POLICY";
+
+/// Env var enabling the Phase 20 GPU-resident expert path (`1`/`on`/`true`).
+/// This is the out-of-process A/B control (invariant #10); `set_gpu_enabled`
+/// is the in-process one. Without a usable Metal device the flag silently
+/// falls back to the CPU baseline rather than failing decode.
+const EXPERT_GPU_ENV: &str = "TQF_EXPERT_GPU_RESIDENT";
 
 /// Default decay half-life for `DecayedCostAware`, in cache-route events;
 /// matches the sweep in `policy::tests::qualification_trace_replays_all_phase21_policy_candidates`.
@@ -224,6 +315,18 @@ fn cache_policy_from_env() -> CachePolicyKind {
     }
 }
 
+#[cfg(feature = "metal")]
+fn gpu_enabled_from_env() -> bool {
+    match std::env::var(EXPERT_GPU_ENV).ok().as_deref() {
+        Some(value) => {
+            value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("true")
+        }
+        None => false,
+    }
+}
+
 impl WholeExpertLfuCache {
     pub fn new(capacity: Bytes) -> Self {
         Self {
@@ -238,6 +341,10 @@ impl WholeExpertLfuCache {
                 .unwrap_or_else(ReadFanout::parallel_default),
             policy: cache_policy_from_env(),
             half_life_events: DEFAULT_HALF_LIFE_EVENTS,
+            #[cfg(feature = "metal")]
+            gpu_state: None,
+            #[cfg(feature = "metal")]
+            gpu_enabled: gpu_enabled_from_env(),
         }
     }
 
@@ -254,6 +361,94 @@ impl WholeExpertLfuCache {
     pub fn set_policy(&mut self, policy: CachePolicyKind, half_life_events: u64) {
         self.policy = policy;
         self.half_life_events = half_life_events.max(1);
+    }
+
+    /// Overrides the Phase 20 GPU-resident expert choice made (from
+    /// `TQF_EXPERT_GPU_RESIDENT`) at construction time. Mirrors
+    /// `set_io_fanout`/`set_policy`: the Phase 20 A/B must be runnable
+    /// entirely within one process. Disabling keeps any already-resident
+    /// GPU values (they stay correct to forward); it only stops new
+    /// admissions from taking the GPU path.
+    #[cfg(feature = "metal")]
+    pub fn set_gpu_enabled(&mut self, enabled: bool) {
+        self.gpu_enabled = enabled;
+    }
+
+    #[cfg(not(feature = "metal"))]
+    pub fn set_gpu_enabled(&mut self, _enabled: bool) {}
+
+    #[cfg(feature = "metal")]
+    pub(crate) fn gpu_expert_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.value, ExpertValue::Gpu(_)))
+            .count()
+    }
+
+    #[cfg(not(feature = "metal"))]
+    pub(crate) fn gpu_expert_count(&self) -> usize {
+        0
+    }
+
+    /// Lazily creates the shared GPU execution state (device, compiled
+    /// kernel library, pipeline cache) on first use. Failure means no
+    /// usable Metal device: the flag is cleared and the cache stays on the
+    /// CPU baseline, so an A/B run never turns into a crash on a headless
+    /// or sandboxed machine.
+    #[cfg(feature = "metal")]
+    fn init_gpu_state_if_needed(&mut self) {
+        if !self.gpu_enabled || self.gpu_state.is_some() {
+            return;
+        }
+        match GpuExecutionState::init() {
+            Ok(state) => self.gpu_state = Some(Arc::new(Mutex::new(state))),
+            Err(error) => {
+                tracing::warn!(%error, "GPU-resident expert path unavailable; keeping CPU baseline");
+                self.gpu_enabled = false;
+            }
+        }
+    }
+
+    /// Converts freshly staged CPU expert payloads into cache values,
+    /// uploading each to persistent GPU buffers when the Phase 20 path is
+    /// enabled and dropping the CPU copy so one expert's Q4_K bytes are
+    /// charged to the broker exactly once (Phase 20 module doc's "sole
+    /// backing store" variant, spec §50's shared-buffer expert slot shape).
+    fn stage_expert_values(
+        &mut self,
+        staged: Vec<(ExpertId, LoadedQwen36Expert)>,
+        broker: &MemoryBroker,
+    ) -> Result<Vec<(ExpertId, ExpertValue)>> {
+        #[cfg(feature = "metal")]
+        {
+            self.init_gpu_state_if_needed();
+            if let Some(state) = &self.gpu_state {
+                let guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                return staged
+                    .into_iter()
+                    .map(|(expert, cpu)| {
+                        let [gate, up, down] = cpu.payload_parts();
+                        let value = GpuResidentExpert::upload(
+                            &guard.ctx,
+                            broker,
+                            gate,
+                            up,
+                            down,
+                            EXPERT_WIDTH,
+                            HIDDEN,
+                        )?;
+                        drop(cpu);
+                        Ok((expert, ExpertValue::Gpu(value)))
+                    })
+                    .collect();
+            }
+        }
+        Ok(staged
+            .into_iter()
+            .map(|(expert, cpu)| (expert, ExpertValue::Cpu(cpu)))
+            .collect())
     }
 
     /// Same utility formula `policy::ReplayCache` uses offline, applied to a
@@ -317,6 +512,7 @@ impl WholeExpertLfuCache {
     pub(crate) fn prepare_exact_route(
         &mut self,
         loader: &Qwen36WeightLoader,
+        broker: &MemoryBroker,
         layer: LayerId,
         route: &RouterResult,
     ) -> Result<ExpertLoadPlan> {
@@ -370,10 +566,13 @@ impl WholeExpertLfuCache {
         // fans these reads out across a bounded thread pool by default
         // (NVMAI R9 precedent) instead of issuing them one at a time; a
         // failed read still drops all staged broker leases and leaves no
-        // partially valid cache entry behind.
-        let mut staged = crate::io::fetch_all(self.io_fanout, &misses, |&expert| {
+        // partially valid cache entry behind. The staged CPU payloads then
+        // become cache values (possibly GPU-resident uploads, Phase 20)
+        // before any entry is visible to eviction.
+        let staged_cpu = crate::io::fetch_all(self.io_fanout, &misses, |&expert| {
             Ok((expert, loader.load_expert(layer, expert)?))
         })?;
+        let mut staged = self.stage_expert_values(staged_cpu, broker)?;
 
         let plan_id = self.next_plan_id;
         self.next_plan_id = self.next_plan_id.wrapping_add(1).max(1);
@@ -427,7 +626,7 @@ impl WholeExpertLfuCache {
         &self,
         plan: &ExpertLoadPlan,
         expert: ExpertId,
-    ) -> Result<&LoadedQwen36Expert> {
+    ) -> Result<&ExpertValue> {
         if self.active_plan.as_ref() != Some(plan) || !plan.route.ids.contains(&expert) {
             return Err(crate::error::InternalError {
                 incident_id: format!("expert-plan-{}-binding", plan.plan_id),
@@ -449,6 +648,49 @@ impl WholeExpertLfuCache {
                 }
                 .into()
             })
+    }
+
+    /// Executes one planned routed expert's forward on whatever backing
+    /// store the cache chose for it (CPU Q4_K payload or Phase 20
+    /// GPU-resident buffers), returning a broker-accounted activation. This
+    /// is the live decode path's binding point: it replaces `planned_expert`
+    /// at the streaming call site so the GPU path needs no Metal types
+    /// outside the cache.
+    pub(crate) fn forward_expert(
+        &mut self,
+        plan: &ExpertLoadPlan,
+        expert: ExpertId,
+        broker: &MemoryBroker,
+        input: &[f32],
+    ) -> Result<Qwen36Activation> {
+        let entry = self.planned_expert(plan, expert)?;
+        #[cfg(feature = "metal")]
+        {
+            if let ExpertValue::Gpu(gpu_expert) = entry {
+                let state = self
+                    .gpu_state
+                    .as_ref()
+                    .ok_or_else(|| crate::error::InternalError {
+                        incident_id: "expert-gpu-state-missing".to_string(),
+                        message: "GPU-resident expert value without GPU execution state"
+                            .to_string(),
+                    })?;
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let values = gpu_expert.forward(&mut guard, input)?;
+                return Qwen36Activation::from_slice(broker, &values);
+            }
+        }
+        match entry {
+            ExpertValue::Cpu(cpu) => cpu.forward(broker, input),
+            #[cfg(feature = "metal")]
+            ExpertValue::Gpu(_) => Err(crate::error::InternalError {
+                incident_id: "expert-gpu-state-missing".to_string(),
+                message: "GPU-resident expert value without GPU execution state".to_string(),
+            }
+            .into()),
+        }
     }
 
     pub(crate) fn finish_exact_route(&mut self, plan: &ExpertLoadPlan) -> Result<()> {
@@ -477,9 +719,10 @@ impl WholeExpertLfuCache {
     pub fn get_or_load(
         &mut self,
         loader: &Qwen36WeightLoader,
+        broker: &MemoryBroker,
         layer: LayerId,
         expert: ExpertId,
-    ) -> Result<&LoadedQwen36Expert> {
+    ) -> Result<&ExpertValue> {
         self.clock = self.clock.wrapping_add(1);
         if let Some(index) = self
             .entries
@@ -511,11 +754,20 @@ impl WholeExpertLfuCache {
             }
         }
         // `load_expert` acquires its broker lease before allocating the
-        // destination Vec. All cache evictions above happened first.
-        let value = loader.load_expert(layer, expert)?;
+        // destination Vec. All cache evictions above happened first. The
+        // loaded payload then becomes a cache value (Phase 20 GPU upload
+        // when enabled) before it is exposed to eviction.
+        let cpu_value = loader.load_expert(layer, expert)?;
+        let (_, value) = self
+            .stage_expert_values(vec![(expert, cpu_value)], broker)?
+            .pop()
+            .ok_or_else(|| crate::error::InternalError {
+                incident_id: "expert-get-or-load-staged".to_string(),
+                message: "get_or_load staging produced no value".to_string(),
+            })?;
         self.stats.misses = self.stats.misses.saturating_add(1);
         self.stats.raw_miss_bytes.0 = self.stats.raw_miss_bytes.0.saturating_add(required.0);
-        self.resident_bytes.0 = self.resident_bytes.0.saturating_add(required.0);
+        self.resident_bytes.0 = self.resident_bytes.0.saturating_add(value.stored_bytes().0);
         self.entries.push(CachedExpert {
             layer,
             expert,
@@ -743,7 +995,7 @@ impl Qwen36StreamingMoe {
         require_len("Qwen streaming MoE input", input.values.len(), HIDDEN)?;
         let route_logits = self.router.matvec(broker, &input.values)?;
         let route = RouterResult::from_logits(&route_logits.values)?;
-        let plan = cache.prepare_exact_route(loader, self.layer, &route)?;
+        let plan = cache.prepare_exact_route(loader, broker, self.layer, &route)?;
         let computed = (|| -> Result<Qwen36Activation> {
             let shared_gate = self.shared_gate.matvec(broker, &input.values)?;
             let shared_up = self.shared_up.matvec(broker, &input.values)?;
@@ -754,9 +1006,7 @@ impl Qwen36StreamingMoe {
             observer("shared", &output)?;
 
             for (&expert, &weight) in plan.route.ids.iter().zip(&plan.route.weights) {
-                let routed = cache
-                    .planned_expert(&plan, expert)?
-                    .forward(broker, &input.values)?;
+                let routed = cache.forward_expert(&plan, expert, broker, &input.values)?;
                 output.add_scaled_in_place(&routed, weight)?;
             }
             observer("combined", &output)?;

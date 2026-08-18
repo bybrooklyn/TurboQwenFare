@@ -21,6 +21,6 @@ pub mod timing;
 
 pub use buffer::BufferLease;
 pub use context::MetalContext;
-pub use expert::GpuResidentExpert;
+pub use expert::{GpuExecutionState, GpuResidentExpert};
 pub use pipeline::PipelineCache;
 pub use timing::{EventFence, GpuStopwatch};

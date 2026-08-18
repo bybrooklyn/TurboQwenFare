@@ -25,6 +25,7 @@ use super::context::MetalContext;
 use super::pipeline::PipelineCache;
 
 pub const Q4K_GEMV_FUNCTION: &str = "tqf_q4k_gemv";
+pub const Q4K_GEMV_STAGED16_FUNCTION: &str = "tqf_q4k_gemv_staged16";
 pub const Q4K_GEMM_FUNCTION: &str = "tqf_q4k_gemm";
 pub const RMSNORM_FUNCTION: &str = "tqf_rmsnorm";
 pub const RESIDUAL_ADD_FUNCTION: &str = "tqf_residual_add";
@@ -112,6 +113,99 @@ kernel void tqf_q4k_gemv(
         }
     }
     out[row] = acc;
+}
+
+// Phase 20 NVMAI-derived MoE phase-1 staged variant (spec §292): 16 rows
+// per threadgroup, block bytes cooperatively staged into threadgroup memory
+// once per block instead of every row-thread re-reading the same 144 bytes
+// from device. Each of the 256 threads owns exactly one element of each
+// block for all 16 rows, so the per-block dequant arithmetic is exactly the
+// per-element mapping of `dequantize_q4_k` (sub-block `p = e/32`, l = e%32
+// always on the sc1 side: `get_scale_min_k4(p)`, nibble = qs[e/2] bit
+// (e%2)*4) — identical values, different summation order per row.
+kernel void tqf_q4k_gemv_staged16(
+    device const uchar* weights [[buffer(0)]],
+    device const float* vec [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup uchar w_stage[16 * 144];
+    threadgroup float v_stage[256];
+    threadgroup float sums[16 * 256];
+    uint blocks_per_row = cols / 256;
+    uint row_base = gid * 16;
+    uint row_count = min(16u, rows - row_base);
+    if (row_base >= rows) return;
+
+    device const uchar* strip_base = weights + (ulong)row_base * (ulong)blocks_per_row * 144;
+    float acc[16];
+    for (uint r = 0; r < 16; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (uint b = 0; b < blocks_per_row; ++b) {
+        for (uint i = tid; i < 16 * 144; i += 256) {
+            uint r = i / 144;
+            if (r < row_count) {
+                w_stage[i] = strip_base[(ulong)r * (ulong)blocks_per_row * 144 + (ulong)b * 144 + (i % 144)];
+            }
+        }
+        if (tid < 256) {
+            v_stage[tid] = vec[(ulong)b * 256 + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < 256) {
+            uint p = tid / 32;
+            // Pairs (2g, 2g+1) share qs bytes [32g, 32g+32): the even pair
+            // owns the low nibble, the odd pair the high nibble.
+            uint nib_byte = (p / 2) * 32 + (tid % 32);
+            uint nib_shift = 4 * (p % 2);
+            float v = v_stage[tid];
+            for (uint r = 0; r < row_count; ++r) {
+                threadgroup const uchar* w = w_stage + r * 144;
+                half d_h = as_type<half>(ushort(ushort(w[0]) | (ushort(w[1]) << 8)));
+                half dmin_h = as_type<half>(ushort(ushort(w[2]) | (ushort(w[3]) << 8)));
+                // scale/min pair for sub-block p from the 12 staged bytes
+                // (identical branch structure to get_scale_min_k4).
+                uchar sc, mm;
+                if (p < 4) {
+                    sc = w[4 + p] & 63;
+                    mm = w[4 + p + 4] & 63;
+                } else {
+                    sc = (w[4 + p + 4] & 0x0F) | ((w[4 + p - 4] >> 6) << 4);
+                    mm = (w[4 + p + 4] >> 4) | ((w[4 + p] >> 6) << 4);
+                }
+                uint nib = (w[16 + nib_byte] >> nib_shift) & 0xF;
+                float value = float(d_h) * float(sc) * float(nib) - float(dmin_h) * float(mm);
+                acc[r] += v * value;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Cross-thread reduction: each thread owns element `tid`'s partial
+    // contribution to every row's dot product; sum the 256 per-row partials
+    // in threadgroup memory (tree reduce).
+    for (uint r = 0; r < row_count; ++r) {
+        sums[r * 256 + tid] = acc[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        for (uint r = 0; r < row_count; ++r) {
+            if (tid < stride) {
+                sums[r * 256 + tid] += sums[r * 256 + tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        for (uint r = 0; r < row_count; ++r) {
+            out[row_base + r] = sums[r * 256];
+        }
+    }
 }
 
 // Batched GEMV / prefill primitive: out[token, row] = dot(dequant(weights[row,:]), mat[token,:]).
@@ -264,7 +358,17 @@ pub fn q4k_gemv(
 ) -> Result<Vec<f32>> {
     assert_q4k_weights_shape(weights, rows, cols);
     let weights_buf = ctx.allocate_buffer_with_data(weights, "q4k-gemv-weights");
-    dispatch_q4k_gemv_buffer(ctx, library, pipelines, &weights_buf, vector, rows, cols)
+    dispatch_q4k_gemv_buffer(
+        ctx,
+        library,
+        pipelines,
+        &weights_buf,
+        vector,
+        rows,
+        cols,
+        Q4K_GEMV_FUNCTION,
+        false,
+    )
 }
 
 /// Same computation as `q4k_gemv`, but against a weights buffer the caller
@@ -290,7 +394,53 @@ pub fn q4k_gemv_persistent_weights(
         "persistent weights buffer is {} bytes, expected {expected} for a {rows}x{cols} Q4_K matrix",
         weights_buf.length()
     );
-    dispatch_q4k_gemv_buffer(ctx, library, pipelines, weights_buf, vector, rows, cols)
+    dispatch_q4k_gemv_buffer(
+        ctx,
+        library,
+        pipelines,
+        weights_buf,
+        vector,
+        rows,
+        cols,
+        Q4K_GEMV_FUNCTION,
+        false,
+    )
+}
+
+/// Phase 20 NVMAI-derived staged variant of `q4k_gemv_persistent_weights`
+/// (spec §292, "MoE phase-1 16-row threadgroup staging"): same contract and
+/// buffers, different kernel. Json parity is asserted functionally (the
+/// per-element dequant is exactly `dequantize_q4_k`'s), and the two kernels
+/// stay selectable for benchmark A/B (isolated microbenchmarks first; full
+/// decode A/B decides the eventual default, per spec §1005).
+pub fn q4k_gemv_persistent_weights_staged16(
+    ctx: &MetalContext,
+    library: &Library,
+    pipelines: &mut PipelineCache,
+    weights_buf: &BufferLease,
+    vector: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>> {
+    let block_bytes = GgmlType::Q4K.block_bytes() as usize;
+    let expected = (rows * blocks_per_row(cols) * block_bytes) as u64;
+    assert_eq!(
+        weights_buf.length(),
+        expected,
+        "persistent weights buffer is {} bytes, expected {expected} for a {rows}x{cols} Q4_K matrix",
+        weights_buf.length()
+    );
+    dispatch_q4k_gemv_buffer(
+        ctx,
+        library,
+        pipelines,
+        weights_buf,
+        vector,
+        rows,
+        cols,
+        Q4K_GEMV_STAGED16_FUNCTION,
+        true,
+    )
 }
 
 fn dispatch_q4k_gemv_buffer(
@@ -301,6 +451,8 @@ fn dispatch_q4k_gemv_buffer(
     vector: &[f32],
     rows: usize,
     cols: usize,
+    function_name: &str,
+    staged: bool,
 ) -> Result<Vec<f32>> {
     assert_eq!(
         vector.len(),
@@ -314,7 +466,7 @@ fn dispatch_q4k_gemv_buffer(
     let cols_buf = ctx.allocate_buffer_with_data(&(cols as u32).to_le_bytes(), "q4k-gemv-cols");
     let rows_buf = ctx.allocate_buffer_with_data(&(rows as u32).to_le_bytes(), "q4k-gemv-rows");
 
-    let pipeline = pipelines.get_or_compile(ctx.device(), library, Q4K_GEMV_FUNCTION, "")?;
+    let pipeline = pipelines.get_or_compile(ctx.device(), library, function_name, "")?;
     let command_buffer = ctx.queue().new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(pipeline);
@@ -323,8 +475,17 @@ fn dispatch_q4k_gemv_buffer(
     encoder.set_buffer(2, Some(out_buf.metal_buffer()), 0);
     encoder.set_buffer(3, Some(cols_buf.metal_buffer()), 0);
     encoder.set_buffer(4, Some(rows_buf.metal_buffer()), 0);
-    let threads_per_group = MTLSize::new(64, 1, 1);
-    let groups = MTLSize::new((rows as u64).max(1).div_ceil(64), 1, 1);
+    let (threads_per_group, groups) = if staged {
+        // One 256-thread threadgroup covers 16 rows; a partial last group is
+        // guarded inside the kernel.
+        let threads_per_group = MTLSize::new(256, 1, 1);
+        let groups = MTLSize::new((rows as u64).max(1).div_ceil(16), 1, 1);
+        (threads_per_group, groups)
+    } else {
+        let threads_per_group = MTLSize::new(64, 1, 1);
+        let groups = MTLSize::new((rows as u64).max(1).div_ceil(64), 1, 1);
+        (threads_per_group, groups)
+    };
     encoder.dispatch_thread_groups(groups, threads_per_group);
     encoder.end_encoding();
     command_buffer.commit();
@@ -614,6 +775,102 @@ mod tests {
         assert_eq!(gpu.len(), cpu.len());
         for (g, c) in gpu.iter().zip(&cpu) {
             assert!((g - c).abs() < 1e-2, "gpu={g} cpu={c}");
+        }
+    }
+
+    #[test]
+    fn staged16_one_hot_element_probe_matches_dequant_exactly() {
+        let Some(ctx) = ctx_or_skip() else { return };
+        let library = load_reference_kernel_library(&ctx).unwrap();
+        let mut pipelines = PipelineCache::new();
+
+        let (rows, cols) = (1usize, 256usize);
+        let (weights, _) = synthetic_weights_and_vector(rows, cols);
+        let dequant = crate::format::quant::dequant::dequantize_q4_k(&weights);
+        let weights_buf = ctx.allocate_buffer_with_data(&weights, "probe");
+
+        for (k, expected) in dequant.iter().enumerate() {
+            let mut vector = vec![0f32; 256];
+            vector[k] = 1.0;
+            let out = q4k_gemv_persistent_weights_staged16(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &weights_buf,
+                &vector,
+                rows,
+                cols,
+            )
+            .unwrap();
+            assert!(
+                (out[0] - expected).abs() < 1e-3,
+                "element {k}: kernel sent {out:?} but one-hot dequant expects {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn staged16_gemv_matches_cpu_reference_and_reference_kernel() {
+        let Some(ctx) = ctx_or_skip() else { return };
+        let library = load_reference_kernel_library(&ctx).unwrap();
+        let mut pipelines = PipelineCache::new();
+
+        // Deliberately awkward shapes: rows < 16 and rows % 16 != 0 both
+        // exercise the partial-group guards, 3 blocks/row exercises the
+        // multi-block barrier loop, and the last two are the real
+        // Qwen3.6 routed-expert geometries (gate/up [512, 2048], down
+        // [2048, 512]).
+        for (rows, cols) in [
+            (1, 256),
+            (16, 256),
+            (17, 512),
+            (33, 768),
+            (100, 1024),
+            (512, 2048),
+            (2048, 512),
+        ] {
+            let (weights, vector) = synthetic_weights_and_vector(rows, cols);
+            let weights_buf = ctx.allocate_buffer_with_data(&weights, "staged16-weights");
+
+            let staged = q4k_gemv_persistent_weights_staged16(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &weights_buf,
+                &vector,
+                rows,
+                cols,
+            )
+            .unwrap();
+            let reference = q4k_gemv_persistent_weights(
+                &ctx,
+                &library,
+                &mut pipelines,
+                &weights_buf,
+                &vector,
+                rows,
+                cols,
+            )
+            .unwrap();
+            let cpu = reference::q4k_gemv(&weights, &vector, rows, cols);
+
+            assert_eq!(staged.len(), cpu.len());
+            for (s, c) in staged.iter().zip(&cpu) {
+                // The staged kernel reduces partials in a tree over threads
+                // rather than sequentially, so this is a relative-tolerance
+                // check on ordinary FP non-associativity (the one-hot probe
+                // above holds the per-element dequant exact).
+                assert!(
+                    (s - c).abs() < (1e-4 * c.abs()).max(1e-2),
+                    "staged16={s} cpu={c} at {rows}x{cols}"
+                );
+            }
+            for (s, r) in staged.iter().zip(&reference) {
+                assert!(
+                    (s - r).abs() < (1e-4 * r.abs()).max(1e-2),
+                    "staged16={s} reference-kernel={r} at {rows}x{cols}"
+                );
+            }
         }
     }
 

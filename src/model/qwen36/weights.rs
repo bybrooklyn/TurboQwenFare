@@ -512,6 +512,20 @@ impl LoadedQwen36Expert {
         Bytes((Self::GATE_BYTES + Self::UP_BYTES + Self::DOWN_BYTES) as u64)
     }
 
+    /// Borrows the three Q4_K payload slices (`gate`, `up`, `down`) so a
+    /// Phase 20 GPU admission path can upload them into persistent Metal
+    /// buffers directly out of this payload, then drop this CPU copy.
+    pub(crate) fn payload_parts(&self) -> [&[u8]; 3] {
+        let gate_end = Self::GATE_BYTES;
+        let up_end = gate_end + Self::UP_BYTES;
+        let down_end = up_end + Self::DOWN_BYTES;
+        [
+            &self.bytes[..gate_end],
+            &self.bytes[gate_end..up_end],
+            &self.bytes[up_end..down_end],
+        ]
+    }
+
     /// Executes this Q4_K whole-expert payload in the canonical SwiGLU
     /// order. The cache retains the bytes; each activation remains a separate
     /// broker-accounted transient allocation.
@@ -1595,21 +1609,21 @@ mod tests {
 
         assert_eq!(
             cache
-                .get_or_load(&loader, layer, crate::ids::ExpertId(0))
+                .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(0))
                 .unwrap()
-                .expert,
-            crate::ids::ExpertId(0)
+                .stored_bytes(),
+            Bytes(expert_bytes)
         );
         // Make expert zero hotter than expert one before capacity forces an
         // eviction. The second lookup must not allocate another payload.
         cache
-            .get_or_load(&loader, layer, crate::ids::ExpertId(0))
+            .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(0))
             .unwrap();
         cache
-            .get_or_load(&loader, layer, crate::ids::ExpertId(1))
+            .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(1))
             .unwrap();
         cache
-            .get_or_load(&loader, layer, crate::ids::ExpertId(2))
+            .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(2))
             .unwrap();
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
@@ -1624,7 +1638,7 @@ mod tests {
         // Expert one was the LFU victim; revisiting it is a new miss and
         // proves eviction happens at whole-expert granularity.
         cache
-            .get_or_load(&loader, layer, crate::ids::ExpertId(1))
+            .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(1))
             .unwrap();
         assert_eq!(cache.stats().misses, 4);
         assert_eq!(cache.stats().evictions, 2);
@@ -1654,20 +1668,20 @@ mod tests {
             let mut cache = WholeExpertLfuCache::new(Bytes(expert_bytes * 2));
             cache.set_policy(policy, 160);
             cache
-                .get_or_load(&loader, layer, crate::ids::ExpertId(0))
+                .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(0))
                 .unwrap();
             cache
-                .get_or_load(&loader, layer, crate::ids::ExpertId(0))
+                .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(0))
                 .unwrap();
             cache
-                .get_or_load(&loader, layer, crate::ids::ExpertId(1))
+                .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(1))
                 .unwrap();
             cache
-                .get_or_load(&loader, layer, crate::ids::ExpertId(2))
+                .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(2))
                 .unwrap();
             let misses_before = cache.stats().misses;
             cache
-                .get_or_load(&loader, layer, crate::ids::ExpertId(0))
+                .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(0))
                 .unwrap();
             cache.stats().misses == misses_before
         };
@@ -1703,7 +1717,9 @@ mod tests {
         let mut serial = WholeExpertLfuCache::new(cache_bytes);
         serial.set_io_fanout(crate::io::ReadFanout::Serial);
         let serial_start = std::time::Instant::now();
-        let plan = serial.prepare_exact_route(&loader, layer, &route).unwrap();
+        let plan = serial
+            .prepare_exact_route(&loader, &broker, layer, &route)
+            .unwrap();
         let serial_elapsed = serial_start.elapsed();
         serial.finish_exact_route(&plan).unwrap();
 
@@ -1711,7 +1727,7 @@ mod tests {
         parallel.set_io_fanout(crate::io::ReadFanout::parallel_default());
         let parallel_start = std::time::Instant::now();
         let plan = parallel
-            .prepare_exact_route(&loader, layer, &route)
+            .prepare_exact_route(&loader, &broker, layer, &route)
             .unwrap();
         let parallel_elapsed = parallel_start.elapsed();
         parallel.finish_exact_route(&plan).unwrap();
@@ -1729,6 +1745,72 @@ mod tests {
         );
     }
 
+    /// Phase 20 real-checkpoint qualification seam: loads one routed
+    /// expert's actual Q4_K payload from the canonical container, uploads it
+    /// to persistent GPU buffers, and checks both selectable GEMV kernels
+    /// (`reference` / `staged16`) against the CPU oracle chain on the real
+    /// bytes, while measuring the per-forward wall time of each kernel for
+    /// the Phase 20 A/B record (isolated microbenchmark first; decode-loop
+    /// A/B decides the default, spec §1005).
+    #[test]
+    #[cfg(feature = "metal")]
+    #[ignore = "requires the canonical .tqf checkpoint; Phase 20 real-weight GPU parity and kernel A/B"]
+    fn gpu_resident_expert_matches_cpu_forward_on_canonical_weights() {
+        use crate::backend::metal::expert::{GpuExecutionState, GpuKernelKind, GpuResidentExpert};
+        use crate::backend::reference;
+
+        let tqf = std::env::var("TQF_CANONICAL_TQF").expect("set TQF_CANONICAL_TQF");
+        let broker = MemoryBroker::new(Bytes(4 * 1024 * 1024 * 1024));
+        let loader = Qwen36WeightLoader::open(Path::new(&tqf), broker.clone()).unwrap();
+        let loaded = loader
+            .load_expert(LayerId(0), crate::ids::ExpertId(7))
+            .unwrap();
+        let [gate, up, down] = loaded.payload_parts();
+        let (expert_width, hidden) = (512usize, 2048usize);
+        let input: Vec<f32> = (0..hidden).map(|i| ((i % 11) as f32) * 0.3 - 1.5).collect();
+
+        // CPU oracle chain (same math as `LoadedQwen36Expert::forward`).
+        let cpu_gate = reference::q4k_gemv(gate, &input, expert_width, hidden);
+        let cpu_up = reference::q4k_gemv(up, &input, expert_width, hidden);
+        let cpu_activated: Vec<f32> = reference::silu(&cpu_gate)
+            .into_iter()
+            .zip(&cpu_up)
+            .map(|(g, u)| g * u)
+            .collect();
+        let cpu = reference::q4k_gemv(down, &cpu_activated, hidden, expert_width);
+
+        let mut state = GpuExecutionState::init().unwrap();
+        let gpu_expert =
+            GpuResidentExpert::upload(&state.ctx, &broker, gate, up, down, expert_width, hidden)
+                .unwrap();
+
+        let iterations = 10;
+        for kind in [GpuKernelKind::Reference, GpuKernelKind::Staged16] {
+            state.kernel_kind = kind;
+            let start = std::time::Instant::now();
+            let mut output = Vec::new();
+            for _ in 0..iterations {
+                output = gpu_expert.forward(&mut state, &input).unwrap();
+            }
+            let per_forward = start.elapsed() / iterations;
+            let max_relative = output
+                .iter()
+                .zip(&cpu)
+                .map(|(g, c)| (g - c).abs() / c.abs().max(1.0))
+                .fold(0f32, f32::max);
+            println!(
+                "phase20_real_expert_ab {:?} per_forward_ms={:.3} max_relative={:.6}",
+                kind,
+                per_forward.as_secs_f64() * 1e3,
+                max_relative
+            );
+            assert!(
+                max_relative < 5e-2,
+                "{kind:?} kernel vs CPU oracle on real Q4_K weights: max relative {max_relative}"
+            );
+        }
+    }
+
     #[test]
     fn exact_route_transaction_pins_all_selected_experts_until_finish() {
         let path = fixture_path("expert-plan.tqf");
@@ -1744,12 +1826,17 @@ mod tests {
             weights: [0.125; 8],
         };
 
-        let plan = cache.prepare_exact_route(&loader, layer, &route).unwrap();
+        let plan = cache
+            .prepare_exact_route(&loader, &broker, layer, &route)
+            .unwrap();
         assert_eq!(plan.route, route);
         assert_eq!(plan.hits, [false; 8]);
         assert_eq!(plan.miss_bytes, Bytes(expert_bytes * 8));
         for expert in route.ids {
-            assert_eq!(cache.planned_expert(&plan, expert).unwrap().expert, expert);
+            assert_eq!(
+                cache.planned_expert(&plan, expert).unwrap().stored_bytes(),
+                Bytes(expert_bytes)
+            );
         }
         let mut tampered = plan.clone();
         tampered.route.ids[0] = crate::ids::ExpertId(8);
@@ -1758,11 +1845,11 @@ mod tests {
             cache
                 .planned_expert(&plan, crate::ids::ExpertId(0))
                 .unwrap()
-                .expert,
-            crate::ids::ExpertId(0)
+                .stored_bytes(),
+            Bytes(expert_bytes)
         );
         assert!(cache
-            .get_or_load(&loader, layer, crate::ids::ExpertId(8))
+            .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(8))
             .is_err());
         assert_eq!(cache.stats().evictions, 0);
         assert_eq!(cache.stats().misses, 8);
@@ -1770,7 +1857,7 @@ mod tests {
 
         cache.finish_exact_route(&plan).unwrap();
         cache
-            .get_or_load(&loader, layer, crate::ids::ExpertId(8))
+            .get_or_load(&loader, &broker, layer, crate::ids::ExpertId(8))
             .unwrap();
         assert_eq!(cache.stats().evictions, 1);
         assert_eq!(cache.stats().misses, 9);

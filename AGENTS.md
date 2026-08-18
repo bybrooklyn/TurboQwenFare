@@ -34,10 +34,18 @@ real foundational work but is not wired into the live decode loop yet:
 - **Phase 20 (Metal perf ports):** broker-registered Metal buffer allocation
   (`MetalContext::allocate_broker_buffer*`, closing a previously-documented gap) and
   `backend::metal::expert::GpuResidentExpert` (uploads one expert's Q4_K weights to persistent GPU
-  buffers once, reused across forward calls instead of re-uploading per matvec), parity-tested on real
-  Metal hardware. Still dispatches the unfused reference `tqf_q4k_gemv` kernel (no NVMAI-style
-  threadgroup-staged fusion yet) and is not called from `experts::mod`'s live forward path, which still
-  runs on `backend::reference` CPU kernels.
+  buffers once, reused across forward calls instead of re-uploading per matvec), now wired into the
+  live decode loop: `WholeExpertLfuCache` entries are `ExpertValue::{Cpu,Gpu}`
+  (`TQF_EXPERT_GPU_RESIDENT`, sole-backing-store accounting) and the streaming site calls
+  `forward_expert`. The NVMAI-style 16-row threadgroup-staged fused GEMV
+  (`tqf_q4k_gemv_staged16`, `TQF_EXPERT_GPU_KERNEL`) exists with one-hot per-element parity
+  against the CPU dequant oracle plus single-GEMV and chained-forward parity tests; on the real
+  canonical checkpoint it measured **2.07x per-expert-forward wall time vs the reference kernel
+  (1.94 ms vs 4.01 ms) with effectively exact parity**, and is benchmark-selected as the GPU
+  path's default kernel. Full record: `docs/research/qualification/phase-20-gpu-resident-expert.md`.
+  Remaining Phase 20 ports: function-constant shape specialization, GDN four-way projection
+  fusion; a decode-loop A/B (not just the isolated microbenchmark) is still owed before any
+  default-path flip, and the GPU path itself stays opt-in.
 - **Phase 21 (global expert cache):** `WholeExpertLfuCache`'s eviction policy is now pluggable
   (`CachePolicyKind::{Lru,Lfu,DecayedCostAware}`, `TQF_EXPERT_CACHE_POLICY`/`set_policy`). A real
   128-token/40-layer route trace from the live checkpoint was captured and replayed offline

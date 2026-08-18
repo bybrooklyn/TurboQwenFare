@@ -1,4 +1,4 @@
-//! GPU-resident MoE expert weights (Phase 20 foundation, spec §112 row 20).
+//! GPU-resident MoE expert weights (Phase 20, spec §112 row 20).
 //!
 //! Uploads one routed/shared expert's gate/up/down Q4_K matrices to
 //! broker-registered Metal buffers once, then reuses those buffers across
@@ -9,26 +9,86 @@
 //! `docs/research/upstream-precedent.md`): a GPU MoE path only wins once
 //! weight upload is amortized, not paid per token.
 //!
-//! This type is deliberately not yet wired into the live decode loop —
-//! `experts::mod` still computes MoE on `backend::reference` CPU kernels,
-//! and wiring this in would double-count resident memory (CPU bytes in
-//! `LoadedQwen36Expert` plus a GPU copy here) against the same 4G budget
-//! without an eviction design that accounts for both. It is a tested,
-//! broker-safe primitive: the next step is either making it the sole
-//! backing store for a cache entry (dropping the CPU `Vec<u8>` copy, using
-//! `BufferLease::as_slice`/`write` for the unified-memory path) or teaching
-//! the cache to charge the GPU copy against the same reservation as its CPU
-//! counterpart.
+//! Wired into the live decode loop as an A/B-able path (`TQF_EXPERT_GPU_RESIDENT`,
+//! `experts::WholeExpertLfuCache`; spec invariant #10): when a cache
+//! admission happens with the flag on, the expert's Q4_K bytes are uploaded
+//! once into these buffers and the CPU copy is dropped, so the same bytes
+//! are charged to the memory broker exactly once ("sole backing store"
+//! variant, spec §50's shared-buffer expert-slot shape). The cache holds the
+//! shared execution state (`GpuExecutionState`: device, compiled kernel
+//! library, pipeline cache) behind a mutex; `forward` runs against that
+//! state.
+//!
+//! The GEMV dispatch is selectable via `TQF_EXPERT_GPU_KERNEL`
+//! (`staged16`, the benchmark-selected default, or `reference` — the Phase
+//! 20 NVMAI-derived 16-row threadgroup-staged kernel in
+//! `backend::metal::kernels` vs the Phase 11 reference kernel). The staged
+//! kernel is parity-tested against both the reference kernel and the CPU
+//! dequant oracle, and the real-checkpoint A/B that selected it as default
+//! is recorded in the Phase 20 qualification notes.
 
 use metal_sys::Library;
 
 use crate::error::Result;
+use crate::ids::Bytes;
 use crate::memory::{MemoryBroker, MemoryClass, MemoryOwner};
 
 use super::buffer::BufferLease;
 use super::context::MetalContext;
-use super::kernels::{q4k_gemv_persistent_weights, silu};
+use super::kernels::{
+    load_reference_kernel_library, q4k_gemv_persistent_weights,
+    q4k_gemv_persistent_weights_staged16, silu,
+};
 use super::pipeline::PipelineCache;
+
+/// Which Phase 20 GEMV kernel the GPU-resident expert path dispatches.
+/// Selected once per process from `TQF_EXPERT_GPU_KERNEL` (values:
+/// `reference` or `staged16`). `staged16` is the default: the real-weight
+/// canonical-checkpoint A/B measured a 2.07x per-forward wall-time win
+/// (1.94 ms vs 4.01 ms, gate/up/down chain including readbacks) with
+/// effectively exact parity against the CPU oracle, so the benchmark
+/// selected it — the env switch keeps the reference kernel reachable for
+/// regression A/B (spec §1005: microbenchmarks first, decode A/B before
+/// flipping a default; the decode-loop A/B remains outstanding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuKernelKind {
+    Reference,
+    Staged16,
+}
+
+impl GpuKernelKind {
+    pub fn from_env() -> Self {
+        match std::env::var("TQF_EXPERT_GPU_KERNEL").as_deref() {
+            Ok("reference") => Self::Reference,
+            _ => Self::Staged16,
+        }
+    }
+}
+
+/// The shared GPU execution state a `GpuResidentExpert::forward` needs:
+/// device/queue, the compiled kernel library, and the per-process pipeline
+/// cache. Created once (lazily, on first Phase 20 cache admission) and
+/// shared process-wide through `experts::WholeExpertLfuCache` so decode
+/// never re-compiles MSL or re-acquires a device.
+pub struct GpuExecutionState {
+    pub ctx: MetalContext,
+    pub library: Library,
+    pub pipelines: PipelineCache,
+    pub kernel_kind: GpuKernelKind,
+}
+
+impl GpuExecutionState {
+    pub fn init() -> Result<Self> {
+        let ctx = MetalContext::init()?;
+        let library = load_reference_kernel_library(&ctx)?;
+        Ok(Self {
+            ctx,
+            library,
+            pipelines: PipelineCache::new(),
+            kernel_kind: GpuKernelKind::from_env(),
+        })
+    }
+}
 
 pub struct GpuResidentExpert {
     gate: BufferLease,
@@ -82,50 +142,60 @@ impl GpuResidentExpert {
         })
     }
 
+    /// Brokered bytes this expert occupies in GPU buffers — identical to
+    /// the CPU payload it was uploaded from, so cache eviction accounting
+    /// (`resident_bytes`, policy utility) is the same for both variants.
+    pub fn stored_bytes(&self) -> Bytes {
+        Bytes(self.gate.length() + self.up.length() + self.down.length())
+    }
+
     /// SwiGLU-style expert forward — gate/up GEMV, `SiLU(gate) * up`, down
     /// GEMV — mirroring `experts::ResidentExpert::forward`'s math exactly,
     /// but against the persistent GPU buffers from `upload` instead of CPU
-    /// Q4_K bytes.
-    pub fn forward(
-        &self,
-        ctx: &MetalContext,
-        library: &Library,
-        pipelines: &mut PipelineCache,
-        input: &[f32],
-    ) -> Result<Vec<f32>> {
-        let gate = q4k_gemv_persistent_weights(
-            ctx,
-            library,
-            pipelines,
-            &self.gate,
-            input,
-            self.expert_width,
-            self.hidden,
-        )?;
-        let up = q4k_gemv_persistent_weights(
-            ctx,
-            library,
-            pipelines,
-            &self.up,
-            input,
-            self.expert_width,
-            self.hidden,
-        )?;
-        let activated_gate = silu(ctx, library, pipelines, &gate)?;
+    /// Q4_K bytes. `state` is the shared execution state (its pipeline
+    /// cache needs `&mut` for lazy kernel compilation). The GEMV kernel is
+    /// selected by `state.kernel_kind` (see `GpuKernelKind`).
+    pub fn forward(&self, state: &mut GpuExecutionState, input: &[f32]) -> Result<Vec<f32>> {
+        let gate = Self::gemv_matrix(state, &self.gate, input, self.expert_width, self.hidden)?;
+        let up = Self::gemv_matrix(state, &self.up, input, self.expert_width, self.hidden)?;
+        let activated_gate = silu(&state.ctx, &state.library, &mut state.pipelines, &gate)?;
         let hidden: Vec<f32> = activated_gate
             .iter()
             .zip(&up)
             .map(|(gate, up)| gate * up)
             .collect();
-        q4k_gemv_persistent_weights(
-            ctx,
-            library,
-            pipelines,
-            &self.down,
-            &hidden,
-            self.hidden,
-            self.expert_width,
-        )
+        Self::gemv_matrix(state, &self.down, &hidden, self.hidden, self.expert_width)
+    }
+
+    /// One Q4_K GEMV against a persistent weights buffer, dispatched on the
+    /// kernel selected by `state.kernel_kind` (see `GpuKernelKind`).
+    fn gemv_matrix(
+        state: &mut GpuExecutionState,
+        weights_buf: &BufferLease,
+        vector: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        match state.kernel_kind {
+            GpuKernelKind::Staged16 => q4k_gemv_persistent_weights_staged16(
+                &state.ctx,
+                &state.library,
+                &mut state.pipelines,
+                weights_buf,
+                vector,
+                rows,
+                cols,
+            ),
+            GpuKernelKind::Reference => q4k_gemv_persistent_weights(
+                &state.ctx,
+                &state.library,
+                &mut state.pipelines,
+                weights_buf,
+                vector,
+                rows,
+                cols,
+            ),
+        }
     }
 }
 
@@ -138,9 +208,9 @@ mod tests {
     use crate::format::quant::GgmlType;
     use crate::ids::Bytes;
 
-    fn ctx_or_skip() -> Option<MetalContext> {
-        match MetalContext::init() {
-            Ok(ctx) => Some(ctx),
+    fn state_or_skip() -> Option<GpuExecutionState> {
+        match GpuExecutionState::init() {
+            Ok(state) => Some(state),
             Err(_) => {
                 eprintln!("skipping Metal test: no device available in this environment");
                 None
@@ -186,11 +256,9 @@ mod tests {
 
     #[test]
     fn gpu_resident_expert_matches_cpu_reference_and_accounts_broker_bytes() {
-        let Some(ctx) = ctx_or_skip() else {
+        let Some(mut state) = state_or_skip() else {
             return;
         };
-        let library = load_reference_kernel_library(&ctx).unwrap();
-        let mut pipelines = PipelineCache::new();
 
         let (expert_width, hidden) = (512, 256); // small multiples of the Q4_K block size
         let gate_w = synthetic_q4_k_weights(expert_width, hidden, 1);
@@ -201,17 +269,22 @@ mod tests {
         let broker = MemoryBroker::new(Bytes(
             (gate_w.len() + up_w.len() + down_w.len()) as u64 + 4096,
         ));
-        let gpu_expert =
-            GpuResidentExpert::upload(&ctx, &broker, &gate_w, &up_w, &down_w, expert_width, hidden)
-                .unwrap();
+        let gpu_expert = GpuResidentExpert::upload(
+            &state.ctx,
+            &broker,
+            &gate_w,
+            &up_w,
+            &down_w,
+            expert_width,
+            hidden,
+        )
+        .unwrap();
         assert_eq!(
             broker.snapshot().reserved,
             Bytes((gate_w.len() + up_w.len() + down_w.len()) as u64)
         );
 
-        let gpu = gpu_expert
-            .forward(&ctx, &library, &mut pipelines, &input)
-            .unwrap();
+        let gpu = gpu_expert.forward(&mut state, &input).unwrap();
         let cpu = cpu_expert_forward(&gate_w, &up_w, &down_w, &input, expert_width, hidden);
 
         assert_eq!(gpu.len(), cpu.len());
@@ -231,11 +304,9 @@ mod tests {
 
     #[test]
     fn upload_reuses_buffers_across_multiple_forward_calls_without_reuploading() {
-        let Some(ctx) = ctx_or_skip() else {
+        let Some(mut state) = state_or_skip() else {
             return;
         };
-        let library = load_reference_kernel_library(&ctx).unwrap();
-        let mut pipelines = PipelineCache::new();
 
         let (expert_width, hidden) = (256, 256);
         let gate_w = synthetic_q4_k_weights(expert_width, hidden, 2);
@@ -244,23 +315,124 @@ mod tests {
         let broker = MemoryBroker::new(Bytes(
             (gate_w.len() + up_w.len() + down_w.len()) as u64 + 4096,
         ));
-        let gpu_expert =
-            GpuResidentExpert::upload(&ctx, &broker, &gate_w, &up_w, &down_w, expert_width, hidden)
-                .unwrap();
+        let gpu_expert = GpuResidentExpert::upload(
+            &state.ctx,
+            &broker,
+            &gate_w,
+            &up_w,
+            &down_w,
+            expert_width,
+            hidden,
+        )
+        .unwrap();
         let reserved_after_upload = broker.snapshot().reserved;
 
         for token in 0..3 {
             let input: Vec<f32> = (0..hidden)
                 .map(|i| ((i + token) % 7) as f32 * 0.2 - 0.5)
                 .collect();
-            let output = gpu_expert
-                .forward(&ctx, &library, &mut pipelines, &input)
-                .unwrap();
+            let output = gpu_expert.forward(&mut state, &input).unwrap();
             assert_eq!(output.len(), expert_width);
             // Repeated forward calls must not grow the broker reservation:
             // the whole point of a persistent-weights buffer is that only
             // the small per-call vector/output buffers are re-allocated.
             assert_eq!(broker.snapshot().reserved, reserved_after_upload);
+        }
+    }
+
+    #[test]
+    fn stored_bytes_equals_the_uploaded_payload_size() {
+        let Some(mut state) = state_or_skip() else {
+            return;
+        };
+        let (expert_width, hidden) = (256, 256);
+        let gate_w = synthetic_q4_k_weights(expert_width, hidden, 11);
+        let up_w = synthetic_q4_k_weights(expert_width, hidden, 12);
+        let down_w = synthetic_q4_k_weights(hidden, expert_width, 13);
+        let broker = MemoryBroker::new(Bytes(
+            (gate_w.len() + up_w.len() + down_w.len()) as u64 + 4096,
+        ));
+        let gpu_expert = GpuResidentExpert::upload(
+            &state.ctx,
+            &broker,
+            &gate_w,
+            &up_w,
+            &down_w,
+            expert_width,
+            hidden,
+        )
+        .unwrap();
+        assert_eq!(
+            gpu_expert.stored_bytes(),
+            Bytes((gate_w.len() + up_w.len() + down_w.len()) as u64)
+        );
+    }
+
+    #[test]
+    fn staged16_and_reference_kernels_agree_at_real_expert_shapes() {
+        let Some(mut state) = state_or_skip() else {
+            return;
+        };
+
+        // Real Qwen3.6 routed-expert geometry (LoadedQwen36Expert payload
+        // sizes): gate/up [512, 2048] Q4_K and down [2048, 512] Q4_K.
+        let (expert_width, hidden) = (512, 2048);
+        let gate_w = synthetic_q4_k_weights(expert_width, hidden, 101);
+        let up_w = synthetic_q4_k_weights(expert_width, hidden, 103);
+        let down_w = synthetic_q4_k_weights(hidden, expert_width, 107);
+        let input: Vec<f32> = (0..hidden).map(|i| ((i % 11) as f32) * 0.3 - 1.5).collect();
+        let broker = MemoryBroker::new(Bytes(
+            (gate_w.len() + up_w.len() + down_w.len()) as u64 + 4096,
+        ));
+        let gpu_expert = GpuResidentExpert::upload(
+            &state.ctx,
+            &broker,
+            &gate_w,
+            &up_w,
+            &down_w,
+            expert_width,
+            hidden,
+        )
+        .unwrap();
+
+        let mut results = Vec::new();
+        for kind in [GpuKernelKind::Reference, GpuKernelKind::Staged16] {
+            state.kernel_kind = kind;
+            results.push((kind, gpu_expert.forward(&mut state, &input).unwrap()));
+        }
+        let cpu = cpu_expert_forward(&gate_w, &up_w, &down_w, &input, expert_width, hidden);
+        // The down matrix is [hidden, expert_width], so a full forward
+        // returns one value per down row = hidden.
+        assert_eq!(cpu.len(), hidden);
+
+        // Each kernel family must stay within a chained-forward tolerance of
+        // the CPU oracle at real shapes. The chained level is deliberately
+        // looser than the single-GEMV tolerances asserted in
+        // `backend::metal::kernels` (which hold at these exact shapes):
+        // synthetic weight data drives the down GEMV into heavy cancellation
+        // (~99.8%: |dot| ~ 8e7 from 512 terms of ~1e8 each), and the
+        // SiLU/product chain carries correlated summation-order differences
+        // linearly instead of cancelling them. 5e-2 relative bounds the
+        // observed 2.4e-2 worst case; real Q4_K weight/activation
+        // distributions are far less adversarial, and the real-checkpoint
+        // parity test is the meaningful quality gate.
+        for (kind, gpu) in &results {
+            for (g, c) in gpu.iter().zip(&cpu) {
+                let relative = (g - c).abs() / c.abs().max(1.0);
+                assert!(
+                    relative < 5e-2,
+                    "{kind:?} kernel vs CPU oracle at real expert shapes: gpu={g} cpu={c} relative={relative}"
+                );
+            }
+        }
+        let (_, reference) = &results[0];
+        let (_, staged) = &results[1];
+        for (r, s) in reference.iter().zip(staged) {
+            let relative = (r - s).abs() / r.abs().max(1.0);
+            assert!(
+                relative < 5e-2,
+                "kernel kinds disagree at real expert shapes: reference={r} staged16={s} relative={relative}"
+            );
         }
     }
 }
