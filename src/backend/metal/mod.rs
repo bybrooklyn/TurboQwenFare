@@ -13,6 +13,7 @@
 
 pub mod buffer;
 pub mod context;
+pub mod expert;
 pub mod kernels;
 pub mod pipeline;
 pub mod shaderlib;
@@ -20,5 +21,6 @@ pub mod timing;
 
 pub use buffer::BufferLease;
 pub use context::MetalContext;
+pub use expert::GpuResidentExpert;
 pub use pipeline::PipelineCache;
 pub use timing::{EventFence, GpuStopwatch};

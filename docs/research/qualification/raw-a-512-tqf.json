@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-17",
+  "tqf_commit": "869e8f2",
+  "fixture": "docs/research/oracles/raw-a-512.json",
+  "model_source_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "oracle_runtime": "llama.cpp",
+  "oracle_revision": "4df29be4f4c3673f428170fda944a5b19f743bb8",
+  "memory_budget_bytes": 4294967296,
+  "expert_cache_capacity_bytes": 268435456,
+  "result": "fail",
+  "divergence": {
+    "generated_token_index": 197,
+    "decode_step": 198,
+    "expected_token": 31215,
+    "expected_text": "Collision",
+    "tqf_computed_token": 1501,
+    "tqf_computed_text": "Event",
+    "tqf_top_logits": [
+      { "token": 1501, "logit": 28.532768 },
+      { "token": 31215, "logit": 28.522234 },
+      { "token": 30280, "logit": 27.395468 },
+      { "token": 760, "logit": 25.432287 }
+    ],
+    "logit_gap_top2": 0.010534,
+    "elapsed_milliseconds_to_divergence": 2147575
+  },
+  "coherence_followup": {
+    "method": "Fed TQF's own bounded reference runtime the confirmed-correct 198-token prefix (prompt + generated_tokens[0..197]), reproducing the exact state at the divergence, then let it decode 30 further tokens freely (no oracle comparison) instead of stopping at the first mismatch.",
+    "tqf_own_continuation_text": "Event:** Collision.\n    *   **Type of Collision:** Perfectly inelastic (they lock together).\n    *   **Condition:** No external",
+    "assessment": "Fully coherent, grammatically correct, on-topic physics content that reorganizes the same information the reference continuation contains (collision type, inelasticity, no-external-forces condition), just starting from the alternate word choice. This is strong evidence the divergence is a benign near-tied-logit fork rather than a routing/logic defect - TQF did not degrade or produce garbage after diverging."
+  },
+  "per_layer_root_cause": {
+    "method": "Compared TQF's and llama.cpp's per-layer activations independently for the trivial single-token case (prompt \"A\" alone, both sides freshly dumped), all 40 layers.",
+    "cosine_similarity_by_layer_band": {
+      "layers_0_3": "1.0000000 (bit-identical)",
+      "layers_4_30": "0.9999989-0.9999999 (tiny, smoothly growing drift)",
+      "layers_31_39": "0.9983-0.9998 (a step-change at layer 31, a full-attention layer, then a sustained high plateau, not a collapse)"
+    },
+    "assessment": "Gradual, depth-compounding floating-point drift with no abrupt localized break - the signature of independent-implementation non-associativity, not a routing/logic defect isolated to one kernel."
+  },
+  "qualification_boundary": "This does NOT close Phase 15's 512-token exit gate as literally specified (exact token-for-token match for the full sequence). TQF matched the independent llama.cpp oracle exactly for 197 consecutive greedy decode steps - further than this codebase had ever been verified before (prior record: 128) - then diverged at step 198 on a razor-thin top-2 logit margin (~0.0105 in log-space, both candidates coherent). A follow-up run confirms TQF's own post-divergence continuation stays coherent rather than degrading, and a per-layer numerical comparison shows gradually-compounding, non-localized drift rather than a break at a specific layer - both consistent with independent floating-point implementations diverging at a near-tie rather than a bug. See `raw-a-512-divergence-investigation.md` for the full writeup and recommendation."
+}

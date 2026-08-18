@@ -1307,6 +1307,7 @@ impl Qwen36WeightLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::experts::policy::CachePolicyKind;
     use crate::experts::{RouterResult, WholeExpertLfuCache};
     use crate::format::tqf::{canonical_header, TqfSectionKind, TqfWriter};
 
@@ -1585,6 +1586,11 @@ mod tests {
         let loader = Qwen36WeightLoader::open(&path, broker.clone()).unwrap();
         let metadata_bytes = broker.snapshot().reserved.0;
         let mut cache = WholeExpertLfuCache::new(Bytes(expert_bytes * 2));
+        // This test asserts frequency-based eviction order specifically, so
+        // pin the policy explicitly rather than relying on whatever the
+        // Phase 21 benchmark-selected default happens to be (currently LRU,
+        // see `DEFAULT_CACHE_POLICY`).
+        cache.set_policy(CachePolicyKind::Lfu, 1);
         let layer = LayerId(0);
 
         assert_eq!(
@@ -1628,6 +1634,99 @@ mod tests {
         drop(loader);
         assert_eq!(broker.snapshot().reserved, Bytes(0));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_policy_is_pluggable_between_lfu_and_lru_for_the_same_access_pattern() {
+        let path = fixture_path("expert-cache-policy.tqf");
+        build_complete_fixture(&path, None, None, 3);
+        let expert_bytes = (LoadedQwen36Expert::GATE_BYTES * 3) as u64;
+        let layer = LayerId(0);
+
+        // Expert 0 ends up higher-frequency but less-recently-used than
+        // expert 1; a third distinct expert then forces exactly one
+        // eviction. LFU and LRU must disagree about which of {0, 1} that is
+        // - this is the live-cache counterpart to
+        // `policy::tests::lfu_retains_repeated_entries_that_lru_would_evict`.
+        let expert_zero_survives = |policy: CachePolicyKind| {
+            let broker = MemoryBroker::new(Bytes(expert_bytes * 2 + 1024 * 1024));
+            let loader = Qwen36WeightLoader::open(&path, broker.clone()).unwrap();
+            let mut cache = WholeExpertLfuCache::new(Bytes(expert_bytes * 2));
+            cache.set_policy(policy, 160);
+            cache
+                .get_or_load(&loader, layer, crate::ids::ExpertId(0))
+                .unwrap();
+            cache
+                .get_or_load(&loader, layer, crate::ids::ExpertId(0))
+                .unwrap();
+            cache
+                .get_or_load(&loader, layer, crate::ids::ExpertId(1))
+                .unwrap();
+            cache
+                .get_or_load(&loader, layer, crate::ids::ExpertId(2))
+                .unwrap();
+            let misses_before = cache.stats().misses;
+            cache
+                .get_or_load(&loader, layer, crate::ids::ExpertId(0))
+                .unwrap();
+            cache.stats().misses == misses_before
+        };
+
+        assert!(
+            expert_zero_survives(CachePolicyKind::Lfu),
+            "LFU should keep the higher-frequency expert 0 resident"
+        );
+        assert!(
+            !expert_zero_survives(CachePolicyKind::Lru),
+            "LRU should have evicted the less-recently-used expert 0"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint; measures Phase 19 parallel vs serial expert I/O wall time"]
+    fn parallel_io_fanout_meaningfully_beats_serial_on_the_canonical_checkpoint() {
+        let tqf = std::env::var("TQF_CANONICAL_TQF").expect("set TQF_CANONICAL_TQF");
+        let cache_bytes = Bytes(LoadedQwen36Expert::canonical_stored_bytes().0 * 8);
+        let broker = MemoryBroker::new(Bytes(4 * 1024 * 1024 * 1024));
+        let loader = Qwen36WeightLoader::open(Path::new(&tqf), broker.clone()).unwrap();
+        let layer = LayerId(0);
+        // Eight distinct experts guarantees eight independent cold-cache
+        // misses per run - the exact shape Phase 19's parallel fan-out
+        // targets (NVMAI R9: "parallelizes only independently reserved
+        // cache misses").
+        let route = RouterResult {
+            ids: std::array::from_fn(|index| crate::ids::ExpertId(index as u16)),
+            weights: [0.125; 8],
+        };
+
+        let mut serial = WholeExpertLfuCache::new(cache_bytes);
+        serial.set_io_fanout(crate::io::ReadFanout::Serial);
+        let serial_start = std::time::Instant::now();
+        let plan = serial.prepare_exact_route(&loader, layer, &route).unwrap();
+        let serial_elapsed = serial_start.elapsed();
+        serial.finish_exact_route(&plan).unwrap();
+
+        let mut parallel = WholeExpertLfuCache::new(cache_bytes);
+        parallel.set_io_fanout(crate::io::ReadFanout::parallel_default());
+        let parallel_start = std::time::Instant::now();
+        let plan = parallel
+            .prepare_exact_route(&loader, layer, &route)
+            .unwrap();
+        let parallel_elapsed = parallel_start.elapsed();
+        parallel.finish_exact_route(&plan).unwrap();
+
+        println!(
+            "phase19_io_fanout_benchmark serial_ms={} parallel_ms={} speedup={:.2}x",
+            serial_elapsed.as_millis(),
+            parallel_elapsed.as_millis(),
+            serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(1e-9)
+        );
+        assert!(
+            parallel_elapsed < serial_elapsed,
+            "parallel I/O fan-out ({parallel_elapsed:?}) should beat serial ({serial_elapsed:?}) \
+             on real SSD reads of eight independent cold experts"
+        );
     }
 
     #[test]

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-17",
+  "tqf_commit": "869e8f2",
+  "fixture": "docs/research/oracles/raw-b-512.json",
+  "model_source_sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+  "oracle_runtime": "llama.cpp",
+  "oracle_revision": "4df29be4f4c3673f428170fda944a5b19f743bb8",
+  "memory_budget_bytes": 4294967296,
+  "expert_cache_capacity_bytes": 1073741824,
+  "result": "fail",
+  "divergence": {
+    "generated_token_index": 24,
+    "decode_step": 25,
+    "expected_token": 913,
+    "tqf_computed_token": 4252,
+    "tqf_top_logits": [
+      { "token": 4252, "logit": 16.453129 },
+      { "token": 913, "logit": 16.374823 },
+      { "token": 5839, "logit": 16.205936 },
+      { "token": 5759, "logit": 16.125748 }
+    ],
+    "logit_gap_top2": 0.078306,
+    "elapsed_milliseconds_to_divergence": 550470,
+    "cache_hits_at_divergence": 3053,
+    "cache_misses_at_divergence": 4947
+  },
+  "qualification_boundary": "This is the second independent 512-token attempt (see raw-a-512-tqf.json for the first, prompt \"A\", diverged at token 197). This one used a different prompt (\"The\", an unrelated multiple-choice-quiz continuation), a direct-token-ID oracle capture method (no retokenization step, eliminating that risk factor entirely), and the corrected 1 GiB production-realistic expert cache (up from the qualification harness's prior 256 MiB default - cache hits are real and growing here, unlike every prior run). It diverged much earlier (token 24, not 197) on another razor-thin top-2 logit gap. Two independent prompts hitting comparable near-ties, one within the first 25 tokens, is strong evidence that near-total logit ties recur often enough in this model/quantization that literal 512-token exact-match is not a reasonably reachable bar by trying different prompts - see raw-a-512-divergence-investigation.md for the full analysis and updated conclusion."
+}

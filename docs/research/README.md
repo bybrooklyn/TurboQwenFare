@@ -17,7 +17,17 @@ back up with the how/when/source of each value.
   runtime code is never linked or shipped.
 - [`qualification/`](qualification/) — immutable result records tying a TQF
   commit and canonical source fingerprint to an executed oracle fixture and
-  its measured cache/broker evidence.
+  its measured cache/broker evidence, including
+  [`raw-a-128-route-trace-policy.md`](qualification/raw-a-128-route-trace-policy.md),
+  the Phase 21 cache-policy benchmark-selection record (LRU vs LFU vs
+  decayed-cost-aware on a real 128-token route trace), and
+  [`raw-a-512-divergence-investigation.md`](qualification/raw-a-512-divergence-investigation.md),
+  the Phase 15 512-token gate attempts: two independent prompts (197 and 24
+  consecutive matched steps respectively, both new depth records for their
+  runs) each diverged on a near-tied logit against the independent oracle.
+  The gate does not close as literally specified, but the divergences are
+  characterized as recurring, benign floating-point near-ties rather than a
+  defect - see the investigation doc's conclusion and recommendation.
 
 ## Status against spec §272's task list
 

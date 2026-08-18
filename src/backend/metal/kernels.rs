@@ -20,6 +20,7 @@ use crate::error::{BackendError, Result};
 use crate::format::quant::dequant::Q4_K_BLOCK_ELEMENTS;
 use crate::format::quant::GgmlType;
 
+use super::buffer::BufferLease;
 use super::context::MetalContext;
 use super::pipeline::PipelineCache;
 
@@ -262,6 +263,45 @@ pub fn q4k_gemv(
     cols: usize,
 ) -> Result<Vec<f32>> {
     assert_q4k_weights_shape(weights, rows, cols);
+    let weights_buf = ctx.allocate_buffer_with_data(weights, "q4k-gemv-weights");
+    dispatch_q4k_gemv_buffer(ctx, library, pipelines, &weights_buf, vector, rows, cols)
+}
+
+/// Same computation as `q4k_gemv`, but against a weights buffer the caller
+/// already uploaded (e.g. once, at expert-cache admission time) instead of
+/// re-uploading `rows*cols` Q4_K bytes on every call. This is the primitive
+/// Phase 20's GPU-resident expert path is built on: NVMAI-style throughput
+/// gains are only real once the weight upload is amortized across many
+/// decode steps rather than paid per matvec.
+pub fn q4k_gemv_persistent_weights(
+    ctx: &MetalContext,
+    library: &Library,
+    pipelines: &mut PipelineCache,
+    weights_buf: &BufferLease,
+    vector: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>> {
+    let block_bytes = GgmlType::Q4K.block_bytes() as usize;
+    let expected = (rows * blocks_per_row(cols) * block_bytes) as u64;
+    assert_eq!(
+        weights_buf.length(),
+        expected,
+        "persistent weights buffer is {} bytes, expected {expected} for a {rows}x{cols} Q4_K matrix",
+        weights_buf.length()
+    );
+    dispatch_q4k_gemv_buffer(ctx, library, pipelines, weights_buf, vector, rows, cols)
+}
+
+fn dispatch_q4k_gemv_buffer(
+    ctx: &MetalContext,
+    library: &Library,
+    pipelines: &mut PipelineCache,
+    weights_buf: &BufferLease,
+    vector: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>> {
     assert_eq!(
         vector.len(),
         cols,
@@ -269,7 +309,6 @@ pub fn q4k_gemv(
         vector.len()
     );
 
-    let weights_buf = ctx.allocate_buffer_with_data(weights, "q4k-gemv-weights");
     let vector_buf = ctx.allocate_buffer_with_data(f32_slice_to_bytes(vector), "q4k-gemv-vector");
     let out_buf = ctx.allocate_buffer((rows * 4).max(4) as u64, "q4k-gemv-out");
     let cols_buf = ctx.allocate_buffer_with_data(&(cols as u32).to_le_bytes(), "q4k-gemv-cols");

@@ -7,6 +7,8 @@
 use metal_sys::{CommandQueue, Device, MTLResourceOptions};
 
 use crate::error::{BackendError, Result};
+use crate::ids::Bytes;
+use crate::memory::{MemoryBroker, MemoryClass, MemoryOwner};
 
 use super::buffer::BufferLease;
 
@@ -71,6 +73,56 @@ impl MetalContext {
         buffer.set_label(label);
         BufferLease::new(buffer, label.to_string())
     }
+
+    /// Broker-registered counterpart to `allocate_buffer`: reserves `length`
+    /// bytes with `broker` *before* the physical Metal allocation happens
+    /// (spec invariant #4), and ties the reservation's lifetime to the
+    /// returned `BufferLease` so dropping the buffer frees the budget too.
+    /// This is the allocation path Phase 20 GPU-resident state should use;
+    /// the un-registered `allocate_buffer*` methods above remain only for
+    /// the pre-broker synthetic-benchmark/kernel-parity call sites.
+    pub fn allocate_broker_buffer(
+        &self,
+        broker: &MemoryBroker,
+        owner: MemoryOwner,
+        class: MemoryClass,
+        length: u64,
+        label: &str,
+    ) -> Result<BufferLease> {
+        let lease = broker.reserve(owner, class, Bytes(length), 64)?;
+        let buffer = self
+            .device
+            .new_buffer(length, MTLResourceOptions::StorageModeShared);
+        buffer.set_label(label);
+        Ok(BufferLease::new_with_lease(
+            buffer,
+            label.to_string(),
+            lease,
+        ))
+    }
+
+    /// Same as `allocate_broker_buffer`, but copies `data` in immediately.
+    pub fn allocate_broker_buffer_with_data(
+        &self,
+        broker: &MemoryBroker,
+        owner: MemoryOwner,
+        class: MemoryClass,
+        data: &[u8],
+        label: &str,
+    ) -> Result<BufferLease> {
+        let lease = broker.reserve(owner, class, Bytes(data.len() as u64), 64)?;
+        let buffer = self.device.new_buffer_with_data(
+            data.as_ptr().cast(),
+            data.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        buffer.set_label(label);
+        Ok(BufferLease::new_with_lease(
+            buffer,
+            label.to_string(),
+            lease,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +169,69 @@ mod tests {
         let lease = ctx.allocate_buffer_with_data(&data, "test-buffer-data");
         assert_eq!(lease.length(), 256);
         assert_eq!(lease.as_slice(), data.as_slice());
+    }
+
+    #[test]
+    fn broker_buffer_reserves_before_allocating_and_releases_on_drop() {
+        let Some(ctx) = context_or_skip() else {
+            return;
+        };
+        let broker = crate::memory::MemoryBroker::new(Bytes(4096));
+        let lease = ctx
+            .allocate_broker_buffer(
+                &broker,
+                MemoryOwner::ExpertPinned,
+                MemoryClass::Elastic,
+                1024,
+                "broker-buffer",
+            )
+            .unwrap();
+        assert_eq!(lease.length(), 1024);
+        assert_eq!(broker.snapshot().reserved, Bytes(1024));
+        drop(lease);
+        assert_eq!(broker.snapshot().reserved, Bytes(0));
+    }
+
+    #[test]
+    fn broker_buffer_over_budget_is_rejected_before_any_metal_allocation() {
+        let Some(ctx) = context_or_skip() else {
+            return;
+        };
+        let broker = crate::memory::MemoryBroker::new(Bytes(512));
+        let error = match ctx.allocate_broker_buffer(
+            &broker,
+            MemoryOwner::ExpertPinned,
+            MemoryClass::Elastic,
+            4096,
+            "too-big",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("expected an over-budget reservation to fail"),
+        };
+        assert!(
+            error.to_string().to_lowercase().contains("budget")
+                || error.to_string().to_lowercase().contains("memory")
+        );
+        assert_eq!(broker.snapshot().reserved, Bytes(0));
+    }
+
+    #[test]
+    fn broker_buffer_with_data_round_trips_contents() {
+        let Some(ctx) = context_or_skip() else {
+            return;
+        };
+        let broker = crate::memory::MemoryBroker::new(Bytes(4096));
+        let data = vec![0x5Au8; 256];
+        let lease = ctx
+            .allocate_broker_buffer_with_data(
+                &broker,
+                MemoryOwner::ExpertPinned,
+                MemoryClass::Elastic,
+                &data,
+                "broker-buffer-data",
+            )
+            .unwrap();
+        assert_eq!(lease.as_slice(), data.as_slice());
+        assert_eq!(broker.snapshot().reserved, Bytes(256));
     }
 }

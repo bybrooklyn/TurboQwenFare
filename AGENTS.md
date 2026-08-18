@@ -19,16 +19,42 @@ The spec uses a decision-status vocabulary that controls how much latitude an im
 
 Implementation coverage now extends through the Phase 18 reference/bounded baseline: BF16 virtual-GQA
 full attention, exact MoE routing/shared/routed computation, a 40-layer decode graph, normalized
-OpenAI streaming adapters, canonical download/conversion/receipt startup, and a whole-expert LFU
-cache with exact load plans. A pinned real Q4_K_M checkpoint passes source and installed-container
+OpenAI streaming adapters, canonical download/conversion/receipt startup, and a whole-expert cache
+with exact load plans. A pinned real Q4_K_M checkpoint passes source and installed-container
 topology validation, release headless server probes, and exact 1-, 16-, and 128-token greedy comparisons
-against a pinned external oracle. This is not equivalent to closing every Phase 13-18 exit gate:
-Phase 15's broader workload matrix and 512-token length (especially the required 512-token
-reference sequence), OS-observed 4 GiB
-qualification, the >=15 tok/s floor, combined <=1% quality qualification, plain GUI startup, and
-RTX 3070 Ti/CUDA qualification remain open. Phase 19 and later implementation is not started. Check
-the current code, tests, and `docs/research/canonical-source-manifest.md` before making a stronger
-status claim.
+against a pinned external oracle.
+
+Phases 19 and 21 are also implemented and qualified with measured real-hardware evidence; Phase 20 has
+real foundational work but is not wired into the live decode loop yet:
+- **Phase 19 (parallel expert I/O):** `src/io/mod.rs` (`ReadFanout`/`fetch_all`) fans independently
+  reserved expert-cache misses across a bounded thread pool, wired as the default in
+  `WholeExpertLfuCache::prepare_exact_route` (`src/experts/mod.rs`); the Phase 18 serial path stays
+  selectable via `TQF_EXPERT_IO_FANOUT` for A/B. Measured on the real checkpoint: 29.5x wall-time
+  reduction for one exact route's independent misses (107ms serial vs 3ms parallel).
+- **Phase 20 (Metal perf ports):** broker-registered Metal buffer allocation
+  (`MetalContext::allocate_broker_buffer*`, closing a previously-documented gap) and
+  `backend::metal::expert::GpuResidentExpert` (uploads one expert's Q4_K weights to persistent GPU
+  buffers once, reused across forward calls instead of re-uploading per matvec), parity-tested on real
+  Metal hardware. Still dispatches the unfused reference `tqf_q4k_gemv` kernel (no NVMAI-style
+  threadgroup-staged fusion yet) and is not called from `experts::mod`'s live forward path, which still
+  runs on `backend::reference` CPU kernels.
+- **Phase 21 (global expert cache):** `WholeExpertLfuCache`'s eviction policy is now pluggable
+  (`CachePolicyKind::{Lru,Lfu,DecayedCostAware}`, `TQF_EXPERT_CACHE_POLICY`/`set_policy`). A real
+  128-token/40-layer route trace from the live checkpoint was captured and replayed offline
+  (`experts::policy::replay_trace`); LRU measured ~36% fewer bytes fetched than LFU at cache
+  capacities that get any reuse at all, and is now the default (`DEFAULT_CACHE_POLICY`). Full record:
+  `docs/research/qualification/raw-a-128-route-trace-policy.md`.
+
+This is not equivalent to closing every Phase 13-18/19-21 exit gate. Still open: Phase 15's broader
+workload matrix and its literal 512-token exact-match requirement (two independent 512-token attempts
+were made and both diverged on a near-tied logit around token 197 and token 24 respectively — see
+`docs/research/qualification/raw-a-512-divergence-investigation.md` for the full root-cause writeup;
+short version: this looks like ordinary floating-point non-associativity between TQF and the
+independent oracle rather than a defect, but the literal exit gate as worded does not close), OS-observed
+4 GiB qualification, the >=15 tok/s floor, combined <=1% quality qualification, plain GUI startup, and
+RTX 3070 Ti/CUDA qualification. Phase 20's kernel fusion and live-loop wiring, and Phase 22 and later,
+are not started. Check the current code, tests, and `docs/research/canonical-source-manifest.md` before
+making a stronger status claim.
 
 ## Commands
 

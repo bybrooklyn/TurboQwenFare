@@ -79,6 +79,107 @@ No NVMAI source has been copied into TQF at this point. Any later direct code
 adaptation must carry the Apache-2.0 notice and prominent modification marker
 required by the specification.
 
+### NVMAI v3.9 re-mining (2026-08-17)
+
+NVMAI moves fast (per the user, "being updated very often"); the clone at
+`/Volumes/flash1/tqf-research/NVMAI` was fast-forwarded from `fd8234b` to
+`ec10e6a` (tag `v3.9`, 48 commits, 2026-08-16 to 2026-08-17). Two of NVMAI's
+own docs (`docs/v4-core-design.md`, `docs/cpu-coexecution-plan.md`) were read
+in full rather than skimming commit messages; both self-report measurements
+and, notably, retract an earlier wrong estimate in the same document more
+than once - a "measure, then correct the estimate" discipline the TQF spec
+also demands (invariant #10-adjacent). No NVMAI source was copied into TQF.
+
+**Directly actionable for TQF's open work:**
+
+- **Cache-size undersizing is a cliff, not a slope, once you stop trusting
+  the OS page cache.** NVMAI measured two different regimes: with the page
+  cache allowed to backstop misses, a *small* slot cache (16) beat a large
+  one (128) by ~35% - the OS was quietly holding the real working set that
+  "declared RAM" never counted. With page-cache backstop disabled
+  (`NVMAI_BOUNDED_IO`, `F_NOCACHE`) - the regime TQF's own invariants
+  already commit to (do-not-do-list: "do not rely on unreported OS page
+  cache to justify a memory claim") - the ordering **inverts**: 16 slots
+  cost 2.2x the throughput of 128 (8.73 vs 18.91 tok/s), because a miss with
+  no cache behind it is a real device read with nothing to fall back on.
+  This directly cross-validates and sharpens TQF's own Phase 21 finding
+  (`raw-a-128-route-trace-policy.md`): the 256 MiB expert-cache capacity
+  used in qualification gets *zero* reuse under any policy (LRU/LFU/decayed)
+  - it is sitting exactly in the dead zone NVMAI's cliff describes. Picking
+  a production cache capacity should treat "below the reuse floor" as a
+  cliff to stay clear of, not a knob to shave for memory headroom.
+- **Predictive expert prefetch (spec Phase 23) is structurally impossible
+  as usually conceived, not just unproven.** NVMAI replayed a real
+  383-token routing trace against a simulated per-layer LRU cache: any
+  cache of >=16 slots is never evicted within one token, so an expert used
+  at layer L in token N-1 is *still resident* at token N. The predictable
+  set (previous token's experts) and the actual miss set are therefore
+  disjoint by construction - **0.00% of misses were catchable by
+  previous-token prediction, at both 16 and 128 slots.** The real 38%
+  token-to-token expert-reuse figure is genuine but already fully captured
+  by the cache itself; there is nothing left for a predictor to add across
+  layers, because layer L+1's routing is not known until layer L's router
+  actually runs. TQF should not plan Phase 23 as "predict from recent
+  history"; if prefetch has value at all it would need a different
+  information source (e.g. the router's own hidden state pre-argmax),
+  which NVMAI did not explore.
+- **KV/context buffers: reserve on demand, not for max-context up front.**
+  Full-attention KV layers sized for NVMAI's full 262144-token ceiling cost
+  **1.63x slower decode even on a 25-token conversation**, purely from
+  mapping overhead destroying locality despite lazy touching keeping RSS
+  low. Growing from an 8192-token start and doubling on demand brought this
+  to 1.02x (byte-identical output). The mechanism - a huge reserved stride
+  hurts locality even when its extra pages are never written - is
+  architecture-independent and worth checking against TQF's own
+  `context/tqkv` allocation strategy once that work starts.
+- **A cheap, directly portable decode-loop reordering, once Phase 20 wires
+  compute into the live loop:** dispatch the shared-expert MLP's GPU work
+  as soon as its only dependency (`routedX`) is ready, rather than encoding
+  it after the CPU blocks on the router round-trip. Pure submission-order
+  change, no new synchronization, byte-identical output; NVMAI measured GPU
+  idle time in that transition drop from 7.881 to 0.016 ms/token.
+
+**Two negative results worth banking as "don't try this" before Phase 20
+temptation strikes:**
+
+- **CPU/GPU co-execution during decode measured 22.6% *slower*** (8-thread
+  CPU expert-FFN kernel running concurrently with GPU decode), because CPU
+  and GPU share one memory controller and one power budget on Apple
+  Silicon - a "free idle core" is not free once it actually computes.
+  NVMAI's own verdict: "there is no split ratio that wins." Relevant
+  because TQF's spec architecture (memory broker, CPU SIMD as a first-class
+  storage-chain participant) makes this specific idea plausible to propose
+  later.
+- **Consolidating Metal command buffers (fewer, larger submissions)
+  measured *slower*** (-4.6% median, not the predicted +12-15%), because
+  merging serializes encode-then-commit and loses CPU/GPU pipelining that
+  splitting was buying. Reverted in NVMAI.
+
+**Confirmed unchanged:** no follow-on work to R11 (MoE phase-1 MSL rewrite)
+or R13 (fused GDN input projections) landed in this window - the fusion
+techniques TQF still hasn't ported are exactly as NVMAI left them in the
+2026-08-16 re-mining above. One useful calibration point did land: NVMAI's
+own *already-fused* MoE kernels measured only ~13-15% of theoretical Apple
+Silicon GPU peak (~600 GFLOP/s of ~4 TFLOP/s), from 4-bit dequant ALU cost
+alone, confirmed via `xcrun xctrace` at max clocks (not a stall or thermal
+artifact) - a realistic ceiling to calibrate TQF's own eventual fusion work
+against rather than expecting near-peak throughput.
+
+**Explicitly out of TQF's scope:** an extended Apple Neural Engine (ANE)
+investigation arc (~15 commits) found ANE offload during decode is a clear
+negative (same shared-memory-controller problem as CPU co-execution) but
+ANE for *prefill* is a genuine, well-measured win (attention alone 15-19x
+faster at width 256-1024, prefill is compute- not bandwidth-bound). This is
+a CoreML/ANE-specific path with no Metal/CUDA analog and TQF's spec is
+Metal/CUDA only - not actionable beyond the general caution that prefill
+kernels can plausibly be several times more efficient before reaching for
+exotic hardware. Also closed as dead ends (routine, not techniques worth
+tracking further): 6-bit quantization (packing inefficiency, withdrawn
+entirely), lossless weight-compression (a full 40-layer x 256-expert scan
+found representative layers at 93% of their entropy limit - already
+near-incompressible), and a fused-GPU-argmax greedy head (~3% slower, not
+faster).
+
 ### Findings → TQF actions (spec §15, reproduced for local reference)
 
 | NVMAI finding | Measured effect | TQF action |
@@ -110,12 +211,65 @@ required by the specification.
 Recorded here as a checklist for whichever phase first has a working Metal
 decode loop to benchmark against (earliest: Phase 15, "end-to-end decode"):
 
-- [ ] Reproduce the parallel-pread I/O-wall improvement (R9) on the M4
-      reference target before porting the technique as a default.
+- [x] Port the parallel-pread technique (R9) itself: `src/io/mod.rs`
+      (`ReadFanout`/`fetch_all`) fans independently reserved expert-cache
+      misses across a bounded thread pool, reusing `TqfReader`'s existing
+      `pread`-based positional reads (`FileExt::read_exact_at`, safe to call
+      concurrently on `&self`). Wired as the default in
+      `WholeExpertLfuCache::prepare_exact_route`
+      (`src/experts/mod.rs`), with the Phase 18 serial path kept selectable
+      via `TQF_EXPERT_IO_FANOUT`/`set_io_fanout` for A/B (spec invariant
+      #10). Parity + worker-bounding + deterministic-first-error covered by
+      `io::tests`; a real-checkpoint wall-time comparison exists as
+      `model::qwen36::weights::tests::parallel_io_fanout_meaningfully_beats_serial_on_the_canonical_checkpoint`
+      (`#[ignore]`, needs `TQF_CANONICAL_TQF`).
+- [x] Ran that benchmark on the real checkpoint (2026-08-17): one exact
+      route's worth of eight independent cold expert misses took 107ms
+      serial versus 3ms with the default 4-worker parallel fan-out - a
+      **29.5x** wall-time reduction. This is a narrower, more extreme metric
+      than R9's own end-to-end figure (~41.2->30.9 ms/token I/O wall, a
+      ~1.33x reduction folded into overall decode) because it isolates pure
+      I/O wall time for one batch of misses rather than amortizing it across
+      a full decode step; the gap is plausibly explained by per-syscall/seek
+      latency on this specific drive being maskable by concurrent dispatch
+      but not by strictly sequential reads. The parallel default is now
+      qualified, not just implemented, on this reference machine - a
+      different drive (e.g. a faster NVMe enclosure) would be expected to
+      narrow this gap, since faster media has less per-request latency to
+      hide behind concurrency in the first place.
 - [ ] Reproduce the 64-slot cache/pinning result (R10) against TQF's own
       global broker design, not NVMAI's per-layer allocation.
 - [ ] Reproduce the MoE MSL stage-time reduction (R11) — note this needs
       Qwen3.6-specific kernel work anyway, so "reproduce" here means
       confirming the *technique* transfers, not reusing the kernel as-is.
+      **Foundation landed, fusion not started:** `backend::metal::expert::GpuResidentExpert`
+      uploads one expert's gate/up/down Q4_K matrices to broker-registered
+      persistent Metal buffers once (`MetalContext::allocate_broker_buffer*`,
+      also new) and reuses them across forward calls instead of re-uploading
+      per matvec — the prerequisite the R11 finding itself depends on
+      ("a GPU MoE path only wins once weight upload is amortized"). It
+      still dispatches the unfused reference `tqf_q4k_gemv` kernel three
+      times per expert (no threadgroup-staged shared activation, no 16
+      rows/512-thread group), is not wired into the live decode loop
+      (`experts::mod` still calls `backend::reference`), and its GPU buffer
+      is a second copy alongside the CPU `LoadedQwen36Expert` bytes rather
+      than a unified-memory zero-copy view — so it does not yet double as
+      the cache's sole resident storage. Parity-tested on real Metal
+      hardware in `backend::metal::expert::tests`.
 - [ ] Confirm or refute the CPU MTP negative result (R15) on TQF's own
       broker/memory model before ruling out a CPU draft path permanently.
+- [ ] Check whether TQF's production expert-cache capacity (not just its
+      Phase 21 policy) sits above the reuse floor the 2026-08-17 NVMAI
+      re-mining found (`raw-a-128-route-trace-policy.md`'s 256 MiB
+      qualification default is confirmed to sit in the zero-reuse dead
+      zone at every policy tested; NVMAI's independent measurement puts
+      undersizing below that floor at a 2.2x throughput cliff under
+      genuinely bounded I/O, not a gentle slope).
+- [x] Phase 23 predictive prefetch, previous-token variant: NVMAI's
+      2026-08-17 replay against a real 383-token trace found 0.00% of
+      cache misses catchable by previous-token prediction at any cache
+      size >=16 slots (the predictable set and the miss set are disjoint
+      by construction once the cache exceeds one token's expert count).
+      TQF should not plan Phase 23 around this specific approach; a
+      different information source (e.g. pre-argmax router hidden state)
+      would be needed and has not been explored by either project.

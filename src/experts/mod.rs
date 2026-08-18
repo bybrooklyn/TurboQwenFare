@@ -9,7 +9,9 @@ pub mod policy;
 use crate::backend::reference::{q4k_gemv, sigmoid, silu};
 use crate::dev::inventory::TensorRole;
 use crate::error::{ModelError, Result};
+use crate::experts::policy::CachePolicyKind;
 use crate::ids::{Bytes, ExpertId, LayerId};
+use crate::io::ReadFanout;
 use crate::memory::{MemoryBroker, MemoryClass, MemoryOwner};
 use crate::model::qwen36::geometry::Qwen36Geometry;
 use crate::model::qwen36::weights::{
@@ -160,10 +162,21 @@ struct CachedExpert {
     value: LoadedQwen36Expert,
 }
 
-/// Global, whole-expert LFU cache. The cache plans from the *actual* router
+/// Global, whole-expert cache. The cache plans from the *actual* router
 /// result and never influences its IDs or weights. It has a dedicated byte
 /// cap below the broker's global budget; entries retain their broker leases
 /// and are dropped before a new expert allocation is attempted.
+///
+/// Eviction uses a pluggable `CachePolicyKind` (Phase 21, spec §112 row 21).
+/// The type keeps its original name for continuity with the Phase 15-18
+/// qualification history (cache policy only changes I/O volume, never a
+/// computed result, so those correctness qualifications remain valid under
+/// any policy) even though the *default* is no longer LFU: a real 128-token
+/// route-trace replay (`docs/research/qualification/raw-a-128-route-trace-policy.md`)
+/// measured LRU beating LFU by a wide margin, so `DEFAULT_CACHE_POLICY` is
+/// now `Lru`. The admission/eviction utility function is the same one
+/// `policy::replay_trace` uses offline, so a future benchmark winner can
+/// replace the default by changing that one constant.
 pub struct WholeExpertLfuCache {
     capacity: Bytes,
     resident_bytes: Bytes,
@@ -172,6 +185,43 @@ pub struct WholeExpertLfuCache {
     active_plan: Option<ExpertLoadPlan>,
     stats: ExpertCacheStats,
     entries: Vec<CachedExpert>,
+    io_fanout: ReadFanout,
+    policy: CachePolicyKind,
+    half_life_events: u64,
+}
+
+/// Env var read once per cache so a deployment/benchmark can force the
+/// Phase 18 serial baseline back on without a code change (spec invariant
+/// #10). Unset or unparseable values keep the Phase 19 parallel default.
+const IO_FANOUT_ENV: &str = "TQF_EXPERT_IO_FANOUT";
+
+/// Env var selecting the eviction policy (`lru`, `lfu`, `decayed-cost-aware`)
+/// for the same A/B purpose. Unset or unparseable values keep the Phase
+/// 15-18-proven LFU default.
+const CACHE_POLICY_ENV: &str = "TQF_EXPERT_CACHE_POLICY";
+
+/// Default decay half-life for `DecayedCostAware`, in cache-route events;
+/// matches the sweep in `policy::tests::qualification_trace_replays_all_phase21_policy_candidates`.
+const DEFAULT_HALF_LIFE_EVENTS: u64 = 160;
+
+/// Phase 21 benchmark-selected default (spec §112 row 21, "the benchmark
+/// winner becomes default"): a real 128-token/40-layer route trace
+/// (`docs/research/qualification/raw-a-128-route-trace-policy.md`) shows LRU
+/// beating LFU by a wide margin at every cache capacity large enough to get
+/// any reuse at all (e.g. 1 GiB: 35.9 GB vs 56.1 GB raw miss bytes over the
+/// same 128-token run - a 36% reduction), with `DecayedCostAware` a close
+/// second. LFU was the Phase 15-18 placeholder, not a measured choice.
+const DEFAULT_CACHE_POLICY: CachePolicyKind = CachePolicyKind::Lru;
+
+fn cache_policy_from_env() -> CachePolicyKind {
+    match std::env::var(CACHE_POLICY_ENV).ok().as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("lfu") => CachePolicyKind::Lfu,
+        Some(value) if value.eq_ignore_ascii_case("decayed-cost-aware") => {
+            CachePolicyKind::DecayedCostAware
+        }
+        Some(value) if value.eq_ignore_ascii_case("lru") => CachePolicyKind::Lru,
+        _ => DEFAULT_CACHE_POLICY,
+    }
 }
 
 impl WholeExpertLfuCache {
@@ -184,6 +234,41 @@ impl WholeExpertLfuCache {
             active_plan: None,
             stats: ExpertCacheStats::default(),
             entries: Vec::new(),
+            io_fanout: ReadFanout::from_env(IO_FANOUT_ENV)
+                .unwrap_or_else(ReadFanout::parallel_default),
+            policy: cache_policy_from_env(),
+            half_life_events: DEFAULT_HALF_LIFE_EVENTS,
+        }
+    }
+
+    /// Overrides the fan-out policy chosen at construction time. Exists for
+    /// qualification/benchmark harnesses that A/B the Phase 19 parallel path
+    /// against the Phase 18 serial baseline within one process.
+    pub fn set_io_fanout(&mut self, fanout: ReadFanout) {
+        self.io_fanout = fanout;
+    }
+
+    /// Overrides the eviction policy chosen at construction time. Same
+    /// purpose as `set_io_fanout`: qualification/benchmark harnesses A/B
+    /// Phase 21 candidates within one process.
+    pub fn set_policy(&mut self, policy: CachePolicyKind, half_life_events: u64) {
+        self.policy = policy;
+        self.half_life_events = half_life_events.max(1);
+    }
+
+    /// Same utility formula `policy::ReplayCache` uses offline, applied to a
+    /// live cache entry. Higher is "keep"; the eviction candidate is the
+    /// unpinned/unselected entry with the lowest utility, ties broken by
+    /// (last_used, layer, expert) for determinism.
+    fn utility(&self, entry: &CachedExpert) -> f64 {
+        match self.policy {
+            CachePolicyKind::Lru => entry.last_used as f64,
+            CachePolicyKind::Lfu => entry.frequency as f64 * 1.0e12 + entry.last_used as f64,
+            CachePolicyKind::DecayedCostAware => {
+                let age = self.clock.saturating_sub(entry.last_used) as f64;
+                let decay = 2.0f64.powf(-(age / self.half_life_events as f64));
+                entry.frequency as f64 * decay * entry.value.stored_bytes().0 as f64
+            }
         }
     }
 
@@ -280,12 +365,15 @@ impl WholeExpertLfuCache {
             }
         }
 
-        // Stage every miss first. A failed read drops all staged broker leases
-        // and leaves no partially valid cache entry behind.
-        let mut staged = Vec::with_capacity(misses.len());
-        for expert in misses {
-            staged.push((expert, loader.load_expert(layer, expert)?));
-        }
+        // Stage every miss first. Each miss reserves and reads an independent
+        // destination (its own broker lease, its own expert), so Phase 19
+        // fans these reads out across a bounded thread pool by default
+        // (NVMAI R9 precedent) instead of issuing them one at a time; a
+        // failed read still drops all staged broker leases and leaves no
+        // partially valid cache entry behind.
+        let mut staged = crate::io::fetch_all(self.io_fanout, &misses, |&expert| {
+            Ok((expert, loader.load_expert(layer, expert)?))
+        })?;
 
         let plan_id = self.next_plan_id;
         self.next_plan_id = self.next_plan_id.wrapping_add(1).max(1);
@@ -440,14 +528,13 @@ impl WholeExpertLfuCache {
     }
 
     fn evict_coldest(&mut self) -> Option<()> {
-        let (index, _) = self
+        let index = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.pin_count == 0)
-            .min_by_key(|(_, entry)| {
-                (entry.frequency, entry.last_used, entry.layer, entry.expert)
-            })?;
+            .min_by(|(_, left), (_, right)| self.eviction_order(left, right))
+            .map(|(index, _)| index)?;
         self.remove_entry(index);
         Some(())
     }
@@ -457,7 +544,7 @@ impl WholeExpertLfuCache {
         selected_layer: LayerId,
         selected_experts: &[ExpertId; TOP_K],
     ) -> Option<()> {
-        let (index, _) = self
+        let index = self
             .entries
             .iter()
             .enumerate()
@@ -465,11 +552,21 @@ impl WholeExpertLfuCache {
                 entry.pin_count == 0
                     && (entry.layer != selected_layer || !selected_experts.contains(&entry.expert))
             })
-            .min_by_key(|(_, entry)| {
-                (entry.frequency, entry.last_used, entry.layer, entry.expert)
-            })?;
+            .min_by(|(_, left), (_, right)| self.eviction_order(left, right))
+            .map(|(index, _)| index)?;
         self.remove_entry(index);
         Some(())
+    }
+
+    /// Total order for eviction candidates: lowest policy utility first,
+    /// ties broken by (last_used, layer, expert) so eviction is
+    /// deterministic regardless of `Vec` iteration/storage order.
+    fn eviction_order(&self, left: &CachedExpert, right: &CachedExpert) -> std::cmp::Ordering {
+        self.utility(left)
+            .total_cmp(&self.utility(right))
+            .then_with(|| left.last_used.cmp(&right.last_used))
+            .then_with(|| left.layer.cmp(&right.layer))
+            .then_with(|| left.expert.cmp(&right.expert))
     }
 
     fn remove_entry(&mut self, index: usize) {

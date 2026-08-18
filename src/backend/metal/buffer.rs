@@ -11,14 +11,33 @@
 
 use metal_sys::Buffer;
 
+use crate::memory::MemoryLease;
+
 pub struct BufferLease {
     buffer: Buffer,
     label: String,
+    /// The broker reservation backing this buffer's physical allocation,
+    /// held for exactly as long as the Metal buffer itself (invariant #4).
+    /// `None` for the pre-Phase-20 call sites that predate broker wiring;
+    /// new call sites should prefer `MetalContext::allocate_broker_buffer*`.
+    _lease: Option<MemoryLease>,
 }
 
 impl BufferLease {
     pub(super) fn new(buffer: Buffer, label: String) -> Self {
-        Self { buffer, label }
+        Self {
+            buffer,
+            label,
+            _lease: None,
+        }
+    }
+
+    pub(super) fn new_with_lease(buffer: Buffer, label: String, lease: MemoryLease) -> Self {
+        Self {
+            buffer,
+            label,
+            _lease: Some(lease),
+        }
     }
 
     pub fn label(&self) -> &str {

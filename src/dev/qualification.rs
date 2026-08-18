@@ -22,7 +22,17 @@ use crate::tokenizer::TqfTokenizer;
 
 pub const ORACLE_SCHEMA_VERSION: u32 = 1;
 const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
-const DEFAULT_EXPERT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+/// Matches the real server's expert-cache sizing (`budget / 4`, see
+/// `src/app/serve.rs`) rather than an arbitrary smaller value. The Phase 21
+/// route-trace replay (`docs/research/qualification/raw-a-128-route-trace-policy.md`)
+/// found every cache policy gets *zero* reuse below ~768 MiB on the real
+/// 128-token trace - a prior 256 MiB default here meant every qualification
+/// run through 2026-08-17 exercised a colder, more pessimistic cache than
+/// what the production default actually gives users. Existing recorded
+/// qualification results remain valid; each one explicitly records its own
+/// `expert_cache_capacity_bytes`, so this change doesn't retroactively
+/// misdescribe them.
+const DEFAULT_EXPERT_CACHE_BYTES: u64 = FOUR_GIB / 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -358,6 +368,29 @@ mod tests {
         }
         for length in [2, 15, 17, 511, 513] {
             assert!(validate_oracle(&artifact(length)).is_err());
+        }
+    }
+
+    #[test]
+    fn committed_oracle_fixtures_are_well_formed() {
+        // Cheap structural check (JSON parse + schema/vocab/length
+        // validation only, no checkpoint/decode) so a corrupted or
+        // hand-edited fixture fails fast instead of only surfacing inside
+        // an hours-long real-checkpoint qualification run.
+        for (name, expected_generated_len, expected_prompt_tokens) in [
+            ("raw-a-1.json", 1, vec![32]),
+            ("raw-a-16.json", 16, vec![32]),
+            ("raw-a-128.json", 128, vec![32]),
+            ("raw-a-512.json", 512, vec![32]),
+            ("raw-b-512.json", 512, vec![760]),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("docs/research/oracles")
+                .join(name);
+            let artifact = load_oracle(&path)
+                .unwrap_or_else(|error| panic!("{name} failed to load/validate: {error}"));
+            assert_eq!(artifact.generated_tokens.len(), expected_generated_len);
+            assert_eq!(artifact.prompt_tokens, expected_prompt_tokens);
         }
     }
 
