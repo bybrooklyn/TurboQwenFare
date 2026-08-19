@@ -48,6 +48,11 @@ libc = "0.2.189"
 # IEEE-754 binary16 conversions for TQKV per-page quantization scales (spec
 # §157-159 store scales as FP16, not BF16 like the reference attention cache).
 half = "2"
+# Cross-platform filesystem event watching (FSEvents on macOS, inotify
+# on Linux) for the retrieval live-sync watcher (spec §42, §199) —
+# watcher events are hints, not a source of truth we'd want to
+# re-derive kqueue/FSEvents bindings for ourselves.
+notify = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

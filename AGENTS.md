@@ -328,6 +328,29 @@ Phases 27-28 land the first long-context (TQKV) work:
   competitive for normal repository sizes." Not a dead end, just not
   measured as a win at this corpus size.
   `docs/research/qualification/phase-41-adaptive-ann-research.md`.
+- **Phase 42 (live sync):** `retrieval::sync` — content-hash (BLAKE3)
+  change detection against a `FileTable` (`full_correctness_walk`), a
+  `SyncEngine` that commits the cheap Lexical/Exact lane immediately
+  while marking new/changed files `semantic_pending` (spec §198's
+  "structural/lexical changes can commit first"), a deterministic
+  debounce/coalesce `DebouncedEventQueue`, and a `BoundedEventSink` +
+  `LiveWatcher` (new `notify` dependency — real FSEvents/inotify, spec
+  §199) that drops events past capacity and latches `overflowed` rather
+  than growing unbounded. No durable journal/generation-pointer commit
+  — same scope boundary Phase 36+ have kept pending a persisted `.tqi`
+  format. Stress-tested for real: 500-event editor-save-storm coalesces
+  correctly; a 50-into-5-capacity overflow correctly triggers a full
+  walk that still detects all 8 real new files despite losing 45 of 50
+  raw hints; lexical search stays usable (and a file's prior semantic
+  vector stays servable, stale-but-available) while re-embedding is
+  pending. Found and fixed two real bugs via genuine end-to-end testing:
+  a test-isolation race from two tests mutating the live `src/` tree
+  concurrently (fixed by isolated snapshots, not the walk logic), and a
+  real FSEvents path-canonicalization bug (macOS reports
+  `/private/var/...`, not the `/var/...` symlink form passed to
+  `watch()`) that silently dropped every real watcher event until a
+  standalone probe diagnosed it and the real-OS smoke test caught it.
+  `docs/research/qualification/phase-42-live-sync.md`.
 
 ## Commands
 
