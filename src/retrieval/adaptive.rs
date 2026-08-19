@@ -159,7 +159,10 @@ pub struct HierarchyOverlay {
     pub modules: HashMap<String, Vec<usize>>,
 }
 
-fn module_of(chunk_id: &str) -> String {
+/// The first path component after `src/` (or the whole id if there's no
+/// `src/` prefix) — spec §90's coarsest hierarchy level, derivable
+/// without any AST.
+pub fn module_of(chunk_id: &str) -> String {
     chunk_id
         .strip_prefix("src/")
         .unwrap_or(chunk_id)

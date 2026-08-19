@@ -373,6 +373,24 @@ Phases 27-28 land the first long-context (TQKV) work:
   answer quality/TTFT, not reranker benchmark alone" measurement (needs
   a live end-to-end RAG pipeline this phase's scope doesn't reach).
   `docs/research/qualification/phase-43-gte-reranker.md`.
+- **Phase 44 (automatic RAG + MCP):** `retrieval::context_budget` (spec
+  §94's dynamic injection-budget estimator, a pure function of Phase
+  40's `QueryIntent`) and `mcp::` — a real MCP server implemented
+  against the actual live spec (protocol version `2025-06-18`,
+  JSON-RPC 2.0 `initialize`/`tools/list`/`tools/call`), stdio transport
+  only (HTTP not attempted), all seven spec §95 read-only tools backed
+  by this session's real retrieval work. `tqf_references`/
+  `tqf_callers`/`tqf_tests` honestly report a real capability gap
+  (`isError: true`, needs a program graph this build doesn't have)
+  rather than fabricate answers, matching Phase 35/36's precedent.
+  Proven for real: a genuine 4-message newline-delimited stdio session
+  round-trips correctly; every data tool with `IndexState: None`
+  returns an ordinary informative result (never a protocol error),
+  proving "server works normally without an index"; real answers
+  verified against a real 3-file index through the exact client-facing
+  `handle_request` path. Not wired into a live server process or
+  `--open` client integration yet.
+  `docs/research/qualification/phase-44-automatic-rag-mcp.md`.
 
 ## Commands
 

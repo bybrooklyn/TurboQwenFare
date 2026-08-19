@@ -53,6 +53,18 @@ impl TqfTokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Pair encoding (`[CLS] a [SEP] b [SEP]`-style, per the tokenizer's
+    /// own `TemplateProcessing` post-processor) for cross-encoder inputs
+    /// like the GTE reranker (spec §43/§93), where a single sequence
+    /// input would not apply the pair template.
+    pub fn encode_pair(&self, a: &str, b: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        let encoding = self
+            .inner
+            .encode((a, b), add_special_tokens)
+            .map_err(|e| ModelError::TokenizerBuild(e.to_string()))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         self.inner
             .decode(ids, skip_special_tokens)

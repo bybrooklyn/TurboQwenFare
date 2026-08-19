@@ -4,6 +4,7 @@
 
 pub mod adaptive;
 pub mod classify;
+pub mod context_budget;
 pub mod flat;
 pub mod hybrid;
 pub mod ignore;
