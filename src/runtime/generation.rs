@@ -261,11 +261,17 @@ pub trait Qwen36Generator: Send + Sync {
     /// conversation before sending it, which only helps if the number is
     /// the tokenizer's rather than an estimate. Defaults to an error so
     /// an implementation without a tokenizer says so instead of guessing.
+    /// Tokens the prompt would occupy, without generating.
+    ///
+    /// The default reports `Unsupported` rather than `ProtocolError::Invalid`:
+    /// a generator that cannot count is a missing *capability*, not a
+    /// malformed client request, and §212 maps those to different statuses.
+    /// Conflating them told callers to fix a request that was already valid.
     fn count_prompt_tokens(&self, _request: &NormalizedRequest) -> Result<usize> {
-        Err(
-            ProtocolError::Invalid("token counting is unavailable for this generator".to_string())
-                .into(),
+        Err(crate::error::ModelError::Unsupported(
+            "this generator cannot count tokens without generating".to_string(),
         )
+        .into())
     }
 
     /// Whether `generate_streaming` really emits deltas during decode

@@ -5,6 +5,8 @@
 pub mod anthropic;
 pub mod auth;
 pub mod bind;
+#[cfg(test)]
+mod conformance;
 pub mod model_id;
 pub mod ollama;
 pub mod openai;

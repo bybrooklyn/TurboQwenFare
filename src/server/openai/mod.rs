@@ -33,6 +33,10 @@ type CancelOnDropStream = crate::server::stream::CancelOnDrop<ReceiverStream<Sse
 struct ModelObject {
     id: &'static str,
     object: &'static str,
+    /// Part of OpenAI's model object; some clients read it. Reported as
+    /// the install time from the trusted receipt when there is one, so it
+    /// describes this model rather than this process.
+    created: u64,
     owned_by: &'static str,
     installed: bool,
 }
@@ -49,6 +53,11 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
         data: vec![ModelObject {
             id: CANONICAL_MODEL_ID,
             object: "model",
+            created: state
+                .model_receipt
+                .as_ref()
+                .map(|receipt| receipt.installed_at_unix)
+                .unwrap_or_else(unix_seconds),
             owned_by: "turboqwenfare",
             installed: state.model_installed,
         }],

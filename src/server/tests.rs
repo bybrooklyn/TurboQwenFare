@@ -42,6 +42,46 @@ pub(super) async fn spawn_test_server_with_api_key(
     spawn_router(test_router(model_installed, None, Some(api_key))).await
 }
 
+/// A server in the state the real one reaches after a successful
+/// install: model installed, runtime loaded, and a validated receipt
+/// describing it. `spawn_test_server_with(true, ..)` deliberately leaves
+/// the receipt absent, which is fine for generation tests but makes the
+/// inventory endpoints (`/api/tags`, `/api/show`) answer as though
+/// nothing were installed.
+pub(super) async fn spawn_test_server_installed(generator: Arc<dyn Qwen36Generator>) -> SocketAddr {
+    let state = AppState {
+        config: Arc::new(Config::default()),
+        model_installed: true,
+        generation_slot: GenerationSlot::new(),
+        generator: Some(generator),
+        model_receipt: Some(Arc::new(fixture_receipt())),
+        started_at: Instant::now(),
+        api_key: None,
+    };
+    spawn_router(server::build_router(state)).await
+}
+
+/// Shaped like a real receipt (the values are fixtures, the fields are
+/// the real ones) so inventory endpoints report from it rather than
+/// inventing plausible-looking values.
+fn fixture_receipt() -> crate::setup::receipt::ModelReceipt {
+    crate::setup::receipt::ModelReceipt {
+        schema_version: 1,
+        model_family: "qwen3.6-35b-a3b".to_string(),
+        source_revision: Some("baec3ebee244827cda0f4557eafa8b28f7545fa6".to_string()),
+        source_sha256: "0".repeat(64),
+        conversion_fingerprint_blake3: "1".repeat(64),
+        metadata_root_blake3: "2".repeat(64),
+        format_major: 1,
+        format_minor: 0,
+        tqf_path: std::path::PathBuf::from("/fixture/qwen3.6-35b-a3b.tqf"),
+        tokenizer_gguf_path: std::path::PathBuf::from("/fixture/qwen3.6-35b-a3b.gguf"),
+        tokenizer_header_blake3: "3".repeat(64),
+        tokenizer_source_bytes: 20_419_565_568,
+        installed_at_unix: 1_760_000_000,
+    }
+}
+
 async fn spawn_router(router: axum::Router) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -74,7 +114,7 @@ fn test_router(
     server::build_router(state)
 }
 
-struct FixtureGenerator;
+pub(super) struct FixtureGenerator;
 
 #[async_trait::async_trait]
 impl Qwen36Generator for FixtureGenerator {
@@ -91,6 +131,18 @@ impl Qwen36Generator for FixtureGenerator {
         GeneratedOutput::from_model_text(format!(
             "hello <tool_call>{{\"name\":\"{name}\",\"arguments\":{{\"path\":\"Cargo.toml\"}}}}</tool_call>"
         ))
+    }
+
+    /// Whitespace words, which is not the real tokenizer's answer but is
+    /// a real count derived from the real request — enough for protocol
+    /// fixtures to exercise the response shape rather than the trait's
+    /// unsupported default.
+    fn count_prompt_tokens(&self, request: &NormalizedRequest) -> crate::error::Result<usize> {
+        Ok(request
+            .messages
+            .iter()
+            .map(|message| message.content.split_whitespace().count())
+            .sum())
     }
 }
 

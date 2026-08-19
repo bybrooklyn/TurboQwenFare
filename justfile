@@ -49,6 +49,12 @@ lint:
 dead-code:
     @cargo clippy --all-targets 2>&1 | grep -cE "never used|never constructed|never read" || true
 
+# Every fixture cites the section it encodes (spec §260, §331).
+#
+# Protocol conformance only — written from the spec, never from the code.
+conformance:
+    cargo test --bin tqf conformance -- --nocapture {{test_flags}}
+
 # The full fast suite. No GPU, no checkpoint, no network.
 test:
     cargo test -- {{test_flags}}

@@ -406,6 +406,12 @@ async fn count_tokens(State(state): State<AppState>, Json(req): Json<MessagesReq
     };
     match generator.count_prompt_tokens(&normalized) {
         Ok(tokens) => Json(serde_json::json!({ "input_tokens": tokens })).into_response(),
+        // A capability the running generator lacks is a 501, not a 400:
+        // telling a client its request was invalid when the request was
+        // fine sends it looking for a bug it does not have.
+        Err(crate::error::TqfError::Model(crate::error::ModelError::Unsupported(message))) => {
+            error(StatusCode::NOT_IMPLEMENTED, "api_error", message)
+        }
         Err(err) => error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
