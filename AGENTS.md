@@ -206,6 +206,19 @@ Phases 27-28 land the first long-context (TQKV) work:
   compute path can't close that floor even with more cache, and spec §40
   itself says a 2G speed miss doesn't invalidate the 4G system.
   `docs/research/qualification/phase-34-2g-profile.md`.
+- **Phase 35 (file catalog/classifier):** `retrieval::{ignore,classify,scan}`
+  — a real (scoped) `.gitignore`/`.tqfignore` glob matcher, content-first
+  classification (byte-sniff binary detection, a keyword-fingerprint
+  language scorer substituting for real AST `parser_quality`, shebang/
+  basename hints, generated/vendor detectors), and a symlink-cycle-safe,
+  root-escape-safe filesystem scanner. Validated against this crate's own
+  live 150-file source tree, not just synthetic fixtures — catching two
+  real bugs in the process: `DirEntry::metadata()` doesn't follow
+  symlinks (a directory symlink silently fell through to a failed file
+  read instead of being walked), and doc-comment-heavy real Rust files
+  were misclassified by generic keyword collisions in prose. All 112 of
+  this crate's own real `.rs` files now classify correctly.
+  `docs/research/qualification/phase-35-file-catalog-classifier.md`.
 
 ## Commands
 
