@@ -21,6 +21,10 @@ path = "src/main.rs"
 default = ["metal"]
 metal = ["dep:metal-sys"]
 cuda = []
+# Compiles and links the adopted SwiftUI GUI (spec §96-98, Phase 46).
+# Opt-in (not part of `default`) because it invokes the Swift toolchain
+# from build.rs; a headless-only build/CI environment need not have one.
+gui = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -28,8 +28,53 @@ pub fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Optimize) => run_optimize(),
-        None => serve::start(&cli, config),
+        None => run_server_or_gui(cli, config),
     }
+}
+
+/// spec §98: headless mode runs the server exactly as before, blocking
+/// the calling thread — unchanged from every earlier phase, so
+/// existing headless behavior/tests are untouched. Non-headless *only*
+/// changes behavior when compiled with the `gui` feature on macOS: the
+/// server moves to a background thread and the real main thread is
+/// handed to the compiled-in SwiftUI app, per spec §98's "transfer the
+/// main thread to a C-callable Swift entrypoint."
+fn run_server_or_gui(cli: Cli, config: crate::config::Config) -> Result<()> {
+    if cli.headless {
+        return serve::start(&cli, config);
+    }
+    #[cfg(all(target_os = "macos", feature = "gui"))]
+    {
+        run_with_gui(cli, config)
+    }
+    #[cfg(not(all(target_os = "macos", feature = "gui")))]
+    {
+        serve::start(&cli, config)
+    }
+}
+
+/// Runs the server on a background OS thread (it owns its own Tokio
+/// runtime, spec §25's async/thread model is unaffected) and hands the
+/// real main thread to `gui::macos::launch`, which never returns until
+/// the user quits the app. `base_url` uses the server's real default
+/// bind address (spec's Ollama-compatible default port) — if the
+/// default port was actually occupied and the server's own bind-with-
+/// fallback logic picked a different one, the GUI's hardcoded default
+/// won't match; resolving that requires threading the real bound
+/// address back from `serve::start` to this caller, which is not
+/// implemented yet (see the Phase 46 qualification doc).
+#[cfg(all(target_os = "macos", feature = "gui"))]
+fn run_with_gui(cli: Cli, config: crate::config::Config) -> Result<()> {
+    let server_thread = std::thread::spawn(move || serve::start(&cli, config));
+    let base_url = format!("http://127.0.0.1:{}", crate::server::bind::DEFAULT_PORT);
+    crate::gui::macos::launch(&base_url);
+    // The GUI returned (the user quit the app). The background server
+    // thread keeps running for the rest of the process's life, exactly
+    // like a headless server would; this function returning lets
+    // `main` exit, which is the same "close the window, quit the app"
+    // behavior every other macOS app has.
+    let _ = server_thread;
+    Ok(())
 }
 
 /// `tqf optimize` (spec §3): today this is phase 10's exit-criteria

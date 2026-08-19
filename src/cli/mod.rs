@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::config::{parse_human_quantity, Config};
 use crate::error::Result;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "tqf",
     version,
@@ -59,7 +59,7 @@ pub struct Cli {
     pub insecure: bool,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Index a directory into TQIndex.
     Sync { path: PathBuf },

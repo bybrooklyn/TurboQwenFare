@@ -406,6 +406,31 @@ Phases 27-28 land the first long-context (TQKV) work:
   5/5 failures before, 5/5 passes after). Not wired to actual `--open`
   CLI parsing or a live server/index yet.
   `docs/research/qualification/phase-45-client-launchers.md`.
+- **Phase 46 (SwiftUI bridge):** a real Swift Package (`swift/`),
+  compiled and statically linked into the single `tqf` Mach-O binary
+  behind a new opt-in `gui` Cargo feature (not in `default` — a
+  headless-only build/CI environment need not have a Swift toolchain).
+  Adopts real Apache-2.0 NVMAI SwiftUI source verbatim with attribution
+  (`ResponseMarkdownRenderer`, `NVMAIMacTheme`, `HUDMetricView`, from a
+  real local NVMAI clone) and replaces NVMAI's own in-process Metal
+  model state with new, TQF-specific HTTP-backed state
+  (`TqfInferenceClient` streaming TQF's real `/v1/chat/completions` SSE
+  endpoint; `TqfAppModel`, deliberately not a port of NVMAI's own
+  942-line AppModel since TQF's model is always server-owned, unlike
+  NVMAI's). A real `@_cdecl("tqf_launch_gui")` C entrypoint hands the
+  process's actual main thread to `NSApplication`; `src/gui/macos`
+  wraps the FFI call; `--headless` takes the exact unchanged code path
+  every earlier phase used. Proven for real: `nm` confirms the real
+  exported symbol linked into the actual binary (not just the
+  standalone Swift build); a from-scratch `cargo build --features gui`
+  succeeds with zero regressions across the full 406/407-test suite;
+  the real Swift/Cargo link flags were derived empirically (a
+  throwaway SwiftPM executable's `swift build -v` output), catching
+  and fixing one real link error (`Observation` isn't a linkable
+  framework). No automated Swift-side tests (this machine's `swiftly`
+  toolchain lacks XCTest/Testing) and no visual/interactive
+  verification — both honestly reported, not glossed over.
+  `docs/research/qualification/phase-46-swiftui-bridge.md`.
 
 ## Commands
 
