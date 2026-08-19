@@ -391,6 +391,21 @@ Phases 27-28 land the first long-context (TQKV) work:
   `handle_request` path. Not wired into a live server process or
   `--open` client integration yet.
   `docs/research/qualification/phase-44-automatic-rag-mcp.md`.
+- **Phase 45 (client launchers):** `integrations::{config,launch}` —
+  ephemeral provider/MCP config for OpenCode/Claude Code/Codex (spec
+  §99's table), every env var/flag confirmed against each client's real
+  live docs during this phase (`OPENCODE_CONFIG`, `ANTHROPIC_BASE_URL`
+  + `--mcp-config`, `CODEX_HOME` + `wire_api="responses"`), plus a
+  real process launch/cleanup lifecycle and spec §100's confirm-before-
+  install gate (offers the real recipe, never runs it). Proven with a
+  real spawned child process (`sh`, not the real AI CLIs) observing its
+  actual env vars and the ephemeral config directory actually vanishing
+  on exit. Found and fixed a real concurrency bug the same way as Phase
+  42's: ephemeral dirs keyed only by PID collided across `cargo test`'s
+  parallel tests; fixed with a counter, not a logic change (reproduced
+  5/5 failures before, 5/5 passes after). Not wired to actual `--open`
+  CLI parsing or a live server/index yet.
+  `docs/research/qualification/phase-45-client-launchers.md`.
 
 ## Commands
 
