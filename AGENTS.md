@@ -137,7 +137,7 @@ Phases 27-28 land the first long-context (TQKV) work:
   on this hardware); instead the gate's three parts are measured directly.
   Memory: `context::tqkv::scaling_bench` really constructs all ten
   full-attention layers at 131,072-token TQKV-Q4 capacity inside one 4 GiB
-  broker (0.66 GiB reserved, 3.34 GiB headroom). Performance: a new
+  broker (0.67 GiB reserved, 3.33 GiB headroom). Performance: a new
   `FullAttentionLayer::seed_synthetic_history_for_benchmark` isolates real
   attention-step cost from I/O at deep, otherwise-unreachable context
   lengths — measured **450 ms/step (BF16) and 1,687 ms/step (TQKV-Q4) at
@@ -159,7 +159,7 @@ Phases 27-28 land the first long-context (TQKV) work:
   restoring byte-identical state. `docs/research/qualification/phase-30-prefix-store.md`.
 - **Phase 31 (256K/TQAttn trigger):** applies spec §303's own decision
   rule after extending Phase 29's isolated-attention-step measurement to
-  262,144 tokens. Memory: TQKV-Q4 at 256K reserves 1.31 GiB (fits 4G); BF16
+  262,144 tokens. Memory: TQKV-Q4 at 256K reserves 1.33 GiB (fits 4G); BF16
   at 256K needs 5.00 GiB (does not fit 4G at all, independent of speed).
   Performance: attention alone costs **822 ms/step (BF16)** and
   **3,331 ms/step (TQKV-Q4)** at 256K — 12.3x and 49.9x over the 15 tok/s
@@ -167,6 +167,20 @@ Phases 27-28 land the first long-context (TQKV) work:
   **triggers Phase 32 (TQAttn)** — full attention cannot stay the default
   beyond this point on the reference implementation.
   `docs/research/qualification/phase-31-256k-tqattn-trigger.md`.
+- **Phase 32 (TQAttn):** `context::tqattn` — the spec §164 REFERENCE
+  BASELINE Quest-style [R21] selector, not the self-indexing Key
+  candidates of §63/§167 (§300 defers those until this baseline is
+  qualified). Extended `SealedPage` with a per-(kv_head, dim) min/max
+  search summary (caught and fixed a real broker-under-reservation bug in
+  the process: the capacity formula hadn't grown with the struct).
+  Implements the §164 selector (recent window + protected pages always
+  included, remaining pages scored via the Quest bound) and 2 of §165's 6
+  uncertainty-expansion triggers. Real full-attention A/B on a 16,384-token
+  synthetic context: **10.72x wall-clock speedup** attending to 9.4% of
+  tokens (page budget 6 of 64 pages), with an engineered "important" old
+  page correctly recalled and 99.8% of the full-attention score preserved.
+  Not yet wired into the live decode loop.
+  `docs/research/qualification/phase-32-tqattn.md`.
 
 ## Commands
 

@@ -81,18 +81,23 @@ computed from the same formula the broker reservation uses, not a live
 | Backend | Bytes/layer @ 128K tokens | 10 layers |
 |---|---|---|
 | BF16 reference | 268,435,456 (256.0 MiB) | 2.50 GiB |
-| TQKV-Q8 | 137,953,280 (~131.6 MiB) | ~1.28 GiB |
-| TQKV-Q4 | 70,844,416 (~67.6 MiB) | ~0.66 GiB |
+| TQKV-Q8 | 139,001,856 (~132.6 MiB) | ~1.29 GiB |
+| TQKV-Q4 | 71,892,992 (~68.6 MiB) | ~0.67 GiB |
+
+(Includes the Phase 32 per-page min/max search summary added after this
+phase originally landed — a small, real addition, not a correction of an
+error: ~2 KiB/page, ~1 MiB/layer at 128K.)
 
 This matches spec §159's own order-of-magnitude estimate ("~5 KiB/token
 across the ten full-attention layers... ~640 MiB at 128K" for Q4 — measured
-here at ~676 MiB total across 10 layers, ~5.6% over the spec's raw-payload
-estimate, attributable to the header/scale overhead the spec explicitly
-flags as additive). At 128K, TQKV-Q4's ~0.66 GiB and even TQKV-Q8's
-~1.28 GiB leave real headroom under a 4 GiB budget once expert cache and
-resident weights are also accounted for, where BF16's 2.5 GiB would not;
-Q8 is still meaningfully larger than Q4, consistent with its stated role
-as the correctness oracle rather than the 128K production candidate
+here at ~686 MiB total across 10 layers, ~7.2% over the spec's raw-payload
+estimate, attributable to the header/scale/search-summary overhead the
+spec explicitly flags as additive). At 128K, TQKV-Q4's ~0.67 GiB and even
+TQKV-Q8's ~1.29 GiB leave real headroom under a 4 GiB budget once expert
+cache and resident weights are also accounted for, where BF16's 2.5 GiB
+would not; Q8 is still meaningfully larger than Q4, consistent with its
+stated role as the correctness oracle rather than the 128K production
+candidate
 (spec §158: "Q8 is not expected to meet the final 4G 128K budget alone").
 
 ## Status and remaining work

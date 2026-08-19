@@ -26,13 +26,14 @@ under TQKV-Q4 inside one live `MemoryBroker`
 test `ten_full_attention_layers_at_128k_tqkv_q4_fit_under_a_4gib_broker`):
 
 ```
-phase29_memory tqkv_q4_128k_all_layers_bytes=708444160 gib=0.660 headroom_gib=3.340
+phase29_memory tqkv_q4_128k_all_layers_bytes=718929920 gib=0.670 headroom_gib=3.330
 ```
 
 Real reservation, real broker, matches the Phase 27 formula exactly
-(708,444,160 bytes): **0.66 GiB for all ten layers' KV history at 128K**,
-leaving 3.34 GiB of a 4 GiB budget for resident core weights and the
-expert cache. The memory half of "4G, 128K" is satisfied for TQKV-Q4.
+(718,929,920 bytes, including Phase 32's later per-page search-summary
+addition): **0.67 GiB for all ten layers' KV history at 128K**, leaving
+3.33 GiB of a 4 GiB budget for resident core weights and the expert cache.
+The memory half of "4G, 128K" is satisfied for TQKV-Q4.
 
 ## Performance suite: isolating attention cost from I/O
 
@@ -67,7 +68,7 @@ Two real findings:
    vs 450 ms) — a real, measured cost of the current scalar per-token
    dequant path (unpacking 4-bit codes plus a per-dimension scale multiply,
    versus BF16's single bit-shift). This is a recorded negative result for
-   raw attention throughput: TQKV-Q4 wins memory (128K fits in 0.66 GiB vs
+   raw attention throughput: TQKV-Q4 wins memory (128K fits in 0.67 GiB vs
    BF16's 2.5 GiB) but currently *loses* compute time at long context. A
    SIMD/fused dequant kernel (the Phase 20 NEON-kernel pattern applied to
    TQKV's Q4 unpack) is the natural next step and is not yet built.

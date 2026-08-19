@@ -14,10 +14,11 @@ measurement to 256K and applies the spec's own stated rule.
 real broker construction of all ten full-attention layers, not formula):
 
 ```
-phase31_memory tqkv_q4_256k_bytes=1406402560 gib=1.310 bf16_256k_bytes=5368709120 gib=5.000 bf16_fits_4gib=false
+phase31_memory tqkv_q4_256k_bytes=1427374080 gib=1.329 bf16_256k_bytes=5368709120 gib=5.000 bf16_fits_4gib=false
 ```
 
-TQKV-Q4 at 256K: **1.31 GiB**, comfortably under a 4 GiB budget. BF16 at
+TQKV-Q4 at 256K: **1.33 GiB** (including Phase 32's later per-page search
+summary), comfortably under a 4 GiB budget. BF16 at
 256K: **5.00 GiB**, which *exceeds* a 4 GiB budget outright — BF16 cannot
 even be constructed at 256K under the 4G profile, independent of speed.
 This matches spec §65's own profile table exactly: "256K / 4G Production

@@ -183,6 +183,10 @@ pub(crate) struct SealedPage {
     key_scales: Vec<f16>,
     value_bytes: Vec<u8>,
     value_scales: Vec<f16>,
+    /// Section 164 Quest-style bound summary: raw (non-abs) per-(kv_head,
+    /// dim) min/max over every token in the page.
+    key_min: Vec<f16>,
+    key_max: Vec<f16>,
     precision: TqkvPrecision,
 }
 
@@ -203,15 +207,27 @@ impl SealedPage {
         debug_assert_eq!(values.len(), token_count * KV_WIDTH);
 
         // Key scale: max |k| over all tokens in the page, per (kv_head, dim).
+        // Section 164's Quest-style bound reuses this same scan for the raw
+        // (non-abs) per-(kv_head, dim) min/max search summary, at no extra
+        // pass over the data.
         let mut key_scales = vec![0f32; KV_HEADS * HEAD_DIM];
+        let mut key_min = vec![f32::INFINITY; KV_HEADS * HEAD_DIM];
+        let mut key_max = vec![f32::NEG_INFINITY; KV_HEADS * HEAD_DIM];
         for token in 0..token_count {
             for head in 0..KV_HEADS {
                 let base = (token * KV_HEADS + head) * HEAD_DIM;
                 for dim in 0..HEAD_DIM {
-                    let v = keys[base + dim].abs();
+                    let raw = keys[base + dim];
+                    let v = raw.abs();
                     let slot = head * HEAD_DIM + dim;
                     if v > key_scales[slot] {
                         key_scales[slot] = v;
+                    }
+                    if raw < key_min[slot] {
+                        key_min[slot] = raw;
+                    }
+                    if raw > key_max[slot] {
+                        key_max[slot] = raw;
                     }
                 }
             }
@@ -258,9 +274,12 @@ impl SealedPage {
         let value_bytes = pack_codes(&value_codes, precision);
         let key_scales: Vec<f16> = key_scales.into_iter().map(f16::from_f32).collect();
         let value_scales: Vec<f16> = value_scales.into_iter().map(f16::from_f32).collect();
+        let key_min: Vec<f16> = key_min.into_iter().map(f16::from_f32).collect();
+        let key_max: Vec<f16> = key_max.into_iter().map(f16::from_f32).collect();
 
         let quant_meta_bytes =
             ((key_scales.len() + value_scales.len()) * std::mem::size_of::<f16>()) as u32;
+        let search_bytes = ((key_min.len() + key_max.len()) * std::mem::size_of::<f16>()) as u32;
         let mut hasher = blake3::Hasher::new();
         hasher.update(&key_bytes);
         hasher.update(&value_bytes);
@@ -268,6 +287,12 @@ impl SealedPage {
             hasher.update(&s.to_le_bytes());
         }
         for s in &value_scales {
+            hasher.update(&s.to_le_bytes());
+        }
+        for s in &key_min {
+            hasher.update(&s.to_le_bytes());
+        }
+        for s in &key_max {
             hasher.update(&s.to_le_bytes());
         }
         let content_hash: [u8; 32] = *hasher.finalize().as_bytes();
@@ -281,19 +306,21 @@ impl SealedPage {
             head_dim: HEAD_DIM as u16,
             key_encoding: precision.encoding_id(),
             value_encoding: precision.encoding_id(),
-            search_encoding: 0,
+            // 1 = section 164's per-(kv_head, dim) min/max Quest-style bound
+            // summary (`context::tqattn`); 0 would mean no search summary.
+            search_encoding: 1,
             flags: 0,
             key_payload_bytes: key_bytes.len() as u32,
             value_payload_bytes: value_bytes.len() as u32,
             quant_meta_bytes,
             outlier_bytes: 0,
-            search_bytes: 0,
+            search_bytes,
             backing_generation: 0,
             key_payload_offset: 0,
             value_payload_offset: key_bytes.len() as u64,
             quant_meta_offset: (key_bytes.len() + value_bytes.len()) as u64,
             outlier_offset: 0,
-            search_offset: 0,
+            search_offset: (key_bytes.len() + value_bytes.len() + quant_meta_bytes as usize) as u64,
             content_hash,
         };
 
@@ -303,11 +330,13 @@ impl SealedPage {
             key_scales,
             value_bytes,
             value_scales,
+            key_min,
+            key_max,
             precision,
         }
     }
 
-    fn token_count(&self) -> usize {
+    pub(crate) fn token_count(&self) -> usize {
         self.header.token_count as usize
     }
 
@@ -329,6 +358,12 @@ impl SealedPage {
             hasher.update(&s.to_le_bytes());
         }
         for s in &self.value_scales {
+            hasher.update(&s.to_le_bytes());
+        }
+        for s in &self.key_min {
+            hasher.update(&s.to_le_bytes());
+        }
+        for s in &self.key_max {
             hasher.update(&s.to_le_bytes());
         }
         let actual: [u8; 32] = *hasher.finalize().as_bytes();
@@ -378,9 +413,11 @@ impl SealedPage {
     }
 
     /// Serializes to the exact layout the header's own offsets describe:
-    /// `[header][key_payload][value_payload][key_scales][value_scales]`.
-    /// Used by `context::prefix` to persist sealed pages as content-addressed
-    /// blobs (spec §66: "Snapshots reference immutable page IDs").
+    /// `[header][key_payload][value_payload][key_scales][value_scales]
+    /// [key_min][key_max]`. Used by `context::prefix` to persist sealed
+    /// pages as content-addressed blobs (spec §66: "Snapshots reference
+    /// immutable page IDs") and by `context::tqattn` to read the search
+    /// summary back out.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.resident_bytes());
         out.extend_from_slice(&self.header.to_le_bytes());
@@ -390,6 +427,12 @@ impl SealedPage {
             out.extend_from_slice(&s.to_le_bytes());
         }
         for s in &self.value_scales {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for s in &self.key_min {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for s in &self.key_max {
             out.extend_from_slice(&s.to_le_bytes());
         }
         out
@@ -444,7 +487,27 @@ impl SealedPage {
             .map(|c| f16::from_le_bytes([c[0], c[1]]))
             .collect();
         let value_scales_region = &scales_region[key_scale_count * 2..];
-        let value_scales = value_scales_region[..value_scale_count * 2]
+        let value_scales: Vec<f16> = value_scales_region[..value_scale_count * 2]
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let search_region = &value_scales_region[value_scale_count * 2..];
+        let key_min_max_count = KV_HEADS * HEAD_DIM;
+        let expected_search_bytes = key_min_max_count * 2 * std::mem::size_of::<f16>();
+        if search_region.len() < expected_search_bytes {
+            return Err(ModelError::Shape {
+                tensor: "TQKV persisted search summary",
+                expected: expected_search_bytes,
+                actual: search_region.len(),
+            }
+            .into());
+        }
+        let key_min = search_region[..key_min_max_count * 2]
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let key_max_region = &search_region[key_min_max_count * 2..];
+        let key_max = key_max_region[..key_min_max_count * 2]
             .chunks_exact(2)
             .map(|c| f16::from_le_bytes([c[0], c[1]]))
             .collect();
@@ -454,18 +517,29 @@ impl SealedPage {
             key_scales,
             value_bytes,
             value_scales,
+            key_min,
+            key_max,
             precision,
         })
     }
 
-    /// Total resident bytes: header + payloads + scale metadata (spec
-    /// section 157's on-disk/in-memory backing accounting).
+    /// Total resident bytes: header + payloads + scale + search-summary
+    /// metadata (spec section 157's on-disk/in-memory backing accounting).
     fn resident_bytes(&self) -> usize {
         PAGE_HEADER_BYTES
             + self.key_bytes.len()
             + self.value_bytes.len()
             + self.key_scales.len() * std::mem::size_of::<f16>()
             + self.value_scales.len() * std::mem::size_of::<f16>()
+            + self.key_min.len() * std::mem::size_of::<f16>()
+            + self.key_max.len() * std::mem::size_of::<f16>()
+    }
+
+    /// The Quest-style search summary (spec §164): per-(kv_head, dim) raw
+    /// min/max over every token in the page, each `KV_HEADS * HEAD_DIM`
+    /// long. Read by `context::tqattn::TqAttnSelector`.
+    pub(crate) fn key_min_max(&self) -> (&[f16], &[f16]) {
+        (&self.key_min, &self.key_max)
     }
 }
 
@@ -598,11 +672,15 @@ impl TqkvPagedCache {
         let value_payload = precision.packed_bytes(PAGE_TOKENS * KV_WIDTH);
         let key_scale_bytes = KV_HEADS * HEAD_DIM * std::mem::size_of::<f16>();
         let value_scale_bytes = PAGE_TOKENS * KV_HEADS * VALUE_GROUPS * std::mem::size_of::<f16>();
+        // Section 164 Quest-style search summary: one min + one max per
+        // (kv_head, dim), same shape as `key_scale_bytes`.
+        let search_bytes = 2 * KV_HEADS * HEAD_DIM * std::mem::size_of::<f16>();
         let per_page = PAGE_HEADER_BYTES
             + key_payload
             + value_payload
             + key_scale_bytes
-            + value_scale_bytes;
+            + value_scale_bytes
+            + search_bytes;
         let sealed_total = per_page
             .checked_mul(sealed_pages)
             .ok_or(ModelError::Shape {
