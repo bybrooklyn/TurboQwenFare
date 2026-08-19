@@ -139,7 +139,10 @@ pub fn full_context_state_reserved_bytes(
             }
         }
     }
-    assert_eq!(gdn_states.len() + full_attention.len(), Qwen36Geometry::NUM_LAYERS);
+    assert_eq!(
+        gdn_states.len() + full_attention.len(),
+        Qwen36Geometry::NUM_LAYERS
+    );
     Ok(broker.snapshot().reserved)
 }
 
@@ -229,8 +232,7 @@ mod tests {
 
     #[test]
     fn seeding_reaches_the_declared_depth_and_one_step_completes() {
-        let point =
-            measure_one_step_at_depth(BackendChoice::Bf16, 300, 512).unwrap();
+        let point = measure_one_step_at_depth(BackendChoice::Bf16, 300, 512).unwrap();
         assert_eq!(point.context_tokens, 300);
         assert!(point.one_step_elapsed.as_secs() < 5);
     }
@@ -248,9 +250,7 @@ mod tests {
     #[test]
     #[ignore = "run with --release; Phase 29/31 populated-context attention scaling"]
     fn attention_cost_scales_with_populated_context_depth_toward_128k() {
-        let depths = [
-            512usize, 4_096, 16_384, 65_536, 131_072, 262_144,
-        ];
+        let depths = [512usize, 4_096, 16_384, 65_536, 131_072, 262_144];
         for &depth in &depths {
             let max_tokens = depth + 1;
             for (name, choice) in [

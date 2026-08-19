@@ -815,9 +815,13 @@ mod tests {
         let steps = crate::context::tqkv::PAGE_TOKENS + 5;
         let broker_bf16 = broker();
         let broker_tqkv = broker();
-        let mut bf16_layer =
-            FullAttentionLayer::new_with_backend(&broker_bf16, LayerId(3), steps, BackendChoice::Bf16)
-                .unwrap();
+        let mut bf16_layer = FullAttentionLayer::new_with_backend(
+            &broker_bf16,
+            LayerId(3),
+            steps,
+            BackendChoice::Bf16,
+        )
+        .unwrap();
         let mut tqkv_layer = FullAttentionLayer::new_with_backend(
             &broker_tqkv,
             LayerId(3),
@@ -835,8 +839,12 @@ mod tests {
                 .map(|_| xorshift_activation(&mut state))
                 .collect();
             let gate: Vec<f32> = (0..HEADS * HEAD_DIM).map(|_| 4.0).collect();
-            let k: Vec<f32> = (0..KV_WIDTH).map(|_| xorshift_activation(&mut state)).collect();
-            let v: Vec<f32> = (0..KV_WIDTH).map(|_| xorshift_activation(&mut state)).collect();
+            let k: Vec<f32> = (0..KV_WIDTH)
+                .map(|_| xorshift_activation(&mut state))
+                .collect();
+            let v: Vec<f32> = (0..KV_WIDTH)
+                .map(|_| xorshift_activation(&mut state))
+                .collect();
 
             let bf16_out = bf16_layer
                 .decode_projected(q.clone(), &gate, k.clone(), &v, &q_norm, &k_norm)

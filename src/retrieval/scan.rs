@@ -46,7 +46,14 @@ pub fn scan_root(root: &Path) -> std::io::Result<ScanReport> {
     let mut report = ScanReport::default();
     let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
     visited_dirs.insert(canonical_root.clone());
-    walk(root, &canonical_root, "", IgnoreSet::new(), &mut visited_dirs, &mut report)?;
+    walk(
+        root,
+        &canonical_root,
+        "",
+        IgnoreSet::new(),
+        &mut visited_dirs,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -147,7 +154,14 @@ fn walk(
                 continue;
             }
             visited_dirs.insert(target.clone());
-            walk(&entry_path, canonical_root, &rel_path, ignores.clone(), visited_dirs, report)?;
+            walk(
+                &entry_path,
+                canonical_root,
+                &rel_path,
+                ignores.clone(),
+                visited_dirs,
+                report,
+            )?;
             continue;
         }
 
@@ -210,9 +224,15 @@ mod tests {
     fn scans_the_real_tqf_repository_and_classifies_its_own_source() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let report = scan_root(root).unwrap();
-        assert!(report.files.len() > 50, "expected a substantial real repo scan");
         assert!(
-            report.files.iter().all(|f| !f.relative_path.starts_with("target/")),
+            report.files.len() > 50,
+            "expected a substantial real repo scan"
+        );
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|f| !f.relative_path.starts_with("target/")),
             "target/ should have been excluded by the real .gitignore"
         );
         let rust_files = report
@@ -220,11 +240,16 @@ mod tests {
             .iter()
             .filter(|f| f.classification.language == Some("Rust"))
             .count();
-        assert!(rust_files > 50, "expected most of this crate's own .rs files to classify as Rust");
+        assert!(
+            rust_files > 50,
+            "expected most of this crate's own .rs files to classify as Rust"
+        );
         let misclassified_rust: Vec<&str> = report
             .files
             .iter()
-            .filter(|f| f.relative_path.ends_with(".rs") && f.classification.language != Some("Rust"))
+            .filter(|f| {
+                f.relative_path.ends_with(".rs") && f.classification.language != Some("Rust")
+            })
             .map(|f| f.relative_path.as_str())
             .collect();
         println!(
@@ -243,7 +268,10 @@ mod tests {
     #[test]
     fn scans_real_files_and_classifies_them() {
         let root = temp_dir("basic");
-        write_file(&root.join("src/main.rs"), b"fn main() {\n    let mut x = 1;\n}\n");
+        write_file(
+            &root.join("src/main.rs"),
+            b"fn main() {\n    let mut x = 1;\n}\n",
+        );
         write_file(&root.join("README.md"), b"# Title\n\nSome text.\n");
 
         let report = scan_root(&root).unwrap();
@@ -266,7 +294,11 @@ mod tests {
         write_file(&root.join("src/lib.rs"), b"pub fn f() {}\n");
 
         let report = scan_root(&root).unwrap();
-        let paths: Vec<&str> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+        let paths: Vec<&str> = report
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
         assert!(paths.contains(&"src/lib.rs"));
         assert!(!paths.contains(&"app.log"));
         assert!(!paths.iter().any(|p| p.starts_with("target/")));
@@ -282,7 +314,11 @@ mod tests {
         write_file(&root.join("other.generated"), b"pub fn g() {}\n");
 
         let report = scan_root(&root).unwrap();
-        let paths: Vec<&str> = report.files.iter().map(|f| f.relative_path.as_str()).collect();
+        let paths: Vec<&str> = report
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
         assert!(paths.contains(&"important.generated"));
         assert!(!paths.contains(&"other.generated"));
         let _ = fs::remove_dir_all(&root);
@@ -300,7 +336,11 @@ mod tests {
         assert!(report.symlink_cycles_skipped > 0);
         // The real file is still found exactly once, not looped forever.
         assert_eq!(
-            report.files.iter().filter(|f| f.relative_path == "real/file.rs").count(),
+            report
+                .files
+                .iter()
+                .filter(|f| f.relative_path == "real/file.rs")
+                .count(),
             1
         );
         let _ = fs::remove_dir_all(&root);
@@ -316,7 +356,10 @@ mod tests {
 
         let report = scan_root(&root).unwrap();
         assert!(report.symlinks_escaping_root_skipped > 0);
-        assert!(report.files.iter().all(|f| f.relative_path != "escaped/secret.rs"));
+        assert!(report
+            .files
+            .iter()
+            .all(|f| f.relative_path != "escaped/secret.rs"));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
     }

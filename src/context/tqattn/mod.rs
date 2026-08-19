@@ -134,14 +134,14 @@ pub fn select_pages(
             continue;
         }
 
-        let mut selected_pages: Vec<usize> =
-            always.iter().copied().chain(scored[..budget].iter().map(|(i, _)| *i)).collect();
+        let mut selected_pages: Vec<usize> = always
+            .iter()
+            .copied()
+            .chain(scored[..budget].iter().map(|(i, _)| *i))
+            .collect();
         selected_pages.sort_unstable();
         selected_pages.dedup();
-        let selected_tokens = selected_pages
-            .iter()
-            .map(|&i| pages[i].token_count())
-            .sum();
+        let selected_tokens = selected_pages.iter().map(|&i| pages[i].token_count()).sum();
         return SelectionResult {
             selected_pages,
             expanded_for_uncertainty: expanded,
@@ -176,22 +176,25 @@ mod tests {
         special_page: usize,
         special_value: f32,
     ) -> TqkvPagedCache {
-        let mut cache = TqkvPagedCache::new(
-            broker,
-            LayerId(0),
-            pages * PAGE_TOKENS,
-            TqkvPrecision::Q8,
-        )
-        .unwrap();
+        let mut cache =
+            TqkvPagedCache::new(broker, LayerId(0), pages * PAGE_TOKENS, TqkvPrecision::Q8)
+                .unwrap();
         let mut state = 0xFEEDu64;
         for page in 0..pages {
             for _ in 0..PAGE_TOKENS {
                 let (key, value): (Vec<f32>, Vec<f32>) = if page == special_page {
-                    (vec![special_value; KV_HEADS * HEAD_DIM], vec![9.0; KV_HEADS * HEAD_DIM])
+                    (
+                        vec![special_value; KV_HEADS * HEAD_DIM],
+                        vec![9.0; KV_HEADS * HEAD_DIM],
+                    )
                 } else {
                     (
-                        (0..KV_HEADS * HEAD_DIM).map(|_| xorshift(&mut state)).collect(),
-                        (0..KV_HEADS * HEAD_DIM).map(|_| xorshift(&mut state)).collect(),
+                        (0..KV_HEADS * HEAD_DIM)
+                            .map(|_| xorshift(&mut state))
+                            .collect(),
+                        (0..KV_HEADS * HEAD_DIM)
+                            .map(|_| xorshift(&mut state))
+                            .collect(),
                     )
                 };
                 cache.push(&key, &value).unwrap();
@@ -261,7 +264,10 @@ mod tests {
                     xorshift(&mut state) * 0.1
                 };
                 cache
-                    .push(&vec![value; KV_HEADS * HEAD_DIM], &vec![1.0; KV_HEADS * HEAD_DIM])
+                    .push(
+                        &vec![value; KV_HEADS * HEAD_DIM],
+                        &vec![1.0; KV_HEADS * HEAD_DIM],
+                    )
                     .unwrap();
             }
         }
@@ -311,7 +317,9 @@ mod tests {
         let selected_ranges: Vec<std::ops::Range<usize>> = result
             .selected_pages
             .iter()
-            .map(|&p| p * crate::context::tqkv::PAGE_TOKENS..(p + 1) * crate::context::tqkv::PAGE_TOKENS)
+            .map(|&p| {
+                p * crate::context::tqkv::PAGE_TOKENS..(p + 1) * crate::context::tqkv::PAGE_TOKENS
+            })
             .collect();
         let started_selective = std::time::Instant::now();
         let mut selective_score = 0f32;

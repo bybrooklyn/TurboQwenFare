@@ -602,7 +602,11 @@ impl Qwen36BoundedReferenceRuntime {
     /// (`capture_tqkv_for_snapshot` returns `None` for them — prefix dedup
     /// is a TQKV-specific mechanism, `TQF_TQKV_ENABLED=1` is required for
     /// this to capture anything useful).
-    pub fn snapshot_session(&self, store: &PrefixSnapshotStore, tokens: &[u32]) -> Result<[u8; 32]> {
+    pub fn snapshot_session(
+        &self,
+        store: &PrefixSnapshotStore,
+        tokens: &[u32],
+    ) -> Result<[u8; 32]> {
         let mut full_attention = Vec::new();
         let mut gdn = Vec::new();
         for layer in &self.layers {

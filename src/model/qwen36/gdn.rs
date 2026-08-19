@@ -383,7 +383,11 @@ impl GdnState {
         out
     }
 
-    pub fn from_bytes(broker: &MemoryBroker, layer: LayerId, bytes: &[u8]) -> crate::error::Result<Self> {
+    pub fn from_bytes(
+        broker: &MemoryBroker,
+        layer: LayerId,
+        bytes: &[u8],
+    ) -> crate::error::Result<Self> {
         let mut state = Self::new(broker, layer)?;
         let recurrent_bytes = state.recurrent.len() * std::mem::size_of::<f32>();
         let conv_bytes = state.conv.history.len() * std::mem::size_of::<f32>();

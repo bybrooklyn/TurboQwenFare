@@ -402,9 +402,9 @@ impl SealedPage {
             self.precision,
         );
         for group in 0..VALUE_GROUPS {
-            let scale =
-                self.value_scales[(local_token * KV_HEADS + kv_head) * VALUE_GROUPS + group]
-                    .to_f32();
+            let scale = self.value_scales
+                [(local_token * KV_HEADS + kv_head) * VALUE_GROUPS + group]
+                .to_f32();
             for dim in group * VALUE_GROUP..(group + 1) * VALUE_GROUP {
                 out[dim] = codes[dim] as f32 * scale;
             }
@@ -473,7 +473,8 @@ impl SealedPage {
         let scales_region = &body[key_len + value_len..];
         let key_scale_count = KV_HEADS * HEAD_DIM;
         let value_scale_count = header.token_count as usize * KV_HEADS * VALUE_GROUPS;
-        let expected_scale_bytes = (key_scale_count + value_scale_count) * std::mem::size_of::<f16>();
+        let expected_scale_bytes =
+            (key_scale_count + value_scale_count) * std::mem::size_of::<f16>();
         if scales_region.len() < expected_scale_bytes {
             return Err(ModelError::Shape {
                 tensor: "TQKV persisted scale metadata",
@@ -552,7 +553,11 @@ fn pack_codes(codes: &[i8], precision: TqkvPrecision) -> Vec<u8> {
             let mut out = Vec::with_capacity(codes.len().div_ceil(2));
             for pair in codes.chunks(2) {
                 let lo = (pair[0] & 0x0f) as u8;
-                let hi = if pair.len() == 2 { (pair[1] & 0x0f) as u8 } else { 0 };
+                let hi = if pair.len() == 2 {
+                    (pair[1] & 0x0f) as u8
+                } else {
+                    0
+                };
                 out.push(lo | (hi << 4));
             }
             out
@@ -560,20 +565,22 @@ fn pack_codes(codes: &[i8], precision: TqkvPrecision) -> Vec<u8> {
     }
 }
 
-fn unpack_codes(
-    bytes: &[u8],
-    offset: usize,
-    count: usize,
-    precision: TqkvPrecision,
-) -> Vec<i8> {
+fn unpack_codes(bytes: &[u8], offset: usize, count: usize, precision: TqkvPrecision) -> Vec<i8> {
     match precision {
-        TqkvPrecision::Q8 => bytes[offset..offset + count].iter().map(|&b| b as i8).collect(),
+        TqkvPrecision::Q8 => bytes[offset..offset + count]
+            .iter()
+            .map(|&b| b as i8)
+            .collect(),
         TqkvPrecision::Q4 => {
             let mut out = Vec::with_capacity(count);
             for i in 0..count {
                 let index = offset + i;
                 let byte = bytes[index / 2];
-                let nibble = if index.is_multiple_of(2) { byte & 0x0f } else { byte >> 4 };
+                let nibble = if index.is_multiple_of(2) {
+                    byte & 0x0f
+                } else {
+                    byte >> 4
+                };
                 // Sign-extend the low 4 bits.
                 out.push(((nibble << 4) as i8) >> 4);
             }
@@ -636,7 +643,12 @@ pub(crate) fn q4_key_baseline(keys: &[f32], token_count: usize) -> (usize, f32) 
     let mut max_err = 0f32;
     for token in 0..token_count {
         for head in 0..KV_HEADS {
-            let local_codes = unpack_codes(&packed, (token * KV_HEADS + head) * HEAD_DIM, HEAD_DIM, TqkvPrecision::Q4);
+            let local_codes = unpack_codes(
+                &packed,
+                (token * KV_HEADS + head) * HEAD_DIM,
+                HEAD_DIM,
+                TqkvPrecision::Q4,
+            );
             let base = (token * KV_HEADS + head) * HEAD_DIM;
             for dim in 0..HEAD_DIM {
                 let decoded = local_codes[dim] as f32 * f16_scales[head * HEAD_DIM + dim].to_f32();
@@ -737,7 +749,11 @@ impl TqkvPagedCache {
     }
 
     pub fn len(&self) -> usize {
-        self.sealed.iter().map(SealedPage::token_count).sum::<usize>() + self.tail_len()
+        self.sealed
+            .iter()
+            .map(SealedPage::token_count)
+            .sum::<usize>()
+            + self.tail_len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -766,7 +782,12 @@ impl TqkvPagedCache {
     /// pages only — the tail is accounted separately since it is still
     /// high-precision and not yet quantized).
     pub fn sealed_resident_bytes(&self) -> Bytes {
-        Bytes(self.sealed.iter().map(SealedPage::resident_bytes).sum::<usize>() as u64)
+        Bytes(
+            self.sealed
+                .iter()
+                .map(SealedPage::resident_bytes)
+                .sum::<usize>() as u64,
+        )
     }
 
     /// Clears logical content while keeping the existing broker lease
@@ -890,10 +911,12 @@ pub fn tqkv_enabled() -> bool {
 /// "first compressed oracle beneath BF16".
 pub fn tqkv_precision() -> TqkvPrecision {
     static PRECISION: std::sync::OnceLock<TqkvPrecision> = std::sync::OnceLock::new();
-    *PRECISION.get_or_init(|| match std::env::var("TQF_TQKV_PRECISION").ok().as_deref() {
-        Some("q4") | Some("Q4") => TqkvPrecision::Q4,
-        _ => TqkvPrecision::Q8,
-    })
+    *PRECISION.get_or_init(
+        || match std::env::var("TQF_TQKV_PRECISION").ok().as_deref() {
+            Some("q4") | Some("Q4") => TqkvPrecision::Q4,
+            _ => TqkvPrecision::Q8,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -966,8 +989,7 @@ mod tests {
     #[test]
     fn cache_reserves_bytes_before_allocating_and_releases_on_drop() {
         let broker = broker();
-        let cache =
-            TqkvPagedCache::new(&broker, LayerId(3), 512, TqkvPrecision::Q8).unwrap();
+        let cache = TqkvPagedCache::new(&broker, LayerId(3), 512, TqkvPrecision::Q8).unwrap();
         assert_eq!(
             broker.snapshot().reserved,
             TqkvPagedCache::bytes_for_tokens(512, TqkvPrecision::Q8).unwrap()
@@ -996,8 +1018,7 @@ mod tests {
     #[test]
     fn push_seals_a_page_exactly_at_the_boundary_and_verifies() {
         let broker = broker();
-        let mut cache =
-            TqkvPagedCache::new(&broker, LayerId(1), 1024, TqkvPrecision::Q8).unwrap();
+        let mut cache = TqkvPagedCache::new(&broker, LayerId(1), 1024, TqkvPrecision::Q8).unwrap();
         let (keys, values) = synthetic_kv(PAGE_TOKENS + 5, 42);
         for token in 0..PAGE_TOKENS + 5 {
             let base = token * KV_WIDTH;
@@ -1086,8 +1107,7 @@ mod tests {
     #[test]
     fn tail_tokens_decode_exactly_at_full_precision() {
         let broker = broker();
-        let mut cache =
-            TqkvPagedCache::new(&broker, LayerId(0), 16, TqkvPrecision::Q8).unwrap();
+        let mut cache = TqkvPagedCache::new(&broker, LayerId(0), 16, TqkvPrecision::Q8).unwrap();
         let (keys, values) = synthetic_kv(3, 55);
         for token in 0..3 {
             let base = token * KV_WIDTH;

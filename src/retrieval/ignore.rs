@@ -91,7 +91,11 @@ fn glob_match_rec(p: &[char], t: &[char]) -> bool {
             // `**`: match zero or more path segments (including `/`). A
             // following `/` is elided in the zero-segment case (`**/*.rs`
             // must match `main.rs`, not just `dir/main.rs`).
-            let rest = if p.len() >= 3 && p[2] == '/' { &p[3..] } else { &p[2..] };
+            let rest = if p.len() >= 3 && p[2] == '/' {
+                &p[3..]
+            } else {
+                &p[2..]
+            };
             for split in 0..=t.len() {
                 if glob_match_rec(rest, &t[split..]) {
                     return true;

@@ -615,7 +615,8 @@ mod tests {
                 .to_string_lossy()
                 .to_string()
         });
-        let store = crate::context::prefix::PrefixSnapshotStore::open(&store_dir, u64::MAX).unwrap();
+        let store =
+            crate::context::prefix::PrefixSnapshotStore::open(&store_dir, u64::MAX).unwrap();
 
         let broker_a = MemoryBroker::new(Bytes(FOUR_GIB));
         let mut runtime_a = Qwen36BoundedReferenceRuntime::open(
@@ -647,7 +648,10 @@ mod tests {
         let restore_started = Instant::now();
         let hit = runtime_b.restore_session(&store, &fed_tokens).unwrap();
         let restore_elapsed = restore_started.elapsed();
-        assert!(hit, "exact-prefix lookup should hit the snapshot just stored");
+        assert!(
+            hit,
+            "exact-prefix lookup should hit the snapshot just stored"
+        );
 
         let continuation_from_live = runtime_a.decode_greedy(input).unwrap().token;
         let continuation_from_restored = runtime_b.decode_greedy(input).unwrap().token;

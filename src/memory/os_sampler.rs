@@ -115,7 +115,9 @@ pub fn assert_footprint_within(
         resident_bytes: before.resident_bytes.max(after.resident_bytes),
         virtual_bytes: before.virtual_bytes.max(after.virtual_bytes),
         resident_peak_bytes: before.resident_peak_bytes.max(after.resident_peak_bytes),
-        broker_reserved_bytes: before.broker_reserved_bytes.max(after.broker_reserved_bytes),
+        broker_reserved_bytes: before
+            .broker_reserved_bytes
+            .max(after.broker_reserved_bytes),
         broker_peak_bytes: before.broker_peak_bytes.max(after.broker_peak_bytes),
     };
     if sample.resident_bytes > budget.0.saturating_add(overhead.0) {

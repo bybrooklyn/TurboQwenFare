@@ -147,8 +147,9 @@ fn hex_decode(text: &str) -> Result<Vec<u8>> {
     (0..text.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&text[i..i + 2], 16)
-                .map_err(|_| ContextError::Invalid(format!("prefix store: bad hex byte in {text}")).into())
+            u8::from_str_radix(&text[i..i + 2], 16).map_err(|_| {
+                ContextError::Invalid(format!("prefix store: bad hex byte in {text}")).into()
+            })
         })
         .collect()
 }
@@ -193,7 +194,10 @@ impl PrefixSnapshotStore {
     }
 
     fn blob_path(&self, hex: &str) -> PathBuf {
-        self.root.join("blobs").join(&hex[0..2]).join(format!("{hex}.bin"))
+        self.root
+            .join("blobs")
+            .join(&hex[0..2])
+            .join(format!("{hex}.bin"))
     }
 
     fn index_path(&self) -> PathBuf {
@@ -205,7 +209,9 @@ impl PrefixSnapshotStore {
     }
 
     fn manifest_path(&self, prefix_hash_hex: &str) -> PathBuf {
-        self.root.join("snapshots").join(format!("{prefix_hash_hex}.toml"))
+        self.root
+            .join("snapshots")
+            .join(format!("{prefix_hash_hex}.toml"))
     }
 
     fn load_index(&self) -> Result<StoreIndex> {
@@ -242,7 +248,12 @@ impl PrefixSnapshotStore {
         *hasher.finalize().as_bytes()
     }
 
-    fn write_blob_if_absent(&self, refcounts: &mut RefcountTable, id_hex: &str, bytes: &[u8]) -> Result<()> {
+    fn write_blob_if_absent(
+        &self,
+        refcounts: &mut RefcountTable,
+        id_hex: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
         let entry = refcounts.counts.entry(id_hex.to_string()).or_insert(0);
         if *entry == 0 {
             atomic_write_bytes(&self.blob_path(id_hex), bytes)?;
@@ -383,14 +394,22 @@ impl PrefixSnapshotStore {
 
     fn touch(&self, prefix_hash_hex: &str) -> Result<()> {
         let mut index = self.load_index()?;
-        if let Some(entry) = index.entries.iter_mut().find(|e| e.prefix_hash == prefix_hash_hex) {
+        if let Some(entry) = index
+            .entries
+            .iter_mut()
+            .find(|e| e.prefix_hash == prefix_hash_hex)
+        {
             entry.last_used_unix = now_unix();
             atomic_write_toml(&self.index_path(), &index)?;
         }
         Ok(())
     }
 
-    fn remove_snapshot_internal(&self, refcounts: &mut RefcountTable, prefix_hash_hex: &str) -> Result<()> {
+    fn remove_snapshot_internal(
+        &self,
+        refcounts: &mut RefcountTable,
+        prefix_hash_hex: &str,
+    ) -> Result<()> {
         let manifest_path = self.manifest_path(prefix_hash_hex);
         let text = match std::fs::read_to_string(&manifest_path) {
             Ok(text) => text,
@@ -459,7 +478,12 @@ impl PrefixSnapshotStore {
     /// Current tracked total bytes across all live snapshots (for tests
     /// and the quality/memory qualification doc).
     pub fn total_bytes(&self) -> Result<u64> {
-        Ok(self.load_index()?.entries.iter().map(|e| e.total_bytes).sum())
+        Ok(self
+            .load_index()?
+            .entries
+            .iter()
+            .map(|e| e.total_bytes)
+            .sum())
     }
 
     pub fn snapshot_count(&self) -> Result<usize> {
@@ -489,10 +513,8 @@ mod tests {
     use crate::model::qwen36::attention::{BackendChoice, FullAttentionLayer};
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tqf-prefix-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tqf-prefix-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -566,9 +588,14 @@ mod tests {
                 .unwrap();
         }
         let capture = layer.capture_tqkv_for_snapshot(LayerId(3)).unwrap();
-        assert!(!capture.pages.is_empty(), "should have sealed at least one page");
+        assert!(
+            !capture.pages.is_empty(),
+            "should have sealed at least one page"
+        );
 
-        store.store(&tokens, std::slice::from_ref(&capture), &[]).unwrap();
+        store
+            .store(&tokens, std::slice::from_ref(&capture), &[])
+            .unwrap();
         let loaded = store.load(&tokens, &broker).unwrap().unwrap();
         assert_eq!(loaded.full_attention.len(), 1);
         let restored_layer = &loaded.full_attention[0];

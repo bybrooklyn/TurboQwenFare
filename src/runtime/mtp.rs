@@ -36,7 +36,9 @@ fn q4_bytes(rows: usize, cols: usize) -> usize {
 /// `ROUTED_EXPERT_WIDTH` (spec §117) — the same formula
 /// `experts::WholeExpertLfuCache` uses for real cache accounting.
 pub fn expert_bytes() -> u64 {
-    (q4_bytes(EXPERT_WIDTH, HIDDEN) + q4_bytes(EXPERT_WIDTH, HIDDEN) + q4_bytes(HIDDEN, EXPERT_WIDTH)) as u64
+    (q4_bytes(EXPERT_WIDTH, HIDDEN)
+        + q4_bytes(EXPERT_WIDTH, HIDDEN)
+        + q4_bytes(HIDDEN, EXPERT_WIDTH)) as u64
 }
 
 /// Spec §172's MTP runtime contract, matching NVMAI's real
@@ -289,7 +291,10 @@ mod tests {
         assert_eq!(result.union_experts, 12); // 4 shared, 8 unique
         assert_eq!(result.separate_experts_sum, 16);
         assert!(result.saved_bytes > 0);
-        assert_eq!(result.union_bytes + result.saved_bytes, result.separate_bytes_sum);
+        assert_eq!(
+            result.union_bytes + result.saved_bytes,
+            result.separate_bytes_sum
+        );
     }
 
     /// Real measured expert-union bandwidth (spec §68/§172), computed from
@@ -319,8 +324,7 @@ mod tests {
                     .iter()
                     .find(|l| l.layer == boundary_layer.layer)
                     .expect("trace layers are 1:1 across steps");
-                let boundary_ids: [ExpertId; TOP_K] =
-                    boundary_layer.expert_ids.map(ExpertId);
+                let boundary_ids: [ExpertId; TOP_K] = boundary_layer.expert_ids.map(ExpertId);
                 let draft_ids: [ExpertId; TOP_K] = draft_layer.expert_ids.map(ExpertId);
                 let result = union_bandwidth(&boundary_ids, &draft_ids);
                 total_union_bytes += result.union_bytes;

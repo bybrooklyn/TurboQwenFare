@@ -162,7 +162,13 @@ impl LexicalIndex {
         self.search_with_params(query, top_k, DEFAULT_K1, DEFAULT_B)
     }
 
-    pub fn search_with_params(&self, query: &str, top_k: usize, k1: f32, b: f32) -> Vec<(String, f32)> {
+    pub fn search_with_params(
+        &self,
+        query: &str,
+        top_k: usize,
+        k1: f32,
+        b: f32,
+    ) -> Vec<(String, f32)> {
         let query_terms: Vec<String> = tokenize(query).into_iter().collect();
         let n = self.chunks.len() as f32;
         if n == 0.0 {
@@ -197,7 +203,11 @@ impl LexicalIndex {
     pub fn exact_lookup(&self, identifier: &str) -> Vec<&str> {
         self.exact
             .get(identifier)
-            .map(|ids| ids.iter().map(|&id| self.chunks[id as usize].path.as_str()).collect())
+            .map(|ids| {
+                ids.iter()
+                    .map(|&id| self.chunks[id as usize].path.as_str())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -208,10 +218,22 @@ mod tests {
 
     #[test]
     fn identifier_subtokens_split_snake_camel_pascal_and_digit_boundaries() {
-        assert_eq!(split_identifier("snake_case_name"), vec!["snake", "case", "name"]);
-        assert_eq!(split_identifier("camelCaseName"), vec!["camel", "Case", "Name"]);
-        assert_eq!(split_identifier("PascalCaseName"), vec!["Pascal", "Case", "Name"]);
-        assert_eq!(split_identifier("SCREAMING_CASE"), vec!["SCREAMING", "CASE"]);
+        assert_eq!(
+            split_identifier("snake_case_name"),
+            vec!["snake", "case", "name"]
+        );
+        assert_eq!(
+            split_identifier("camelCaseName"),
+            vec!["camel", "Case", "Name"]
+        );
+        assert_eq!(
+            split_identifier("PascalCaseName"),
+            vec!["Pascal", "Case", "Name"]
+        );
+        assert_eq!(
+            split_identifier("SCREAMING_CASE"),
+            vec!["SCREAMING", "CASE"]
+        );
         assert_eq!(split_identifier("HTTPServer"), vec!["HTTP", "Server"]);
         assert_eq!(split_identifier("value2Count"), vec!["value", "2", "Count"]);
         assert_eq!(split_identifier("plain"), vec!["plain"]);
@@ -287,7 +309,10 @@ mod tests {
                 Some((f.relative_path.clone(), contents))
             })
             .collect();
-        assert!(documents.len() > 100, "expected most of this crate's real .rs files indexed");
+        assert!(
+            documents.len() > 100,
+            "expected most of this crate's real .rs files indexed"
+        );
         let index = LexicalIndex::build(&documents);
 
         // Exact lane: a real, unambiguous type name.

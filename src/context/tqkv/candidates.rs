@@ -20,7 +20,7 @@ use super::{HEAD_DIM, KV_HEADS, KV_WIDTH, VALUE_GROUP, VALUE_GROUPS};
 /// convention as Q8/Q4 (section 158). Range [-3,3] (8 codes, one excluded,
 /// mirroring Q4's [-7,7] symmetric convention).
 pub struct Q3Symmetric {
-    pub codes: Vec<u8>, // 3-bit packed, token-major within (kv_head,dim)
+    pub codes: Vec<u8>,   // 3-bit packed, token-major within (kv_head,dim)
     pub scales: Vec<f16>, // per (kv_head, dim)
     pub token_count: usize,
 }
@@ -52,7 +52,9 @@ impl Q3Symmetric {
                 let base = (token * KV_HEADS + head) * HEAD_DIM;
                 for dim in 0..HEAD_DIM {
                     let scale = scales[head * HEAD_DIM + dim];
-                    let q = (keys[base + dim] / scale).round().clamp(-Q3_CLAMP, Q3_CLAMP);
+                    let q = (keys[base + dim] / scale)
+                        .round()
+                        .clamp(-Q3_CLAMP, Q3_CLAMP);
                     raw_codes[base + dim] = q as i8;
                 }
             }
@@ -139,8 +141,7 @@ impl Q2Asymmetric {
     }
 
     pub fn payload_bytes(&self) -> usize {
-        self.codes.len()
-            + (self.mins.len() + self.scales.len()) * std::mem::size_of::<f16>()
+        self.codes.len() + (self.mins.len() + self.scales.len()) * std::mem::size_of::<f16>()
     }
 }
 
@@ -545,7 +546,9 @@ mod tests {
 
     fn synthetic(tokens: usize, seed: u64) -> Vec<f32> {
         let mut state = seed | 1;
-        (0..tokens * KV_WIDTH).map(|_| xorshift(&mut state)).collect()
+        (0..tokens * KV_WIDTH)
+            .map(|_| xorshift(&mut state))
+            .collect()
     }
 
     /// Deliberately adds heavy per-column outliers (deterministic, every
@@ -743,7 +746,11 @@ mod tests {
         let rotated = RotatedQ4::encode(&heavy_outlier_keys, tokens);
         let rotated_err =
             max_abs_error(tokens, &heavy_outlier_keys, |t, h| rotated.decode_one(t, h));
-        rows.push(("Rotated-Q4 (RHT, frequent-skew)", rotated.payload_bytes(), rotated_err));
+        rows.push((
+            "Rotated-Q4 (RHT, frequent-skew)",
+            rotated.payload_bytes(),
+            rotated_err,
+        ));
 
         let rare_outlier_keys = synthetic_with_one_outlier(tokens, 43);
         let plain_q4_on_rare = super::super::q4_key_baseline(&rare_outlier_keys, tokens);
@@ -755,7 +762,11 @@ mod tests {
         let outlier = OutlierSplitQ4::encode(&rare_outlier_keys, tokens);
         let outlier_err =
             max_abs_error(tokens, &rare_outlier_keys, |t, h| outlier.decode_one(t, h));
-        rows.push(("Outlier-split Q4 (rare-outlier)", outlier.payload_bytes(), outlier_err));
+        rows.push((
+            "Outlier-split Q4 (rare-outlier)",
+            outlier.payload_bytes(),
+            outlier_err,
+        ));
 
         println!("phase28_candidate_matrix page_tokens={tokens} bf16_reference_bytes={bf16_bytes}");
         for (name, bytes, max_err) in &rows {
