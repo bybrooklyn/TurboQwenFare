@@ -162,6 +162,8 @@ env-template:
     # Helper models (Phases 37/43/48) — separate checkpoints.
     TQF_PPLX_SAFETENSORS=
     TQF_PPLX_TOKENIZER=
+    # The immutable commit for the helper model, used by `just pin-helper-model`.
+    TQF_PPLX_REVISION=
     TQF_GTE_SAFETENSORS=
     TQF_GTE_TOKENIZER=
     TQF_VISION_MMPROJ=
@@ -188,6 +190,25 @@ qual-context:
 # Expert cache/prefetch/tiling replays over the real 128-token route trace.
 qual-experts:
     cargo test --release -- --ignored --nocapture {{test_flags}} experts::
+
+# Verifies the file really is pplx-embed (every tensor `helper_model::roles`
+# names, across all 28 layers) before hashing it, then prints the constants
+# to paste into `src/source/pinned.rs`. The hash comes from the artifact you
+# will actually serve, which is a stronger guarantee than one copied from a
+# registry listing.
+#
+# Capture the helper model's pinned constants from a local copy.
+pin-helper-model:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${TQF_PPLX_SAFETENSORS:-}" ]]; then
+        echo "Set TQF_PPLX_SAFETENSORS to your local pplx-embed-v1-0.6b checkpoint." >&2
+        echo "Optionally set TQF_PPLX_REVISION to the immutable commit from the" >&2
+        echo "model page's Files-and-versions tab, so the pin records it too." >&2
+        exit 2
+    fi
+    cargo test --release print_pinned_constants_for_the_local_helper_checkpoint \
+        -- --ignored --nocapture {{test_flags}}
 
 # Preflight names exactly what is missing, then runs the greedy-parity
 # guard, starts the real server, and smokes both surfaces against real
