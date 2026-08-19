@@ -12,7 +12,7 @@ use serde::Serialize;
 use tokio_stream::Stream;
 
 use crate::runtime::stream_decoder::StreamEvent;
-use crate::runtime::{GeneratedOutput, NormalizedRequest, Session};
+use crate::runtime::{GeneratedOutput, NormalizedRequest, ProtocolFlavor, Session};
 use crate::server::AppState;
 
 #[derive(Serialize)]
@@ -55,20 +55,20 @@ pub async fn generate_with_session(
     let Some(_permit) = state.generation_slot.acquire(&session.cancellation).await else {
         return Err(not_ready_body(
             "request cancelled before it reached the generation slot",
-            request.stream,
+            request,
         ));
     };
 
     if !state.model_installed {
         return Err(not_ready_body(
             "no model installed yet; run `tqf` to complete first-run setup",
-            request.stream,
+            request,
         ));
     }
     let Some(generator) = &state.generator else {
         return Err(not_ready_body(
             "model receipt exists but its Qwen runtime is not loaded",
-            request.stream,
+            request,
         ));
     };
     match generator
@@ -78,7 +78,7 @@ pub async fn generate_with_session(
         Ok(output) => Ok(output),
         Err(error) => Err(not_ready_body(
             &format!("generation failed: {error}"),
-            request.stream,
+            request,
         )),
     }
 }
@@ -104,33 +104,41 @@ pub async fn generate_streaming_with_session(
     let Some(_permit) = state.generation_slot.acquire(&session.cancellation).await else {
         return Err(not_ready_body(
             "request cancelled before it reached the generation slot",
-            request.stream,
+            request,
         ));
     };
 
     if !state.model_installed {
         return Err(not_ready_body(
             "no model installed yet; run `tqf` to complete first-run setup",
-            request.stream,
+            request,
         ));
     }
     let Some(generator) = &state.generator else {
         return Err(not_ready_body(
             "model receipt exists but its Qwen runtime is not loaded",
-            request.stream,
+            request,
         ));
     };
     generator
         .generate_streaming(request.clone(), session.cancellation.clone(), events)
         .await
-        .map_err(|error| not_ready_body(&format!("generation failed: {error}"), request.stream))
+        .map_err(|error| not_ready_body(&format!("generation failed: {error}"), request))
 }
 
-fn not_ready_body(message: &str, stream: bool) -> Response {
-    if stream {
-        sse_error(message).into_response()
-    } else {
-        (
+/// Translates an unavailable state into the error envelope the *calling
+/// protocol* uses (spec §212: OpenAI surfaces return OpenAI-like errors,
+/// Ollama surfaces return Ollama-like ones, all mapped from one internal
+/// taxonomy).
+///
+/// Before this was protocol-aware, an Ollama client asking a server with
+/// no model installed got OpenAI's nested `{"error": {"message": ...}}`
+/// on an `/api/*` route, which Ollama clients do not parse.
+fn not_ready_body(message: &str, request: &NormalizedRequest) -> Response {
+    match request.protocol {
+        ProtocolFlavor::Ollama => ollama_not_ready(message, request.stream),
+        _ if request.stream => sse_error(message).into_response(),
+        _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
                 error: ErrorDetail {
@@ -140,8 +148,26 @@ fn not_ready_body(message: &str, stream: bool) -> Response {
                 },
             }),
         )
-            .into_response()
+            .into_response(),
     }
+}
+
+/// Ollama's flat `{"error": "..."}` envelope. A streaming request gets it
+/// as a single NDJSON line, since the client is already parsing that
+/// framing and an abrupt close would look like a network fault.
+fn ollama_not_ready(message: &str, stream: bool) -> Response {
+    let body = serde_json::json!({ "error": message });
+    if stream {
+        let mut line = body.to_string();
+        line.push('\n');
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+            line,
+        )
+            .into_response();
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
 fn sse_error(message: &str) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {

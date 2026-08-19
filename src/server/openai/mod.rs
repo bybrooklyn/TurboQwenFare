@@ -11,12 +11,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::convert::Infallible;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::Stream;
-use tokio_util::sync::CancellationToken;
 
 use crate::runtime::stream_decoder::StreamEvent;
 use crate::runtime::{
@@ -25,31 +21,13 @@ use crate::runtime::{
 };
 use crate::server::{stub, AppState};
 
-const CANONICAL_MODEL_ID: &str = "qwen3.6-35b-a3b";
+use crate::server::model_id::{self, CANONICAL_MODEL_ID};
 
 type SseItem = Result<Event, Infallible>;
 
-/// Axum drops the response stream when the client stops consuming it. Tie
-/// that lifetime directly to the model session instead of relying on a later
-/// channel send to discover the disconnect.
-struct CancelOnDropStream {
-    inner: ReceiverStream<SseItem>,
-    cancellation: CancellationToken,
-}
-
-impl Stream for CancelOnDropStream {
-    type Item = SseItem;
-
-    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(context)
-    }
-}
-
-impl Drop for CancelOnDropStream {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-    }
-}
+/// The SSE flavor of the shared cancel-on-drop wrapper; NDJSON uses the
+/// same type over `Bytes` (see `crate::server::stream`).
+type CancelOnDropStream = crate::server::stream::CancelOnDrop<ReceiverStream<SseItem>>;
 
 #[derive(Serialize)]
 struct ModelObject {
@@ -134,7 +112,9 @@ fn default_object_schema() -> Value {
 /// Normalizes both accepted OpenAI tool shapes: Chat Completions nests the
 /// function definition under `function`, while Responses supplies its
 /// function fields directly. The model never sees either wire shape.
-fn normalize_tools(tools: Vec<Value>) -> std::result::Result<Vec<ToolDefinition>, String> {
+pub(crate) fn normalize_tools(
+    tools: Vec<Value>,
+) -> std::result::Result<Vec<ToolDefinition>, String> {
     tools
         .into_iter()
         .map(|tool| {
@@ -255,13 +235,11 @@ fn chat_message_tool_calls(calls: &[Value]) -> std::result::Result<Vec<MessageTo
         .collect()
 }
 
+/// Delegates to the shared resolver so an OpenAI-shaped client repointed
+/// from an Ollama base URL — which routinely sends `qwen3.6:35b` — is not
+/// rejected for spelling the same single model differently.
 fn validate_model(model: Option<&str>) -> std::result::Result<(), String> {
-    match model {
-        None | Some(CANONICAL_MODEL_ID) | Some("Qwen3.6-35B-A3B") => Ok(()),
-        Some(model) => Err(format!(
-            "model {model:?} is not available; use {CANONICAL_MODEL_ID:?}"
-        )),
-    }
+    model_id::resolve(model).map(|_| ())
 }
 
 /// Every sampling knob the request carries, so `apply_sampling` reads as
@@ -1050,6 +1028,7 @@ pub fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn dropping_the_sse_stream_cancels_its_model_session() {

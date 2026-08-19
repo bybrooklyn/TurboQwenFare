@@ -24,7 +24,7 @@ pub(super) async fn spawn_test_server(model_installed: bool) -> SocketAddr {
     spawn_test_server_with(model_installed, None).await
 }
 
-async fn spawn_test_server_with(
+pub(super) async fn spawn_test_server_with(
     model_installed: bool,
     generator: Option<Arc<dyn Qwen36Generator>>,
 ) -> SocketAddr {
@@ -98,18 +98,18 @@ impl Qwen36Generator for FixtureGenerator {
 /// between them, so tests can prove deltas arrive during generation
 /// rather than in a single burst at the end. The existing doubles use the
 /// trait's default `generate_streaming`, which cannot distinguish the two.
-struct IncrementalFixtureGenerator {
+pub(super) struct IncrementalFixtureGenerator {
     words: Vec<&'static str>,
 }
 
 impl IncrementalFixtureGenerator {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             words: vec!["one ", "two ", "three ", "four ", "five"],
         }
     }
 
-    fn full_text(&self) -> String {
+    pub(super) fn full_text(&self) -> String {
         self.words.concat()
     }
 }
@@ -198,7 +198,7 @@ impl Qwen36Generator for DelayedGenerator {
     }
 }
 
-async fn http_request(addr: SocketAddr, request: &str) -> String {
+pub(super) async fn http_request(addr: SocketAddr, request: &str) -> String {
     let mut stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
         .await
         .expect("connect timed out")

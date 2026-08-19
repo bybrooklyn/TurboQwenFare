@@ -81,11 +81,18 @@ for ep in /api/tags /api/ps; do
         bad "GET $ep returns a models array"
     fi
 done
-if body "$BASE/api/show" -d '{"model":"qwen3.6:35b"}' | grep -q '"details"'; then
+show_code="$(status "$BASE/api/show" -d '{"model":"qwen3.6:35b"}')"
+if [ "$show_code" = "200" ] && body "$BASE/api/show" -d '{"model":"qwen3.6:35b"}' | grep -q '"details"'; then
     ok 'POST /api/show returns details for an Ollama-style tag'
+elif [ "$show_code" = "404" ] && [ "$MODEL_INSTALLED" != "true" ]; then
+    skip 'POST /api/show (404: no model installed)'
 else
-    bad 'POST /api/show returns details for an Ollama-style tag'
+    bad "POST /api/show returns details for an Ollama-style tag (got $show_code)"
 fi
+# An unknown model must be rejected, installed or not.
+bogus="$(status "$BASE/api/show" -d '{"model":"llama3"}')"
+[ "$bogus" = "400" ] && ok "an unknown model is rejected (got $bogus)" \
+                     || bad "an unknown model is rejected (got $bogus)"
 
 note 'model-management endpoints are an honest 501, not an anonymous 404'
 code="$(status "$BASE/api/pull" -d '{"name":"llama3"}')"
@@ -94,17 +101,32 @@ code="$(status "$BASE/api/pull" -d '{"name":"llama3"}')"
 
 note 'generation: non-streaming'
 NS="$TMP/nonstream.json"
+chat_code="$(status "$BASE/api/chat" -d '{"model":"qwen3.6:35b","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"num_predict":8}}')"
+if [ "$chat_code" = "503" ] && [ "$MODEL_INSTALLED" != "true" ]; then
+    skip 'POST /api/chat (503: no model installed)'
+    # The envelope must still be Ollama-shaped, flat {"error": "..."},
+    # not OpenAI's nested object (spec §212).
+    if curl -s "${JSON[@]}" "$BASE/api/chat" \
+         -d '{"model":"qwen3.6:35b","stream":false,"messages":[{"role":"user","content":"hi"}]}' \
+         | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; sys.exit(0 if isinstance(e,str) else 1)'; then
+        ok 'the 503 uses Ollama'"'"'s flat error envelope'
+    else
+        bad 'the 503 uses Ollama'"'"'s flat error envelope'
+    fi
+    : > "$NS"
+else
 body "$BASE/api/chat" -d '{
   "model":"qwen3.6:35b","stream":false,
   "messages":[{"role":"user","content":"Say hi in three words."}],
   "options":{"temperature":0,"num_predict":16}}' > "$NS"
+fi
 if [ -s "$NS" ]; then
     check 'response is a single valid JSON object' python3 -c "import json,sys; json.load(open('$NS'))"
     grep -q '"done":true'  "$NS" && ok 'carries done:true'          || bad 'carries done:true'
     grep -q '"message"'    "$NS" && ok 'nests message{role,content}' || bad 'nests message{role,content}'
     grep -q '"created_at"' "$NS" && ok 'carries created_at'          || bad 'carries created_at'
     grep -q '"eval_count"' "$NS" && ok 'carries eval_count timings'  || bad 'carries eval_count timings'
-else
+elif [ "$MODEL_INSTALLED" = "true" ]; then
     bad 'POST /api/chat (stream:false) returned a body'
 fi
 
@@ -121,9 +143,13 @@ if [ -s "$ND" ]; then
         || bad "content-type is application/x-ndjson (got: $(grep -i '^content-type' "$HDR" | tr -d '\r'))"
 
     lines=$(wc -l < "$ND")
-    [ "$lines" -gt 1 ] \
-        && ok "streamed $lines lines (incremental)" \
-        || bad "streamed $lines line — generation is not incremental"
+    if [ "$MODEL_INSTALLED" != "true" ]; then
+        skip "incremental line count (no model installed; saw $lines)"
+    elif [ "$lines" -gt 1 ]; then
+        ok "streamed $lines lines (incremental)"
+    else
+        bad "streamed $lines line — generation is not incremental"
+    fi
 
     grep -q '^data: '  "$ND" && bad 'SSE "data:" framing leaked into NDJSON' || ok 'no SSE data: prefix'
     grep -q '\[DONE\]' "$ND" && bad 'SSE [DONE] sentinel leaked into NDJSON' || ok 'no [DONE] sentinel'
@@ -140,26 +166,62 @@ for n, line in enumerate(open('$ND'), 1):
         bad 'every line is a bare JSON object'
     fi
 
-    head -1 "$ND" | grep -q '"done":false' && ok 'first line has done:false' || bad 'first line has done:false'
-    tail -1 "$ND" | grep -q '"done":true'  && ok 'terminal line has done:true (clients hang without it)' \
-                                           || bad 'terminal line has done:true (clients hang without it)'
-    tail -1 "$ND" | grep -q '"done_reason"' && ok 'terminal line has done_reason' || bad 'terminal line has done_reason'
+    if [ "$MODEL_INSTALLED" != "true" ]; then
+        if tail -1 "$ND" | grep -q '"error"'; then
+            ok 'the stream carries an Ollama-shaped error line when no model is installed'
+        else
+            bad 'the stream carries an Ollama-shaped error line when no model is installed'
+        fi
+    else
+        head -1 "$ND" | grep -q '"done":false' && ok 'first line has done:false' || bad 'first line has done:false'
+        tail -1 "$ND" | grep -q '"done":true'  && ok 'terminal line has done:true (clients hang without it)' \
+                                               || bad 'terminal line has done:true (clients hang without it)'
+        tail -1 "$ND" | grep -q '"done_reason"' && ok 'terminal line has done_reason' || bad 'terminal line has done_reason'
+    fi
 else
     bad 'POST /api/chat (streaming) returned a body'
 fi
 
 note 'generate uses "response", not "message"'
-if body "$BASE/api/generate" -d '{"model":"qwen3.6:35b","prompt":"Hello","stream":false,"options":{"num_predict":8}}' \
-     | grep -q '"response"'; then
-    ok 'POST /api/generate returns a response field'
+gen_code="$(status "$BASE/api/generate" -d '{"model":"qwen3.6:35b","prompt":"Hello","stream":false,"options":{"num_predict":8}}')"
+if [ "$gen_code" = "200" ]; then
+    body "$BASE/api/generate" -d '{"model":"qwen3.6:35b","prompt":"Hello","stream":false,"options":{"num_predict":8}}' \
+      | grep -q '"response"' && ok 'POST /api/generate returns a response field' \
+                             || bad 'POST /api/generate returns a response field'
+elif [ "$gen_code" = "503" ] && [ "$MODEL_INSTALLED" != "true" ]; then
+    skip 'POST /api/generate (503: no model installed)'
 else
-    bad 'POST /api/generate returns a response field'
+    bad "POST /api/generate (got $gen_code)"
+fi
+
+note 'parameters that cannot be honored are rejected, not silently ignored'
+for payload_desc in \
+    'raw:{"model":"qwen3.6:35b","prompt":"x","raw":true}' \
+    'context:{"model":"qwen3.6:35b","prompt":"x","context":[1,2,3]}' \
+    'format:{"model":"qwen3.6:35b","prompt":"x","format":"json"}' \
+    'mirostat:{"model":"qwen3.6:35b","prompt":"x","options":{"mirostat":2}}'
+do
+    what="${payload_desc%%:*}"; payload="${payload_desc#*:}"
+    code="$(status "$BASE/api/generate" -d "$payload")"
+    [ "$code" = "400" ] && ok "$what is rejected (got $code)" || bad "$what is rejected (got $code)"
+done
+
+note 'Ollama defaults that are no-ops are accepted, not rejected'
+noop="$(status "$BASE/api/generate" -d '{"model":"qwen3.6:35b","prompt":"x","stream":false,"options":{"mirostat":0,"tfs_z":1.0,"typical_p":1.0}}')"
+if [ "$noop" = "200" ] || { [ "$noop" = "503" ] && [ "$MODEL_INSTALLED" != "true" ]; }; then
+    ok "mirostat:0 / tfs_z:1.0 / typical_p:1.0 accepted (got $noop)"
+else
+    bad "mirostat:0 / tfs_z:1.0 / typical_p:1.0 accepted (got $noop)"
 fi
 
 note 'sampling knobs real clients send by default are accepted'
-code="$(status "$BASE/api/chat" -d '{"model":"qwen3.6:35b","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"temperature":0.8,"top_p":0.9,"top_k":40,"num_predict":8}}')"
-[ "$code" = "200" ] && ok "temperature 0.8 / top_p 0.9 / top_k 40 accepted (got $code)" \
-                    || bad "temperature 0.8 / top_p 0.9 / top_k 40 accepted (got $code)"
+generation_status 'temperature 0.8 / top_p 0.9 / top_k 40' /api/chat \
+  '{"model":"qwen3.6:35b","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"temperature":0.8,"top_p":0.9,"top_k":40,"num_predict":8}}'
+generation_status 'seed / repeat_penalty / stop' /api/chat \
+  '{"model":"qwen3.6:35b","stream":false,"messages":[{"role":"user","content":"hi"}],"options":{"seed":42,"repeat_penalty":1.1,"stop":["\n\n"],"num_predict":8}}'
+generation_status 'num_predict -1 (unbounded) and keep_alive' /api/chat \
+  '{"model":"qwen3.6:35b","stream":false,"keep_alive":"5m","messages":[{"role":"user","content":"hi"}],"options":{"num_predict":-1}}'
+
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

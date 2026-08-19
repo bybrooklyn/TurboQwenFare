@@ -5,10 +5,12 @@
 pub mod anthropic;
 pub mod auth;
 pub mod bind;
+pub mod model_id;
 pub mod ollama;
 pub mod openai;
 #[cfg(test)]
 mod security_tests;
+pub mod stream;
 pub mod stub;
 #[cfg(test)]
 mod tests;
@@ -48,17 +50,34 @@ pub struct AppState {
     pub api_key: Option<Arc<str>>,
 }
 
+/// Assembles the whole HTTP surface.
+///
+/// The split between the two tiers is security-critical, not stylistic.
+/// Everything that can generate, embed, or enumerate what is installed
+/// goes inside `protected`, so a `0.0.0.0` bind requires the API key
+/// tqf mints for it (spec §74). The unauthenticated tier is limited to
+/// fixed-content liveness probes that clients call *before* they have
+/// anywhere to put a credential:
+///
+/// - `/health` — also what `bind::probe_health` uses to recognize another
+///   tqf on a busy port, so it must answer without a key.
+/// - `/v1/tqf/metrics` — process uptime and memory, no model data.
+/// - `GET`/`HEAD /` and `/api/version` — Ollama's liveness handshake.
+///
+/// Merging the Ollama routes at this top level is the path of least
+/// resistance and would silently expose generation with no auth.
 pub fn build_router(state: AppState) -> Router {
-    let protected =
-        Router::new()
-            .merge(openai::routes())
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                auth::require_api_key,
-            ));
+    let protected = Router::new()
+        .merge(openai::routes())
+        .merge(ollama::routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_api_key,
+        ));
 
     Router::new()
         .merge(tqf_api::routes())
+        .merge(ollama::unauthenticated_routes())
         .merge(protected)
         .with_state(state)
 }
