@@ -183,6 +183,14 @@ qual-context:
 qual-experts:
     cargo test --release -- --ignored --nocapture {{test_flags}} experts::
 
+# Preflight names exactly what is missing, then runs the greedy-parity
+# guard, starts the real server, and smokes both surfaces against real
+# generation. This is everything `just ci` cannot reach.
+#
+# End-to-end acceptance against the real pinned checkpoint.
+verify-real:
+    ./scripts/verify-real.sh
+
 # Lane E: every checkpoint-gated test.
 qual-all:
     cargo test --release -- --ignored --nocapture {{test_flags}}
