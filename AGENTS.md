@@ -181,6 +181,20 @@ Phases 27-28 land the first long-context (TQKV) work:
   page correctly recalled and 99.8% of the full-attention score preserved.
   Not yet wired into the live decode loop.
   `docs/research/qualification/phase-32-tqattn.md`.
+- **Phase 33 (MTP):** the real MTP sidecar checkpoint
+  (`source::pinned::MTP_FILENAME`, a separate ~1 GiB GGUF) is not
+  installed and a full second forward-pass runtime for it is out of
+  scope, so `runtime::mtp` implements what doesn't require the sidecar to
+  exist: NVMAI-derived accept/reject verification semantics and
+  statistics (consulted directly from the real
+  `StreamingMTPDecoder`/`StreamingMTP.swift` reference implementation),
+  an adaptive hysteresis controller that defaults off and only enables
+  after a sustained positive rolling net-benefit window, and expert-union
+  bandwidth accounting. Measured against the real committed 128-step
+  route trace (not synthetic): **20.81% fewer expert bytes** for a
+  verified boundary+draft pair versus fetching each independently,
+  averaged across 5,080 real (layer, consecutive-step) pairs.
+  `docs/research/qualification/phase-33-mtp.md`.
 
 ## Commands
 
