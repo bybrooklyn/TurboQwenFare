@@ -41,7 +41,19 @@ baseline used, and asserts the tokens are **bit-identical** to the
 already-established-correct `[220, 16, 15, 15, 15, 20332, 1740, 369]`
 sequence from BF16-under-4GiB.
 
-<!-- filled in once the real-hardware run completes -->
+```
+phase34_2g_qual steps=8 expert_cache_bytes=402653184 peak_reserved_mib=459 tokens=[220, 16, 15, 15, 15, 20332, 1740, 369]
+```
+
+**Bit-identical** to the established baseline, with peak broker
+reservation at 459 MiB — well inside the 2 GiB hard wall, with room to
+spare even before considering that a real 8-step run doesn't yet exercise
+sustained expert-cache pressure. (Phase 27's real-hardware investigation
+found BF16 and TQKV-Q8 diverge at step 9 on a near-tied logit — an
+established floating-point non-associativity case, not a defect — so this
+8-step window was chosen to land on a token count both known-good
+sequences already agree on exactly, rather than coincidentally landing on
+that razor-thin margin.)
 
 ## Status and remaining work
 

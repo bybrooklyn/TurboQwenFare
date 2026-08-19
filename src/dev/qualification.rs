@@ -588,6 +588,43 @@ mod tests {
         );
     }
 
+    /// Diagnostic (not a qualification gate): prints the top-4 logit
+    /// candidates at every step, real checkpoint, so a token-sequence
+    /// divergence between two backend runs can be checked against the
+    /// actual logit gap at the divergence point — a near-tied gap is the
+    /// same floating-point non-associativity class already documented in
+    /// `raw-a-512-divergence-investigation.md`; a large gap would instead
+    /// indicate a real bug. Companion to
+    /// `canonical_decode_prints_greedy_sequence_for_tqkv_ab_comparison`.
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint; diagnostic for TQKV/BF16 divergence investigation"]
+    fn canonical_decode_prints_top_logits_per_step() {
+        let tqf = std::env::var("TQF_CANONICAL_TQF").expect("set TQF_CANONICAL_TQF");
+        let steps: usize = std::env::var("TQF_TQKV_QUAL_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10);
+        let broker = MemoryBroker::new(Bytes(FOUR_GIB));
+        let mut runtime = Qwen36BoundedReferenceRuntime::open(
+            Path::new(&tqf),
+            broker.clone(),
+            steps.max(64),
+            Bytes(DEFAULT_EXPERT_CACHE_BYTES),
+        )
+        .unwrap();
+        let mut token = 32u32;
+        for step in 0..steps {
+            let decoded = runtime.decode_greedy(token).unwrap();
+            println!(
+                "top_logits_qual tqkv_enabled={} step={step} input={token} chosen={} top4={:?}",
+                crate::context::tqkv::tqkv_enabled(),
+                decoded.token,
+                decoded.diagnostics.top_logits,
+            );
+            token = decoded.token;
+        }
+    }
+
     /// Phase 30 prefix-reuse qualification (spec §300, §66-67; exit gate
     /// row 30: "Repeated-prefix TTFT reduction; restart reuse"). Decodes a
     /// shared prefix once on the real checkpoint, snapshots it, then times

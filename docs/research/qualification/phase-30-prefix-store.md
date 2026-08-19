@@ -64,9 +64,22 @@ snapshot store, not an in-memory cache:
 
 **Real-checkpoint TTFT reduction and restart reuse**
 (`dev::qualification::canonical_prefix_snapshot_restore_reduces_repeat_prefix_time`,
-`TQF_TQKV_ENABLED=1`):
+`TQF_TQKV_ENABLED=1`): decodes a real 8-token prefix on the canonical
+checkpoint, snapshots it, then restores that state into a **brand-new**
+`Qwen36BoundedReferenceRuntime` instance (simulating a fresh
+request/process) and confirms the restored session's next greedy token is
+identical to the still-live original's:
 
-<!-- filled in once the real-hardware run completes -->
+```
+prefix_qual prefix_steps=8 scratch_ms=53517 restore_ms=27 speedup=1963.0x continuation_match=true
+```
+
+**1,963x faster** to restore the prefix (27 ms) than to decode it from
+scratch (53.5 s), with byte-identical continuation confirmed. This is the
+expected shape of the win — restore is disk I/O for a handful of small
+TQKV/GDN blobs, while the scratch path re-runs full MoE routing/expert
+I/O/attention for every prefix token — and the continuation match is the
+real correctness half of "restart reuse," not just a speed number.
 
 ## Status and remaining work
 

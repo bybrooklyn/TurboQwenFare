@@ -119,9 +119,12 @@ Phases 27-28 land the first long-context (TQKV) work:
   attention code path stays under 0.05 max abs error across a sealed-page
   boundary; on the real checkpoint, BF16 and TQKV-Q8 produced **identical**
   8-token greedy continuations. 128K capacity accounting (broker-reservation
-  math, not a live 128K decode): BF16 2.50 GiB / TQKV-Q8 ~1.28 GiB / TQKV-Q4
-  ~0.66 GiB across the ten full-attention layers.
-  `docs/research/qualification/phase-27-tqkv-baseline.md`.
+  math, not a live 128K decode): BF16 2.50 GiB / TQKV-Q8 ~1.29 GiB / TQKV-Q4
+  ~0.67 GiB across the ten full-attention layers. A follow-up real
+  264-step run found the two backends diverge at step 9 on a razor-thin
+  logit gap (0.002-0.045 out of ~21 magnitude, same class of finding as
+  `raw-a-512-divergence-investigation.md`); investigated and recorded, not
+  a defect. `docs/research/qualification/phase-27-tqkv-baseline.md`.
 - **Phase 28 (advanced TQKV candidates):** `context::tqkv::candidates` —
   standalone Q3 symmetric, Q2 asymmetric, Rotated-Q4 (randomized Hadamard
   transform), outlier-split Q4, and pre-RoPE Q4 encode/decode pairs, per
@@ -156,7 +159,10 @@ Phases 27-28 land the first long-context (TQKV) work:
   `Qwen36BoundedReferenceRuntime::snapshot_session`/`restore_session`.
   Real restart reuse demonstrated: a snapshot survives dropping the store
   handle entirely and reopening a fresh one against the same directory,
-  restoring byte-identical state. `docs/research/qualification/phase-30-prefix-store.md`.
+  restoring byte-identical state. On the real checkpoint, restoring a
+  real 8-token prefix from a snapshot took 27 ms versus 53.5 s to decode
+  it from scratch (**1,963x**), with byte-identical continuation
+  confirmed. `docs/research/qualification/phase-30-prefix-store.md`.
 - **Phase 31 (256K/TQAttn trigger):** applies spec §303's own decision
   rule after extending Phase 29's isolated-attention-step measurement to
   262,144 tokens. Memory: TQKV-Q4 at 256K reserves 1.33 GiB (fits 4G); BF16
@@ -199,13 +205,13 @@ Phases 27-28 land the first long-context (TQKV) work:
   Real construction of the *entire* 40-layer context/recurrent-state
   footprint (30 GDN states + 10 TQKV-Q4 full-attention layers at 128K)
   inside a real 2 GiB broker: **0.731 GiB used, 1.269 GiB headroom** for
-  weights/expert-cache. Stage 1 (real decode under a 2 GiB broker with a
-  384 MiB expert cache, checked against the established BF16-4GiB
-  baseline) and stage 3 (15 tok/s) status recorded in the doc — stage 3
-  is not attempted since Phase 25/29 already establish the reference
-  compute path can't close that floor even with more cache, and spec §40
-  itself says a 2G speed miss doesn't invalidate the 4G system.
-  `docs/research/qualification/phase-34-2g-profile.md`.
+  weights/expert-cache. Stage 1: a real 8-step decode under a 2 GiB
+  broker with TQKV-Q4 and a 384 MiB expert cache produced **bit-identical**
+  tokens to the established BF16-4GiB baseline, peak reservation 459 MiB.
+  Stage 3 (15 tok/s) is not attempted since Phase 25/29 already establish
+  the reference compute path can't close that floor even with more cache,
+  and spec §40 itself says a 2G speed miss doesn't invalidate the 4G
+  system. `docs/research/qualification/phase-34-2g-profile.md`.
 - **Phase 35 (file catalog/classifier):** `retrieval::{ignore,classify,scan}`
   — a real (scoped) `.gitignore`/`.tqfignore` glob matcher, content-first
   classification (byte-sniff binary detection, a keyword-fingerprint

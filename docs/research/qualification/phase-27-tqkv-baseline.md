@@ -67,12 +67,41 @@ meaningful performance signal, just noise on a decode that is dominated by
 expert I/O per the Phase 25 ledger. TQKV's own I/O/compute cost is not yet
 separately measured; that is follow-up work.)
 
-A longer real-checkpoint run (264 steps, crossing one 256-token sealed-page
-boundary) was launched to extend the greedy-parity check past the tail-only
-regime; see the addendum below once it completes; the synthetic
-differential test above already covers the sealed-page path with the same
-production code, so page-boundary correctness is not solely resting on
-that longer run.
+**264-step real-checkpoint run (crosses one 256-token sealed-page
+boundary).** BF16 and TQKV-Q8 match token-for-token through step 8, then
+diverge at step 9 (BF16 continues with token 6992; TQKV-Q8 continues with
+token 20331) — well before the 256-token page boundary, i.e. this
+divergence is about tail-regime precision, not page sealing.
+
+A focused diagnostic (`canonical_decode_prints_top_logits_per_step`,
+printing the real top-4 logits every step) pinned down *why* rather than
+leaving it as an unexplained mismatch: at step 8, both backends' top two
+candidates are the same pair, separated by a razor-thin margin —
+
+| Backend | 1st | 2nd | Gap |
+|---|---|---|---|
+| BF16 | token 6992, logit 21.25112 | token 20331, logit 21.205843 | **0.045** |
+| TQKV-Q8 | token 20331, logit 21.209215 | token 6992, logit 21.207214 | **0.002** |
+
+Out of a logit scale around 21, a 0.002-0.045 gap is a ~0.01-0.2% margin —
+the same near-tied-logit floating-point non-associativity class already
+documented in this repo's own
+`raw-a-512-divergence-investigation.md` (there, between TQF and an
+independent external oracle; here, between TQF's own two backends). It is
+consistent with, not contradicted by, the measured Q8 error bounds above
+(<0.05 max abs error is easily enough to flip a 0.002-0.045 logit gap after
+accumulating through 40 layers). After the divergence, both continuations
+remain fluent, on-topic real text (both are the model continuing to
+describe a two-variable system of equations) — a real bug corrupting
+attention state would be expected to produce garbage or a much larger,
+non-near-tied divergence, not a clean fork onto an equally plausible
+continuation. This is recorded as a benign, investigated finding, not
+asserted as fact without checking — the synthetic 261-step differential
+test above (same production code, <0.05 max abs error, no external
+near-tied-logit sensitivity) is the primary sealed-page correctness
+evidence; this real run is additional confirmation that TQKV-Q8's real
+divergence behavior matches its measured error bound rather than
+exceeding it.
 
 **128K capacity accounting** (`q8_is_smaller_than_bf16_and_q4_is_smaller_than_q8_at_128k`,
 computed from the same formula the broker reservation uses, not a live
