@@ -17,6 +17,17 @@ public final class TqfAppModel {
     public private(set) var serverReachable: Bool = false
     public var error: String?
 
+    /// spec §47: "Create simple default conversation/setup experience
+    /// and expandable engineering cockpit." The simple experience is
+    /// `RootView`'s prompt/output pane, always visible; this toggle
+    /// reveals `InspectorView` alongside it. Read-only concern: this
+    /// flag only ever changes what's *displayed*, never anything about
+    /// how the server itself runs.
+    public var showsInspector: Bool = false
+
+    public private(set) var metrics: TqfMetrics?
+    private var metricsPollTask: Task<Void, Never>?
+
     private let client: TqfInferenceClient
     private var generationTask: Task<Void, Never>?
 
@@ -26,6 +37,27 @@ public final class TqfAppModel {
 
     public func refreshServerStatus() async {
         serverReachable = await client.healthCheck()
+    }
+
+    /// spec §47: "The inspector consumes metrics; it must not change
+    /// runtime policy directly except through supported configuration
+    /// actions." This method only ever *reads* — there is no
+    /// corresponding "set metric"/"mutate policy" call anywhere in this
+    /// model, by construction, not just by convention.
+    public func startMetricsPolling(interval: Duration = .seconds(2)) {
+        metricsPollTask?.cancel()
+        metricsPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.metrics = await self.client.fetchMetrics()
+                try? await Task.sleep(for: interval)
+            }
+        }
+    }
+
+    public func stopMetricsPolling() {
+        metricsPollTask?.cancel()
+        metricsPollTask = nil
     }
 
     public var canGenerate: Bool {

@@ -13,15 +13,28 @@ public struct RootView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            outputPane
-            Divider()
-            composer
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                header
+                Divider()
+                outputPane
+                Divider()
+                composer
+            }
+            .frame(minWidth: 640, minHeight: 480)
+            if model.showsInspector {
+                Divider()
+                InspectorView(metrics: model.metrics)
+                    .padding(12)
+                    .transition(.move(edge: .trailing))
+            }
         }
-        .frame(minWidth: 640, minHeight: 480)
-        .task { await model.refreshServerStatus() }
+        .animation(.default, value: model.showsInspector)
+        .task {
+            await model.refreshServerStatus()
+            model.startMetricsPolling()
+        }
+        .onDisappear { model.stopMetricsPolling() }
     }
 
     private var header: some View {
@@ -38,6 +51,17 @@ public struct RootView: View {
                     .foregroundStyle(.red)
                     .lineLimit(1)
             }
+            // spec §47: "expandable engineering cockpit" — the simple
+            // default view (everything else in this file) never
+            // changes; this toggle only reveals/hides InspectorView.
+            Button {
+                model.showsInspector.toggle()
+            } label: {
+                Label("Inspector", systemImage: "sidebar.trailing")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.plain)
+            .help("Toggle the engineering inspector")
         }
         .padding(12)
     }

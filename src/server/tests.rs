@@ -154,6 +154,32 @@ async fn health_reports_ok_and_model_state() {
     assert!(response.contains(r#""model_installed":false"#));
 }
 
+/// Real end-to-end test of spec §47's inspector-metrics endpoint: a
+/// real HTTP request against a real running server, asserting the
+/// resident-memory reading is a genuine positive number (this test
+/// process itself has real, nonzero resident memory — anything else
+/// would mean the OS sampler silently failed rather than reported
+/// `None` honestly).
+#[tokio::test]
+async fn tqf_metrics_reports_real_process_memory() {
+    let addr = spawn_test_server(false).await;
+    let response = http_request(addr, &get("/v1/tqf/metrics")).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected response: {response}"
+    );
+    let body = response.split("\r\n\r\n").last().unwrap_or("");
+    let json: serde_json::Value = serde_json::from_str(body).expect("valid JSON body");
+    let resident = json["resident_bytes"]
+        .as_u64()
+        .expect("resident_bytes must be a real sampled number on this platform");
+    assert!(
+        resident > 0,
+        "a running process must have nonzero resident memory: {resident}"
+    );
+    assert_eq!(json["model_installed"], false);
+}
+
 #[tokio::test]
 async fn models_lists_canonical_model() {
     let addr = spawn_test_server(true).await;

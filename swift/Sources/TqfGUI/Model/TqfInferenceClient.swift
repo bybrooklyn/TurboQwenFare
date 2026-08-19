@@ -14,6 +14,25 @@ public struct TqfTokenEvent: Sendable {
     public let textDelta: String
 }
 
+/// spec §47's inspector metrics — mirrors `MetricsResponse` in
+/// `src/server/tqf_api/mod.rs` field-for-field (real OS-sampled
+/// process memory, not fabricated).
+public struct TqfMetrics: Sendable, Decodable {
+    public let uptimeSeconds: UInt64
+    public let modelInstalled: Bool
+    public let residentBytes: UInt64?
+    public let virtualBytes: UInt64?
+    public let residentPeakBytes: UInt64?
+
+    enum CodingKeys: String, CodingKey {
+        case uptimeSeconds = "uptime_seconds"
+        case modelInstalled = "model_installed"
+        case residentBytes = "resident_bytes"
+        case virtualBytes = "virtual_bytes"
+        case residentPeakBytes = "resident_peak_bytes"
+    }
+}
+
 /// Streams one chat completion from TQF's real `/v1/chat/completions`
 /// endpoint (`stream: true`), parsing the standard OpenAI SSE chunk
 /// format (`data: {...}\n\n`, terminated by `data: [DONE]`) — the exact
@@ -39,6 +58,22 @@ public final class TqfInferenceClient: Sendable {
             return false
         }
         return (200..<300).contains(http.statusCode)
+    }
+
+    /// Fetches spec §47's real inspector metrics from TQF's own
+    /// `/v1/tqf/metrics`. Returns `nil` on any failure (server
+    /// unreachable, malformed body) — the inspector treats a failed
+    /// fetch as "no data yet," not an error banner, since polling
+    /// failures are expected whenever the server briefly isn't up.
+    public func fetchMetrics() async -> TqfMetrics? {
+        let url = baseURL.appendingPathComponent("v1/tqf/metrics")
+        guard let (data, response) = try? await session.data(from: url),
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode)
+        else {
+            return nil
+        }
+        return try? JSONDecoder().decode(TqfMetrics.self, from: data)
     }
 
     public func streamChatCompletion(prompt: String) -> AsyncThrowingStream<TqfTokenEvent, Error> {

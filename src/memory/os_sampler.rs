@@ -80,6 +80,17 @@ fn sample_native() -> Option<(u64, u64, u64)> {
     None
 }
 
+/// Real OS-observed resident/virtual/peak-resident bytes for the
+/// current process, with no broker dependency — for callers (like the
+/// GUI's inspector metrics endpoint, spec §47) that want a genuine
+/// process footprint reading without needing a live `MemoryBroker`
+/// instance. `None` on platforms without a sampler (same fallback
+/// `sample_os_footprint` uses).
+pub fn sample_process_footprint() -> Option<(Bytes, Bytes, Bytes)> {
+    let (resident, virtual_bytes, resident_peak) = sample_native()?;
+    Some((Bytes(resident), Bytes(virtual_bytes), Bytes(resident_peak)))
+}
+
 /// Samples the OS footprint and the broker accounting in one place. On
 /// platforms without a sampler, the native fields are zero and the
 /// sample still carries the broker numbers.

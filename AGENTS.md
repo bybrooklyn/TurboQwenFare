@@ -431,6 +431,25 @@ Phases 27-28 land the first long-context (TQKV) work:
   toolchain lacks XCTest/Testing) and no visual/interactive
   verification — both honestly reported, not glossed over.
   `docs/research/qualification/phase-46-swiftui-bridge.md`.
+- **Phase 47 (UI refinement):** a real new `GET /v1/tqf/metrics`
+  endpoint (`src/server/tqf_api`) exposing real OS-sampled process
+  memory (Phase 24's sampler, now broker-independent via a new
+  `sample_process_footprint()`) plus uptime/model-installed state — not
+  fabricated data, proven by a real HTTP test asserting genuine
+  nonzero resident memory. On the Swift side: adopted `MetricFormat`
+  verbatim (POSIX-locale formatters), and a new `InspectorView` —
+  deliberately not a port of NVMAI's own much larger per-kernel-timing
+  inspector, since TQF has no equivalent runtime to report on yet —
+  showing only the real metrics the new endpoint provides. `RootView`
+  gained a toggle revealing the inspector alongside the always-visible
+  simple conversation pane (spec's literal "simple default... and
+  expandable... cockpit"), read-only by construction (no "set metric"
+  call exists anywhere). Zero regressions: a from-scratch `cargo build
+  --features gui` still links (`nm` confirms `_tqf_launch_gui`), 408/407
+  tests pass across both build configs. No visual verification possible
+  in this environment, and no "supported configuration action" exists
+  yet to wire through the inspector (both honestly noted).
+  `docs/research/qualification/phase-47-ui-refinement.md`.
 
 ## Commands
 
