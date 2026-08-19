@@ -291,6 +291,27 @@ Phases 27-28 land the first long-context (TQKV) work:
   residual hierarchy's cheap base-only score reproduces Phase 38's 0.85
   Hamming floor; adding the residual lifts it to 0.95.
   `docs/research/qualification/phase-39-tqvec-candidates.md`.
+- **Phase 40 (hybrid retrieval):** `retrieval::hybrid` — query-intent
+  routing (spec §192's `QueryIntent`, confidence-scored not
+  mutually-exclusive), the `Candidate`/`CandidateProvenance` contract
+  (spec §193, "provenance explanation objects... for GUI/debugging"),
+  weighted RRF fusion (`k=60`) with hard exact precedence (spec §84/
+  §194: proven directly — an exact hit beats a higher-scoring
+  semantic-only rival). Fuses only the three lanes that exist (Exact/
+  Lexical from Phase 36, Semantic from Phase 38) — Structural/Program
+  graph/Hierarchy/Change-Git and spec §195's graph expansion all need
+  real AST/program-graph output Phase 35/36 already scoped out.
+  Measured end to end on Phase 38's real corpus/query fixtures (no
+  model load needed): an identifier query correctly skips the semantic
+  lane and returns the exact hit; all four real NL queries correctly
+  engage all three lanes and reproduce Phase 38's own gold-ranking
+  winners through the full pipeline. Found and fixed a real
+  nondeterminism bug in the process — `HashMap`-order tie-breaking made
+  a genuine RRF tie (two chunks, each the other lane's #1, weighted
+  equally) flaky across runs; fixed with a deterministic rank-then-
+  chunk_id tie-break, never a cross-lane raw-score comparison (spec
+  §193's explicit rule).
+  `docs/research/qualification/phase-40-hybrid-retrieval.md`.
 
 ## Commands
 

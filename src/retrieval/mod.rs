@@ -4,6 +4,7 @@
 
 pub mod classify;
 pub mod flat;
+pub mod hybrid;
 pub mod ignore;
 pub mod lexical;
 pub mod scan;
