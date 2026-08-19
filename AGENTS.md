@@ -478,6 +478,33 @@ Phases 27-28 land the first long-context (TQKV) work:
   delivers the runtime and its oracle-validated qualification, not the
   end-to-end HTTP route.
   `docs/research/qualification/phase-48-vision-encoder.md`.
+- **Phase 49 (1M research):** no new mechanism — combines Phases 27
+  (TQKV-Q4), 30 (prefix snapshot store), and 32 (TQAttn) at
+  1,048,576-token (1M) scale, the same "real construction + isolated
+  real measurement" methodology Phases 29/31/34 used at 128K/256K/2G.
+  Capacity: `context::tqkv::scaling_bench::full_context_state_
+  reserved_bytes` really constructs all 40 layers (30 GDN + 10
+  TQKV-Q4 full-attention) at 1M — **5.349 GiB, fits an 8 GiB profile
+  with 2.65 GiB headroom, does not fit 4 GiB** (spec §321's own
+  explicitly-allowed 8G fallback). Bandwidth: a real full attention
+  step at 1M costs **80.5 s** (`attention_cost_at_one_million_tokens_
+  tqkv_q4`, ~1,200x over the 15 tok/s budget, continuing Phase 29/31's
+  trend line exactly); the real `TqAttn::select_pages` selector with
+  its *default, not-scaled-up* page budget selects only **0.15%** of
+  tokens at 1M (vs 9.4% at Phase 32's 16,384-token scale, same fixed
+  budget both times — the shrinking-fraction behavior a fixed-compute
+  selector is supposed to have) for a measured **649x speedup**
+  (38.88 s full vs 59 ms selective), with the engineered "important"
+  old page still correctly recalled. Neither TQKV-Q4 nor TQAttn alone
+  reaches 1M on both axes; combined, they close both. Prefix restore's
+  cost was reasoned from Phase 30's own mechanism (I/O-bound
+  page-byte deserialization, not O(context) recompute) rather than
+  re-run, since actually decoding a real 1M-token prefix first would
+  cost the same multi-day wall clock Phase 25/29 already ruled
+  infeasible on this hardware. Not wired into the live decode loop;
+  no ≤1% quality qualification at 1M yet (Phase 32's own 99.8%
+  score-preservation check only covers 16,384 tokens).
+  `docs/research/qualification/phase-49-1m-research.md`.
 
 ## Commands
 

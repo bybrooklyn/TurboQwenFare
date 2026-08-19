@@ -360,4 +360,68 @@ mod tests {
         }
         total
     }
+
+    /// Phase 49 (spec §321, "1M research": "combine validated TQKV/TQAttn/
+    /// backing/prefix techniques"). Extends Phase 32's own full-vs-selective
+    /// A/B (above) from a 16,384-token synthetic context to a real
+    /// 1,048,576-token (1M) one — the same real `TqkvPagedCache`/
+    /// `select_pages` production code, at the scale spec §4's "~1M target
+    /// context" actually names. Uses the *default* `TqAttnConfig` (a fixed
+    /// small page budget, not scaled up with context length), because a
+    /// fixed compute budget regardless of context length is the entire
+    /// point of TQAttn — this measures whether that fixed-budget property
+    /// actually holds at 1M, not a budget hand-tuned to look good.
+    /// `--release --ignored --nocapture`; numbers transcribed into
+    /// `docs/research/qualification/phase-49-1m-research.md`.
+    #[test]
+    #[ignore = "run with --release; Phase 49 1M-token TQAttn bandwidth measurement"]
+    fn tqattn_selective_attention_scales_to_one_million_tokens() {
+        let context_tokens = 1_048_576usize; // 1M, spec §4's target context
+        let pages = context_tokens / PAGE_TOKENS;
+        let broker = MemoryBroker::new(Bytes(8 * 1024 * 1024 * 1024));
+        let cache = cache_with_one_standout_page(&broker, pages, pages / 2, 5.0);
+        let reserved = broker.snapshot().reserved;
+        println!(
+            "phase49_bandwidth one_layer_tqkv_q8_1m_reserved_bytes={} gib={:.3}",
+            reserved.0,
+            reserved.0 as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+
+        let query = [[1.0f32; HEAD_DIM]; HEADS];
+        let config = TqAttnConfig::default(); // fixed budget: recent_window=2, page_budget=4
+        let result = select_pages(&cache, &query, &config, &[]);
+
+        let full_tokens = cache.len();
+        let selected_tokens = result.selected_tokens;
+        assert!(selected_tokens < full_tokens);
+
+        let started_full = std::time::Instant::now();
+        let full_score = attend_over_tokens(&cache, &query, 0..full_tokens);
+        let full_elapsed = started_full.elapsed();
+
+        let selected_ranges: Vec<std::ops::Range<usize>> = result
+            .selected_pages
+            .iter()
+            .map(|&p| p * PAGE_TOKENS..(p + 1) * PAGE_TOKENS)
+            .collect();
+        let started_selective = std::time::Instant::now();
+        let mut selective_score = 0f32;
+        for range in &selected_ranges {
+            selective_score += attend_over_tokens(&cache, &query, range.clone());
+        }
+        let selective_elapsed = started_selective.elapsed();
+
+        println!(
+            "phase49_bandwidth full_tokens={full_tokens} selected_tokens={selected_tokens} \
+             selected_fraction={:.6} full_ms={} selective_ms={} speedup={:.2}x \
+             standout_page_selected={} full_score={full_score:.3} \
+             selective_score_partial={selective_score:.3}",
+            selected_tokens as f64 / full_tokens as f64,
+            full_elapsed.as_millis(),
+            selective_elapsed.as_millis(),
+            full_elapsed.as_secs_f64() / selective_elapsed.as_secs_f64().max(1e-12),
+            result.selected_pages.contains(&(pages / 2)),
+        );
+        assert!(result.selected_pages.contains(&(pages / 2)));
+    }
 }

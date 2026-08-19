@@ -230,6 +230,39 @@ mod tests {
         );
     }
 
+    /// Phase 49 (spec §321, "1M research": "treat capacity and bandwidth
+    /// separately... maintain 8G profile initially if needed"). The
+    /// capacity half: really construct the *entire* 40-layer context/
+    /// recurrent-state footprint (30 GDN states + 10 TQKV-Q4 full-attention
+    /// layers) at 1,048,576-token (1M) capacity, and check it against both
+    /// an 8 GiB budget (the spec's own explicitly-allowed fallback at this
+    /// scale) and the original 4 GiB target (reported honestly either way,
+    /// not assumed).
+    #[test]
+    fn full_context_state_at_1m_tqkv_q4_capacity_check() {
+        let eight_gib = Bytes(8 * 1024 * 1024 * 1024);
+        let broker = MemoryBroker::new(eight_gib);
+        let reserved = full_context_state_reserved_bytes(
+            &broker,
+            1_048_576,
+            BackendChoice::Tqkv(TqkvPrecision::Q4),
+        )
+        .unwrap();
+        assert!(
+            reserved.0 < eight_gib.0,
+            "full 40-layer context state {} exceeded the 8 GiB budget",
+            reserved.0
+        );
+        let four_gib = 4u64 * 1024 * 1024 * 1024;
+        println!(
+            "phase49_capacity context_state_1m_q4_bytes={} gib={:.3} headroom_vs_8gib_gib={:.3} fits_4gib={}",
+            reserved.0,
+            reserved.0 as f64 / (1024.0 * 1024.0 * 1024.0),
+            (eight_gib.0 - reserved.0) as f64 / (1024.0 * 1024.0 * 1024.0),
+            reserved.0 < four_gib,
+        );
+    }
+
     #[test]
     fn seeding_reaches_the_declared_depth_and_one_step_completes() {
         let point = measure_one_step_at_depth(BackendChoice::Bf16, 300, 512).unwrap();
@@ -265,5 +298,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Phase 49 (spec §321, "1M research"): extends Phase 29/31's isolated
+    /// attention-step measurement to 1,048,576 tokens (1M). TQKV-Q4 only —
+    /// `measure_one_step_at_depth` reserves inside a fixed 8 GiB broker, and
+    /// Phase 31 already established BF16 needs ~5 GiB just for 256K (so
+    /// ~20 GiB at 1M, an already-known, not newly-discovered, non-fit);
+    /// re-running that failure here would only be noise, not a finding.
+    /// `--release --ignored --nocapture`; transcribed into
+    /// `docs/research/qualification/phase-49-1m-research.md`.
+    #[test]
+    #[ignore = "run with --release; Phase 49 1M-token isolated attention-step cost"]
+    fn attention_cost_at_one_million_tokens_tqkv_q4() {
+        let depth = 1_048_576usize;
+        let point =
+            measure_one_step_at_depth(BackendChoice::Tqkv(TqkvPrecision::Q4), depth, depth + 1)
+                .unwrap();
+        println!(
+            "phase49_scaling backend=TQKV-Q4 context_tokens={depth} seed_ms={} one_step_ms={}",
+            point.seed_elapsed.as_millis(),
+            point.one_step_elapsed.as_millis(),
+        );
     }
 }
