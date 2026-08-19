@@ -622,7 +622,7 @@ impl WholeExpertLfuCache {
     pub fn advance_prefetch(
         &mut self,
         loader: &Arc<Qwen36WeightLoader>,
-        broker: &MemoryBroker,
+        _broker: &MemoryBroker,
         from_layer: LayerId,
         to_layer: LayerId,
         route: &RouterResult,
@@ -1005,7 +1005,7 @@ impl WholeExpertLfuCache {
 
         let plan_id = self.next_plan_id;
         self.next_plan_id = self.next_plan_id.wrapping_add(1).max(1);
-        let mut plan = BatchExpertPlan {
+        let plan = BatchExpertPlan {
             plan_id,
             layer,
             distinct: distinct.clone(),

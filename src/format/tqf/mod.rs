@@ -16,8 +16,10 @@ mod writer;
 pub use importer::{canonical_header, convert_canonical_gguf, ConversionReport};
 pub use reader::TqfReader;
 pub use records::{
-    ExpertIndexRecord, ExpertMatrix, ExpertTileRecord, SectionRecord, TensorExtentRecord,
-    TqfSectionKind, EXPERT_INDEX_FLAG_TILE_CHECKSUMS,
+    ExpertMatrix,
+    TqfSectionKind,
 };
-pub use superblock::{Superblock, FORMAT_MAJOR, FORMAT_MINOR};
-pub use writer::{RecoveredExpert, RecoveredExtent, RecoveredTile, TqfHeaderInfo, TqfWriter};
+#[cfg(test)]
+pub use records::EXPERT_INDEX_FLAG_TILE_CHECKSUMS;
+pub use superblock::{FORMAT_MAJOR, FORMAT_MINOR};
+pub use writer::{TqfHeaderInfo, TqfWriter};

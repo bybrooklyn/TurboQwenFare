@@ -6,4 +6,5 @@
 /.tqf-dev/
 /.freebuff/
 /swift/.build/
+/.mimocode/
 /.claude/.phase-verify-ok

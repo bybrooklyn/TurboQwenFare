@@ -18,7 +18,7 @@ use crate::ids::{ExpertId, LayerId, TileId};
 
 use super::records::{
     append_string, ChecksumEntry, ExpertIndexRecord, ExpertMatrix, ExpertTileRecord, SectionRecord,
-    TensorExtentRecord, TqfSectionKind, CHECKSUM_ENTRY_SIZE, EXPERT_INDEX_RECORD_SIZE,
+    TensorExtentRecord, TqfSectionKind, CHECKSUM_ENTRY_SIZE,
     EXPERT_TILE_RECORD_SIZE, SECTION_RECORD_SIZE, TENSOR_EXTENT_RECORD_SIZE,
 };
 use super::superblock::{Superblock, FORMAT_MAJOR, FORMAT_MINOR, SUPERBLOCK_SIZE};

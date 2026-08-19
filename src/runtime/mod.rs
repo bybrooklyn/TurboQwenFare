@@ -10,14 +10,13 @@ pub mod request;
 pub mod session;
 
 pub use decode::{
-    decode_greedy, DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, LayerStep,
+    DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash,
     LogitCandidate, RouterTrace,
 };
 pub use generation::{
-    GeneratedOutput, GeneratedToolCall, Qwen36Generator, Qwen36ResidentReferenceGenerator,
+    GeneratedOutput, Qwen36Generator, Qwen36ResidentReferenceGenerator,
 };
 pub use request::{
-    Message, MessageToolCall, NormalizedRequest, ProtocolFlavor, RetrievalPolicy, Role,
-    SamplingParams, ToolDefinition, VisionInput,
+    Message, MessageToolCall, NormalizedRequest, ProtocolFlavor, Role, ToolDefinition,
 };
-pub use session::{GenerationSlot, Session, SessionId};
+pub use session::{GenerationSlot, Session};
