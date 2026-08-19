@@ -10,3 +10,6 @@
 # Local checkpoint paths for `just qual-*` (loaded by the justfile's
 # `set dotenv-load`). Machine-specific and often absolute — never commit.
 .env
+
+# phase-verify's per-staging-state sentinel.
+/.claude/.phase-verify-ok
