@@ -312,6 +312,22 @@ Phases 27-28 land the first long-context (TQKV) work:
   chunk_id tie-break, never a cross-lane raw-score comparison (spec
   §193's explicit rule).
   `docs/research/qualification/phase-40-hybrid-retrieval.md`.
+- **Phase 41 (adaptive ANN research):** `retrieval::adaptive` — steps
+  1-2 of spec §313's five-step candidate sequence: a deterministic
+  balanced k-means `SemanticPartitionIndex` over Phase 38's real
+  vectors, and a path-derived `HierarchyOverlay` (repository/module/
+  file, no AST needed). Steps 3-5 (hot/cold residency, split/merge,
+  workload-adaptive routing) need live query/update traffic this
+  session's offline methodology can't produce honestly, deferred to
+  Phase 42. Measured on the real Phase 38 corpus: the hierarchy overlay
+  correctly groups all ten real files into six real modules; static
+  partitioning is a genuine **negative result at this scale** — `k=2`
+  partitions/`nprobe=1` loses 30 recall points (0.70) for only a 55%
+  scan reduction, `k=3` drops to 0.60 recall for 65% — confirming spec
+  §89's own prediction that flat search "can be surprisingly
+  competitive for normal repository sizes." Not a dead end, just not
+  measured as a win at this corpus size.
+  `docs/research/qualification/phase-41-adaptive-ann-research.md`.
 
 ## Commands
 

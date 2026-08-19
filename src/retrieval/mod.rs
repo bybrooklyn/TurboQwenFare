@@ -2,6 +2,7 @@
 //! not depend on (spec Part X). Must remain removable without affecting
 //! core inference validity.
 
+pub mod adaptive;
 pub mod classify;
 pub mod flat;
 pub mod hybrid;
