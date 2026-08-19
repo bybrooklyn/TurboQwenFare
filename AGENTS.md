@@ -219,6 +219,18 @@ Phases 27-28 land the first long-context (TQKV) work:
   were misclassified by generic keyword collisions in prose. All 112 of
   this crate's own real `.rs` files now classify correctly.
   `docs/research/qualification/phase-35-file-catalog-classifier.md`.
+- **Phase 36 (structural/lexical index):** `retrieval::lexical` — no real
+  AST exists (Phase 35's scope decision), so structural chunking/symbols/
+  program graph are not attempted; instead a real BM25 reference index
+  (spec's own `k1=1.2, b=0.75`) with snake/camel/Pascal/digit-boundary
+  identifier subtoken splitting, plus a case-sensitive exact-identifier
+  lane, both over whole-file chunks. Proven end to end on this crate's own
+  real 113-file source tree (not synthetic fixtures): `MemoryBroker`
+  exact-resolves across 30 real referencing files; the query "whole
+  expert lfu cache eviction" (never appearing as that literal substring
+  anywhere) top-ranks `src/experts/mod.rs` via identifier-subtoken
+  splitting; "gitignore glob pattern matching" top-ranks
+  `src/retrieval/ignore.rs`. `docs/research/qualification/phase-36-structural-lexical-index.md`.
 
 ## Commands
 

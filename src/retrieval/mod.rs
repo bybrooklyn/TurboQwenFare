@@ -4,4 +4,5 @@
 
 pub mod classify;
 pub mod ignore;
+pub mod lexical;
 pub mod scan;
