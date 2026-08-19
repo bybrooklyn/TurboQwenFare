@@ -15,6 +15,7 @@
 
 use metal_sys::{CompileOptions, Library, MTLSize};
 
+#[cfg(test)]
 use crate::backend::reference;
 use crate::error::{BackendError, Result};
 use crate::format::quant::dequant::Q4_K_BLOCK_ELEMENTS;

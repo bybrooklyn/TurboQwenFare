@@ -19,8 +19,7 @@ pub mod pipeline;
 pub mod shaderlib;
 pub mod timing;
 
-pub use buffer::BufferLease;
 pub use context::MetalContext;
 pub use expert::{GpuExecutionState, GpuResidentExpert};
 pub use pipeline::PipelineCache;
-pub use timing::{EventFence, GpuStopwatch};
+pub use timing::GpuStopwatch;

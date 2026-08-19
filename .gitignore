@@ -6,6 +6,7 @@
 /.tqf-dev/
 /.freebuff/
 /swift/.build/
+/.mimocode/
 
 # Local checkpoint paths for `just qual-*` (loaded by the justfile's
 # `set dotenv-load`). Machine-specific and often absolute — never commit.

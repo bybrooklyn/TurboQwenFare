@@ -10,24 +10,12 @@ pub mod request;
 pub mod session;
 pub mod stream_decoder;
 
-// Module facade. `tqf` is a bin-only crate (spec §23: one crate, one
-// binary, no `[lib]` target), so rustc reachability-analyses every
-// `pub use` from `main` and reports the ones the product surface does not
-// yet consume. These re-exports are the module's real interface — keeping
-// them is deliberate; the allows go away as each is wired up.
-#[allow(unused_imports)]
 pub use decode::{
-    decode_greedy, DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, LayerStep,
-    LogitCandidate, RouterTrace,
+    DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, LogitCandidate, RouterTrace,
 };
-#[allow(unused_imports)]
-pub use generation::{
-    GeneratedOutput, GeneratedToolCall, Qwen36Generator, Qwen36ResidentReferenceGenerator,
-};
-#[allow(unused_imports)]
+pub use generation::{GeneratedOutput, Qwen36Generator, Qwen36ResidentReferenceGenerator};
 pub use request::{
-    Message, MessageToolCall, NormalizedRequest, ProtocolFlavor, RetrievalPolicy, Role,
-    SamplingParams, ToolDefinition, VisionInput,
+    Message, MessageToolCall, NormalizedRequest, ProtocolFlavor, Role, SamplingParams,
+    ToolDefinition,
 };
-#[allow(unused_imports)]
-pub use session::{GenerationSlot, Session, SessionId};
+pub use session::{GenerationSlot, Session};
