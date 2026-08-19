@@ -364,6 +364,54 @@ impl GdnState {
         self.recurrent.copy_from_slice(&snapshot.recurrent);
         self.conv = snapshot.conv.clone();
     }
+
+    /// Little-endian byte serialization (crate invariant #2) for
+    /// persisting a snapshot to disk (`context::prefix`, spec §66's "GDN
+    /// state checkpoint"). Fixed-size (both vectors are constant-size with
+    /// context length, see the struct doc), so no length prefix is needed —
+    /// `from_bytes` reconstructs the same fixed sizes from `Self::bytes()`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            (self.recurrent.len() + self.conv.history.len()) * std::mem::size_of::<f32>(),
+        );
+        for v in &self.recurrent {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &self.conv.history {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn from_bytes(broker: &MemoryBroker, layer: LayerId, bytes: &[u8]) -> crate::error::Result<Self> {
+        let mut state = Self::new(broker, layer)?;
+        let recurrent_bytes = state.recurrent.len() * std::mem::size_of::<f32>();
+        let conv_bytes = state.conv.history.len() * std::mem::size_of::<f32>();
+        if bytes.len() != recurrent_bytes + conv_bytes {
+            return Err(crate::error::ModelError::Shape {
+                tensor: "GDN snapshot bytes",
+                expected: recurrent_bytes + conv_bytes,
+                actual: bytes.len(),
+            }
+            .into());
+        }
+        for (slot, chunk) in state
+            .recurrent
+            .iter_mut()
+            .zip(bytes[..recurrent_bytes].chunks_exact(4))
+        {
+            *slot = f32::from_le_bytes(chunk.try_into().unwrap());
+        }
+        for (slot, chunk) in state
+            .conv
+            .history
+            .iter_mut()
+            .zip(bytes[recurrent_bytes..].chunks_exact(4))
+        {
+            *slot = f32::from_le_bytes(chunk.try_into().unwrap());
+        }
+        Ok(state)
+    }
 }
 
 fn sigmoid(x: f32) -> f32 {

@@ -578,4 +578,81 @@ mod tests {
             sequence,
         );
     }
+
+    /// Phase 30 prefix-reuse qualification (spec §300, §66-67; exit gate
+    /// row 30: "Repeated-prefix TTFT reduction; restart reuse"). Decodes a
+    /// shared prefix once on the real checkpoint, snapshots it, then times
+    /// restoring that state into a *brand-new* runtime instance (simulating
+    /// a fresh request/process) versus the real time it took to decode the
+    /// prefix from scratch. Also confirms the restored state produces the
+    /// same next greedy token as the original, still-live runtime —
+    /// correctness and speed in one real-hardware run, the same
+    /// methodology as Phase 26's TTFT measurement.
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint with TQF_TQKV_ENABLED=1; Phase 30 prefix-reuse qualification"]
+    fn canonical_prefix_snapshot_restore_reduces_repeat_prefix_time() {
+        assert!(
+            crate::context::tqkv::tqkv_enabled(),
+            "set TQF_TQKV_ENABLED=1 (prefix dedup is TQKV-specific, spec section 66)"
+        );
+        let tqf = std::env::var("TQF_CANONICAL_TQF").expect("set TQF_CANONICAL_TQF");
+        let prefix_steps: usize = std::env::var("TQF_PREFIX_QUAL_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let store_dir = std::env::var("TQF_PREFIX_STORE_DIR").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("tqf-phase30-prefix-store")
+                .to_string_lossy()
+                .to_string()
+        });
+        let store = crate::context::prefix::PrefixSnapshotStore::open(&store_dir, u64::MAX).unwrap();
+
+        let broker_a = MemoryBroker::new(Bytes(FOUR_GIB));
+        let mut runtime_a = Qwen36BoundedReferenceRuntime::open(
+            Path::new(&tqf),
+            broker_a,
+            64,
+            Bytes(DEFAULT_EXPERT_CACHE_BYTES),
+        )
+        .unwrap();
+        let mut input = 32u32;
+        let mut fed_tokens = Vec::with_capacity(prefix_steps);
+        let scratch_started = Instant::now();
+        for _ in 0..prefix_steps {
+            fed_tokens.push(input);
+            input = runtime_a.decode_greedy(input).unwrap().token;
+        }
+        let scratch_elapsed = scratch_started.elapsed();
+
+        runtime_a.snapshot_session(&store, &fed_tokens).unwrap();
+
+        let broker_b = MemoryBroker::new(Bytes(FOUR_GIB));
+        let mut runtime_b = Qwen36BoundedReferenceRuntime::open(
+            Path::new(&tqf),
+            broker_b,
+            64,
+            Bytes(DEFAULT_EXPERT_CACHE_BYTES),
+        )
+        .unwrap();
+        let restore_started = Instant::now();
+        let hit = runtime_b.restore_session(&store, &fed_tokens).unwrap();
+        let restore_elapsed = restore_started.elapsed();
+        assert!(hit, "exact-prefix lookup should hit the snapshot just stored");
+
+        let continuation_from_live = runtime_a.decode_greedy(input).unwrap().token;
+        let continuation_from_restored = runtime_b.decode_greedy(input).unwrap().token;
+        assert_eq!(
+            continuation_from_live, continuation_from_restored,
+            "restored session must continue identically to the still-live one"
+        );
+
+        println!(
+            "prefix_qual prefix_steps={prefix_steps} scratch_ms={} restore_ms={} speedup={:.1}x continuation_match={}",
+            scratch_elapsed.as_millis(),
+            restore_elapsed.as_millis(),
+            scratch_elapsed.as_secs_f64() / restore_elapsed.as_secs_f64().max(0.0001),
+            continuation_from_live == continuation_from_restored,
+        );
+    }
 }

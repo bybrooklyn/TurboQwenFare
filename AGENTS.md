@@ -132,6 +132,31 @@ Phases 27-28 land the first long-context (TQKV) work:
   outlier-split cuts max error 13.3x on rare-outlier data for +12 bytes;
   Q3 trades ~25% smaller payload for ~2.3x the Q4 baseline's error.
   `docs/research/qualification/phase-28-advanced-tqkv.md`.
+- **Phase 29 (128K production gate):** a literal end-to-end 128K live decode
+  is not run (Phase 25's own I/O-bound floor puts it at many hours to days
+  on this hardware); instead the gate's three parts are measured directly.
+  Memory: `context::tqkv::scaling_bench` really constructs all ten
+  full-attention layers at 131,072-token TQKV-Q4 capacity inside one 4 GiB
+  broker (0.66 GiB reserved, 3.34 GiB headroom). Performance: a new
+  `FullAttentionLayer::seed_synthetic_history_for_benchmark` isolates real
+  attention-step cost from I/O at deep, otherwise-unreachable context
+  lengths — measured **450 ms/step (BF16) and 1,687 ms/step (TQKV-Q4) at
+  128K tokens**, i.e. attention compute alone (before any I/O or MoE work)
+  already exceeds the entire 15 tok/s (66.7 ms) budget by 6.75x-25x,
+  confirming TQAttn-style selective attention (Phase 31-32) is
+  architecturally necessary, not optional — and surfacing a new recorded
+  negative result: TQKV-Q4 is 3.7x slower per attention step than BF16 at
+  128K (scalar per-token dequant cost). `docs/research/qualification/phase-29-128k-gate.md`.
+- **Phase 30 (prefix snapshot store):** `context::prefix::PrefixSnapshotStore`
+  — content-addressed, refcounted, crash-safe (atomic-write) on-disk
+  storage for TQKV pages (reusing their existing BLAKE3 content hash as the
+  page-content ID, spec §66) and GDN recurrent state
+  (`GdnState::to_bytes`/`from_bytes`), an exact BLAKE3 token-prefix hash
+  (spec §67, v1 exact-match only), and LRU disk-quota eviction. Wired into
+  `Qwen36BoundedReferenceRuntime::snapshot_session`/`restore_session`.
+  Real restart reuse demonstrated: a snapshot survives dropping the store
+  handle entirely and reopening a fresh one against the same directory,
+  restoring byte-identical state. `docs/research/qualification/phase-30-prefix-store.md`.
 
 ## Commands
 

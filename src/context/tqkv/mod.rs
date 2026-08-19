@@ -22,6 +22,7 @@ use crate::memory::{MemoryBroker, MemoryClass, MemoryLease, MemoryOwner};
 use crate::model::qwen36::geometry::Qwen36Geometry;
 
 pub mod candidates;
+pub mod scaling_bench;
 
 const KV_HEADS: usize = Qwen36Geometry::FULL_KV_HEADS;
 const HEAD_DIM: usize = Qwen36Geometry::FULL_HEAD_DIM;
@@ -45,14 +46,14 @@ pub enum TqkvPrecision {
 }
 
 impl TqkvPrecision {
-    fn encoding_id(self) -> u16 {
+    pub(crate) fn encoding_id(self) -> u16 {
         match self {
             TqkvPrecision::Q8 => 1,
             TqkvPrecision::Q4 => 2,
         }
     }
 
-    fn from_encoding_id(id: u16) -> Result<Self> {
+    pub(crate) fn from_encoding_id(id: u16) -> Result<Self> {
         match id {
             1 => Ok(TqkvPrecision::Q8),
             2 => Ok(TqkvPrecision::Q4),
@@ -175,7 +176,8 @@ impl TqkvPageHeader {
 /// One sealed, immutable (spec section 156) TQKV page for a single layer.
 /// Key scales are per `(kv_head, dim)` over the whole page (section 158);
 /// Value scales are per `(token, kv_head, group)`.
-struct SealedPage {
+#[derive(Clone)]
+pub(crate) struct SealedPage {
     header: TqkvPageHeader,
     key_bytes: Vec<u8>,
     key_scales: Vec<f16>,
@@ -309,6 +311,13 @@ impl SealedPage {
         self.header.token_count as usize
     }
 
+    /// Content-addressed identity (spec §66's "immutable page IDs"): the
+    /// same BLAKE3 hash already computed at seal time and checked by
+    /// `verify`, reused directly rather than hashed twice.
+    pub(crate) fn content_id(&self) -> [u8; 32] {
+        self.header.content_hash
+    }
+
     /// Verifies the sealed payload against its header's content hash —
     /// the section-156 "canonical page bytes are immutable" guarantee made
     /// checkable, mirroring `format::tqf`'s per-tile BLAKE3 checksums.
@@ -366,6 +375,87 @@ impl SealedPage {
             }
         }
         out
+    }
+
+    /// Serializes to the exact layout the header's own offsets describe:
+    /// `[header][key_payload][value_payload][key_scales][value_scales]`.
+    /// Used by `context::prefix` to persist sealed pages as content-addressed
+    /// blobs (spec §66: "Snapshots reference immutable page IDs").
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.resident_bytes());
+        out.extend_from_slice(&self.header.to_le_bytes());
+        out.extend_from_slice(&self.key_bytes);
+        out.extend_from_slice(&self.value_bytes);
+        for s in &self.key_scales {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for s in &self.value_scales {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < PAGE_HEADER_BYTES {
+            return Err(ModelError::Shape {
+                tensor: "TQKV persisted page",
+                expected: PAGE_HEADER_BYTES,
+                actual: bytes.len(),
+            }
+            .into());
+        }
+        let mut header_bytes = [0u8; PAGE_HEADER_BYTES];
+        header_bytes.copy_from_slice(&bytes[..PAGE_HEADER_BYTES]);
+        let header = TqkvPageHeader::from_le_bytes(&header_bytes);
+        let precision = TqkvPrecision::from_encoding_id(header.key_encoding)?;
+        let body = &bytes[PAGE_HEADER_BYTES..];
+        let key_len = header.key_payload_bytes as usize;
+        let value_len = header.value_payload_bytes as usize;
+        let key_bytes = body
+            .get(..key_len)
+            .ok_or(ModelError::Shape {
+                tensor: "TQKV persisted key payload",
+                expected: key_len,
+                actual: body.len(),
+            })?
+            .to_vec();
+        let value_bytes = body
+            .get(key_len..key_len + value_len)
+            .ok_or(ModelError::Shape {
+                tensor: "TQKV persisted value payload",
+                expected: value_len,
+                actual: body.len().saturating_sub(key_len),
+            })?
+            .to_vec();
+        let scales_region = &body[key_len + value_len..];
+        let key_scale_count = KV_HEADS * HEAD_DIM;
+        let value_scale_count = header.token_count as usize * KV_HEADS * VALUE_GROUPS;
+        let expected_scale_bytes = (key_scale_count + value_scale_count) * std::mem::size_of::<f16>();
+        if scales_region.len() < expected_scale_bytes {
+            return Err(ModelError::Shape {
+                tensor: "TQKV persisted scale metadata",
+                expected: expected_scale_bytes,
+                actual: scales_region.len(),
+            }
+            .into());
+        }
+        let key_scales = scales_region[..key_scale_count * 2]
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let value_scales_region = &scales_region[key_scale_count * 2..];
+        let value_scales = value_scales_region[..value_scale_count * 2]
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Ok(Self {
+            header,
+            key_bytes,
+            key_scales,
+            value_bytes,
+            value_scales,
+            precision,
+        })
     }
 
     /// Total resident bytes: header + payloads + scale metadata (spec
@@ -608,6 +698,35 @@ impl TqkvPagedCache {
         self.tail_keys.clear();
         self.tail_values.clear();
         self.next_page_id = 0;
+    }
+
+    /// Sealed pages in order, for `context::prefix` snapshot export — each
+    /// one's `content_id()`/`to_bytes()` is what gets persisted as a
+    /// content-addressed blob.
+    pub(crate) fn sealed_pages(&self) -> &[SealedPage] {
+        &self.sealed
+    }
+
+    /// The mutable tail's raw post-RoPE Key/Value history — not
+    /// content-addressed (it is not yet immutable, spec §156), so a
+    /// snapshot stores it inline rather than by content ID.
+    pub(crate) fn tail_raw(&self) -> (&[f32], &[f32]) {
+        (&self.tail_keys, &self.tail_values)
+    }
+
+    /// Rebuilds cache content from a restored snapshot (sealed pages plus
+    /// tail), keeping the existing broker lease/capacity — the
+    /// `context::prefix` restart-reuse path.
+    pub(crate) fn restore_from_snapshot(
+        &mut self,
+        sealed: Vec<SealedPage>,
+        tail_keys: Vec<f32>,
+        tail_values: Vec<f32>,
+    ) {
+        self.next_page_id = sealed.len() as u64;
+        self.sealed = sealed;
+        self.tail_keys = tail_keys;
+        self.tail_values = tail_values;
     }
 
     pub(crate) fn push(&mut self, key: &[f32], value: &[f32]) -> Result<()> {

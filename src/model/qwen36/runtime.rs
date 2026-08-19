@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::context::prefix::{GdnCapture, PrefixSnapshotStore};
 use crate::dev::inventory::TensorRole;
 use crate::error::{ModelError, Result};
 use crate::experts::{Qwen36ResidentMoe, Qwen36StreamingMoe, RouterResult, WholeExpertLfuCache};
@@ -593,6 +594,70 @@ impl Qwen36BoundedReferenceRuntime {
                 BoundedLayerState::Full { state, .. } => state.reset(),
             }
         }
+    }
+
+    /// Phase 30 prefix reuse (spec §66-67): captures every layer's current
+    /// TQKV/GDN state and persists it under `tokens`' exact prefix hash.
+    /// Full-attention layers running the BF16 backend contribute nothing
+    /// (`capture_tqkv_for_snapshot` returns `None` for them — prefix dedup
+    /// is a TQKV-specific mechanism, `TQF_TQKV_ENABLED=1` is required for
+    /// this to capture anything useful).
+    pub fn snapshot_session(&self, store: &PrefixSnapshotStore, tokens: &[u32]) -> Result<[u8; 32]> {
+        let mut full_attention = Vec::new();
+        let mut gdn = Vec::new();
+        for layer in &self.layers {
+            match layer {
+                BoundedLayerState::Full { id, state } => {
+                    if let Some(capture) = state.capture_tqkv_for_snapshot(*id) {
+                        full_attention.push(capture);
+                    }
+                }
+                BoundedLayerState::Gdn { id, state } => {
+                    gdn.push(GdnCapture {
+                        layer: *id,
+                        bytes: state.to_bytes(),
+                    });
+                }
+            }
+        }
+        store.store(tokens, &full_attention, &gdn)
+    }
+
+    /// Restores session state from a stored exact-prefix snapshot, if one
+    /// exists. Returns `true` (and leaves `decode_index` at the snapshot's
+    /// token count, ready to continue from there) on a hit, `false` on a
+    /// miss with no state changed.
+    pub fn restore_session(&mut self, store: &PrefixSnapshotStore, tokens: &[u32]) -> Result<bool> {
+        let Some(loaded) = store.load(tokens, &self.broker)? else {
+            return Ok(false);
+        };
+        for restored in loaded.full_attention {
+            for layer in &mut self.layers {
+                if let BoundedLayerState::Full { id, state } = layer {
+                    if *id == restored.layer {
+                        state.restore_tqkv_snapshot(
+                            restored.sealed,
+                            restored.tail_keys,
+                            restored.tail_values,
+                            restored.position,
+                        )?;
+                        break;
+                    }
+                }
+            }
+        }
+        for restored in loaded.gdn {
+            for layer in &mut self.layers {
+                if let BoundedLayerState::Gdn { id, state } = layer {
+                    if *id == restored.layer {
+                        *state = restored.state;
+                        break;
+                    }
+                }
+            }
+        }
+        self.decode_index = loaded.token_count as u64;
+        Ok(true)
     }
 }
 

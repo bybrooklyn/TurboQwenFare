@@ -354,9 +354,103 @@ impl FullAttentionLayer {
         self.cache.len()
     }
 
+    /// Populates `tokens` synthetic post-RoPE Key/Value entries directly
+    /// into the backend without computing attention on each one — real
+    /// per-token decode is O(n) per step, so building up to a 128K-scale
+    /// history that way is itself the Phase 29 problem. This exists purely
+    /// for the Phase 29 populated-context attention-cost benchmark
+    /// (`context::tqkv::scaling_bench`): it isolates "cost of one real
+    /// attention step at depth n" from "cost of the n steps that built up
+    /// that history", which the full decode loop cannot separate on its
+    /// own. Not used by any production call site.
+    pub(crate) fn seed_synthetic_history_for_benchmark(&mut self, tokens: usize) -> Result<()> {
+        let mut state = 0x5EED_5EED_u64;
+        let mut xorshift = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state as f64 / u64::MAX as f64) * 2.0 - 1.0) as f32 * 3.0
+        };
+        let mut key = vec![0f32; KV_WIDTH];
+        let mut value = vec![0f32; KV_WIDTH];
+        for _ in 0..tokens {
+            for slot in key.iter_mut().chain(value.iter_mut()) {
+                *slot = xorshift();
+            }
+            self.cache.push(&key, &value)?;
+        }
+        self.position += tokens as u64;
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.cache.reset();
         self.position = 0;
+    }
+
+    /// The current decode position (tokens pushed so far) — a prefix
+    /// snapshot restore must set this so the next real token's RoPE angle
+    /// is computed at the right absolute position.
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Exposes the TQKV backend for `context::prefix` snapshot export;
+    /// `None` when this layer is running the BF16 reference backend
+    /// (prefix dedup is a TQKV-specific mechanism, spec §66).
+    pub(crate) fn tqkv_cache(&self) -> Option<&TqkvPagedCache> {
+        match &self.cache {
+            KvCacheBackend::Tqkv(cache) => Some(cache),
+            KvCacheBackend::Bf16(_) => None,
+        }
+    }
+
+    /// Builds a `context::prefix` capture of this layer's current TQKV
+    /// state (`None` for a BF16-backed layer — see `tqkv_cache`).
+    pub(crate) fn capture_tqkv_for_snapshot(
+        &self,
+        layer: LayerId,
+    ) -> Option<crate::context::prefix::FullAttentionCapture> {
+        let cache = self.tqkv_cache()?;
+        let pages = cache
+            .sealed_pages()
+            .iter()
+            .map(|page| (page.content_id(), page.to_bytes()))
+            .collect();
+        let (tail_keys, tail_values) = cache.tail_raw();
+        Some(crate::context::prefix::FullAttentionCapture {
+            layer,
+            precision: cache.precision(),
+            position: self.position,
+            pages,
+            tail_keys: tail_keys.to_vec(),
+            tail_values: tail_values.to_vec(),
+        })
+    }
+
+    /// Restores this layer's TQKV backend from a snapshot and sets
+    /// `position` to match (`context::prefix` restart-reuse path). Errors
+    /// if this layer isn't currently running the TQKV backend.
+    pub(crate) fn restore_tqkv_snapshot(
+        &mut self,
+        sealed: Vec<crate::context::tqkv::SealedPage>,
+        tail_keys: Vec<f32>,
+        tail_values: Vec<f32>,
+        position: u64,
+    ) -> Result<()> {
+        match &mut self.cache {
+            KvCacheBackend::Tqkv(cache) => {
+                cache.restore_from_snapshot(sealed, tail_keys, tail_values);
+                self.position = position;
+                Ok(())
+            }
+            KvCacheBackend::Bf16(_) => Err(ModelError::Shape {
+                tensor: "TQKV snapshot restore onto a BF16-backed layer",
+                expected: 1,
+                actual: 0,
+            }
+            .into()),
+        }
     }
 
     /// Broker-accounted variant used by the real fixed-graph binder.  The
