@@ -111,6 +111,24 @@ pub enum FormatError {
     Gguf(#[from] GgufError),
     #[error(transparent)]
     Container(#[from] ContainerError),
+    #[error(transparent)]
+    Safetensors(#[from] SafetensorsError),
+}
+
+/// Errors from the minimal safetensors reader (`helper_model::safetensors`,
+/// spec §37) used to ingest the pplx-embed helper-model checkpoint. Not a
+/// general safetensors library — only the subset needed to read one known
+/// model's F32 tensors.
+#[derive(Debug, Error)]
+pub enum SafetensorsError {
+    #[error("safetensors header length {0} is missing or exceeds the sane bound")]
+    HeaderLengthInvalid(u64),
+    #[error("safetensors header is not valid JSON")]
+    InvalidHeader,
+    #[error("safetensors tensor {0:?} not found")]
+    TensorNotFound(String),
+    #[error("safetensors tensor {name:?} has unsupported dtype {dtype:?} (only F32 is read)")]
+    UnsupportedDtype { name: String, dtype: String },
 }
 
 /// Errors from the strict GGUF import reader (spec §277, §115 invariants

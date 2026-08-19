@@ -237,6 +237,28 @@ Phases 27-28 land the first long-context (TQKV) work:
   anywhere) top-ranks `src/experts/mod.rs` via identifier-subtoken
   splitting; "gitignore glob pattern matching" top-ranks
   `src/retrieval/ignore.rs`. `docs/research/qualification/phase-36-structural-lexical-index.md`.
+- **Phase 37 (pplx helper runtime):** `helper_model::` — a new top-level
+  module (sibling of `model`/`runtime`, matching the spec's dependency-
+  firewall table) implementing `perplexity-ai/pplx-embed-v1-0.6b`: a
+  dense, **bidirectional** Qwen3-architecture encoder (28 layers, hidden
+  1024, 16Q/8KV heads, RoPE θ=1e6), distinct from the causal MoE Qwen3.6
+  core. A minimal safetensors reader (new `SafetensorsError`/
+  `FormatError::Safetensors`), lossless F32-passthrough `.tqf` conversion,
+  a from-scratch CPU forward pass (per-head QK-RMSNorm, full rotate-half
+  RoPE, GQA, bidirectional softmax attention, SwiGLU), mean pooling, MRL
+  truncation, and INT8/binary/ubinary quantization reproduced exactly
+  from the checkpoint's own shipped `st_quantize.py`. Loaded under a new
+  `MemoryOwner::HelperModel`/`MemoryClass::Transient` broker reservation
+  (spec's "transient helper model while its current operation is
+  executing"). Validated against the checkpoint's own official ONNX
+  export as an independent oracle (not self-consistency): on the real
+  2.2 GiB checkpoint (310 tensors, SHA-256 verified), token IDs match
+  exactly, pooled FP32 cosine similarity is ~1.0, and **zero** of 1024
+  INT8 dims differ by more than one quantization step with **zero**
+  binary sign-bit mismatches, across both real test sentences. Not yet
+  wired into `POST /v1/embeddings` — this phase delivers the runtime and
+  its qualification, not the HTTP route.
+  `docs/research/qualification/phase-37-pplx-helper-runtime.md`.
 
 ## Commands
 

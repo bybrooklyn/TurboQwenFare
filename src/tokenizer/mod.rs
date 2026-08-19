@@ -32,6 +32,19 @@ impl TqfTokenizer {
         gguf::build_from_gguf(file)
     }
 
+    /// Builds directly from a standalone HF `tokenizer.json`, for models
+    /// distributed as safetensors rather than GGUF (e.g. the pplx-embed
+    /// helper model, spec §37) where no GGUF vocab/merges metadata exists.
+    pub fn from_tokenizer_json_file(path: &std::path::Path) -> Result<Self> {
+        let inner =
+            HfTokenizer::from_file(path).map_err(|e| ModelError::TokenizerBuild(e.to_string()))?;
+        Ok(Self {
+            inner,
+            bos_token_id: None,
+            eos_token_id: None,
+        })
+    }
+
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let encoding = self
             .inner

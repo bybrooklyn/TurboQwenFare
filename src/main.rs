@@ -11,6 +11,7 @@ mod error;
 mod experts;
 mod format;
 mod gui;
+mod helper_model;
 mod ids;
 mod integrations;
 mod io;

@@ -36,6 +36,11 @@ pub enum MemoryOwner {
     IoStaging,
     Scratch,
     ServerReserve,
+    /// A transiently loaded helper model (spec §37 embedding/rerank
+    /// helpers, spec §115 item 7: "transient helper model while its
+    /// current operation is executing"). Reserved only while the helper
+    /// is loaded; the decode-critical owners above never account for it.
+    HelperModel,
 }
 
 impl std::fmt::Display for MemoryOwner {
@@ -67,6 +72,7 @@ pub struct OwnerReserved {
     pub io_staging: u64,
     pub scratch: u64,
     pub server_reserve: u64,
+    pub helper_model: u64,
 }
 
 impl OwnerReserved {
@@ -81,6 +87,7 @@ impl OwnerReserved {
             MemoryOwner::IoStaging => &mut self.io_staging,
             MemoryOwner::Scratch => &mut self.scratch,
             MemoryOwner::ServerReserve => &mut self.server_reserve,
+            MemoryOwner::HelperModel => &mut self.helper_model,
         };
         *slot = slot.saturating_add(bytes);
     }
@@ -96,6 +103,7 @@ impl OwnerReserved {
             MemoryOwner::IoStaging => &mut self.io_staging,
             MemoryOwner::Scratch => &mut self.scratch,
             MemoryOwner::ServerReserve => &mut self.server_reserve,
+            MemoryOwner::HelperModel => &mut self.helper_model,
         };
         *slot = slot.saturating_sub(bytes);
     }
@@ -113,6 +121,7 @@ impl Default for OwnerReserved {
             io_staging: 0,
             scratch: 0,
             server_reserve: 0,
+            helper_model: 0,
         }
     }
 }
