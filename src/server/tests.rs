@@ -873,11 +873,13 @@ async fn the_native_memory_endpoint_reports_real_os_numbers() {
         body["observed"]["resident_bytes"].as_u64().unwrap_or(0) > 0,
         "resident memory must be a real reading: {body}"
     );
-    // The per-owner broker breakdown is deliberately absent rather than
-    // fabricated, and the response says so.
+    // `spawn_test_server(true)` installs no generator, so there is no
+    // broker to report. `null` is the honest answer — distinct from a
+    // broker that exists and reports zero. The loaded case is covered by
+    // `tqf_memory_reports_real_broker_reservations_when_a_runtime_is_loaded`.
     assert!(
-        body["note"].as_str().unwrap_or_default().contains("broker"),
-        "{body}"
+        body["reserved"].is_null(),
+        "with no runtime loaded there is no broker to report: {body}"
     );
 }
 
@@ -1035,4 +1037,128 @@ async fn anthropic_streams_reasoning_in_its_own_thinking_block() {
         "content blocks left unterminated: {open:?}"
     );
     assert!(response.contains("message_stop"));
+}
+
+/// A generator that owns a real broker, so tests can assert that anything
+/// else the server loads is charged against the *same* `--memory` budget.
+struct BrokeredGenerator {
+    broker: crate::memory::MemoryBroker,
+}
+
+#[async_trait::async_trait]
+impl Qwen36Generator for BrokeredGenerator {
+    async fn generate(
+        &self,
+        _request: NormalizedRequest,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::error::Result<GeneratedOutput> {
+        GeneratedOutput::from_model_text("ok")
+    }
+
+    fn broker(&self) -> Option<crate::memory::MemoryBroker> {
+        Some(self.broker.clone())
+    }
+}
+
+/// The property the exposed broker exists for (spec §115 invariant 4,
+/// §114's "do not silently allocate above `--memory`"): a second holder —
+/// a transient helper model, say — reserves against the same budget the
+/// runtime is using, rather than allocating behind its back.
+///
+/// `MemoryBroker` is an `Arc` handle, so this checks that the handle
+/// really shares accounting rather than cloning a fresh budget.
+#[tokio::test]
+async fn a_second_holder_of_the_exposed_broker_shares_one_budget() {
+    use crate::ids::Bytes;
+    use crate::memory::{MemoryBroker, MemoryClass, MemoryOwner};
+
+    let broker = MemoryBroker::new(Bytes(1024 * 1024));
+    let generator = Arc::new(BrokeredGenerator {
+        broker: broker.clone(),
+    });
+
+    let exposed = generator
+        .broker()
+        .expect("the generator exposes its broker");
+    assert_eq!(exposed.snapshot().reserved, Bytes(0));
+
+    // Reserve through the handle the server would use for a helper model.
+    let lease = exposed
+        .reserve(
+            MemoryOwner::HelperModel,
+            MemoryClass::Transient,
+            Bytes(512 * 1024),
+            64,
+        )
+        .expect("half the budget must fit");
+
+    // The runtime's own broker sees it — one budget, not two.
+    assert_eq!(broker.snapshot().reserved, Bytes(512 * 1024));
+    assert_eq!(broker.snapshot().by_owner.helper_model, 512 * 1024);
+
+    // And the budget is genuinely shared: a second reservation that would
+    // exceed it is refused rather than silently granted.
+    let over = exposed.reserve(
+        MemoryOwner::HelperModel,
+        MemoryClass::Transient,
+        Bytes(768 * 1024),
+        64,
+    );
+    assert!(
+        over.is_err(),
+        "a helper model must not be able to allocate above --memory"
+    );
+
+    drop(lease);
+    assert_eq!(broker.snapshot().reserved, Bytes(0));
+}
+
+/// `/tqf/memory` used to document that it could not report broker
+/// reservations because the broker was owned by the runtime. Now it can.
+#[tokio::test]
+async fn tqf_memory_reports_real_broker_reservations_when_a_runtime_is_loaded() {
+    use crate::ids::Bytes;
+    use crate::memory::{MemoryBroker, MemoryClass, MemoryOwner};
+
+    let broker = MemoryBroker::new(Bytes(8 * 1024 * 1024));
+    let _lease = broker
+        .reserve(
+            MemoryOwner::ExpertPinned,
+            MemoryClass::Elastic,
+            Bytes(2 * 1024 * 1024),
+            64,
+        )
+        .unwrap();
+
+    let addr = spawn_test_server_with(
+        true,
+        Some(Arc::new(BrokeredGenerator {
+            broker: broker.clone(),
+        })),
+    )
+    .await;
+
+    let response = http_request(addr, &get("/tqf/memory")).await;
+    let body = response.split("\r\n\r\n").nth(1).expect("a body");
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+
+    assert_eq!(parsed["reserved"]["budget_bytes"], 8 * 1024 * 1024);
+    assert_eq!(parsed["reserved"]["reserved_bytes"], 2 * 1024 * 1024);
+    assert_eq!(
+        parsed["reserved"]["by_owner"]["expert_pinned"],
+        2 * 1024 * 1024
+    );
+}
+
+/// With no runtime loaded there is no broker, and the field is `null` —
+/// which is a different claim from a broker reporting zero.
+#[tokio::test]
+async fn tqf_memory_reports_null_reservations_when_nothing_is_loaded() {
+    let addr = spawn_test_server(false).await;
+    let response = http_request(addr, &get("/tqf/memory")).await;
+    let body = response.split("\r\n\r\n").nth(1).expect("a body");
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+
+    assert!(parsed["reserved"].is_null());
+    assert!(parsed["observed"]["resident_bytes"].as_u64().unwrap_or(0) > 0);
 }

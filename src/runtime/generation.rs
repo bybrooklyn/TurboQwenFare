@@ -280,6 +280,22 @@ pub trait Qwen36Generator: Send + Sync {
     fn streams_incrementally(&self) -> bool {
         false
     }
+
+    /// The memory broker governing this generator's residency, when it has
+    /// one.
+    ///
+    /// Exposed so that anything else the server loads — a transient helper
+    /// model (spec §37), for instance — reserves against the *same*
+    /// `--memory` budget rather than allocating behind it. `--memory` is a
+    /// hard live working-set contract, not an advisory cache size, and a
+    /// second allocator with its own budget would silently break that
+    /// (spec §115 invariant 4, and §114's "do not silently allocate above
+    /// `--memory`").
+    ///
+    /// `None` for generators that own no broker, such as test doubles.
+    fn broker(&self) -> Option<crate::memory::MemoryBroker> {
+        None
+    }
 }
 
 /// An actual, fixed-graph Qwen3.6 generator for the high-memory resident
@@ -344,6 +360,13 @@ impl QwenRuntimeInstance {
         match self {
             Self::Resident(runtime) => runtime.expert_cache_stats(),
             Self::Bounded(runtime) => Some(runtime.expert_cache_stats()),
+        }
+    }
+
+    fn broker(&self) -> crate::memory::MemoryBroker {
+        match self {
+            Self::Resident(runtime) => runtime.broker(),
+            Self::Bounded(runtime) => runtime.broker(),
         }
     }
 }
@@ -555,6 +578,15 @@ impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
 
     fn streams_incrementally(&self) -> bool {
         true
+    }
+
+    fn broker(&self) -> Option<crate::memory::MemoryBroker> {
+        Some(
+            self.runtime
+                .lock()
+                .expect("Qwen runtime mutex poisoned")
+                .broker(),
+        )
     }
 }
 

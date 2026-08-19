@@ -116,6 +116,36 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
 /// than omitting one. `/tqf/status` names the configured budget.
 async fn memory(State(state): State<AppState>) -> Json<Value> {
     let footprint = sample_process_footprint();
+
+    // Phase 24's rule: report both numbers or neither. A configuration is
+    // not "4G certified" because steady-state decode is 3.9G if admission
+    // spiked the OS-observed footprint to 4.7G, so the broker's own
+    // accounting and the OS reading are only meaningful together.
+    let reserved = state
+        .generator
+        .as_ref()
+        .and_then(|g| g.broker())
+        .map(|broker| {
+            let snapshot = broker.snapshot();
+            serde_json::json!({
+                "budget_bytes": snapshot.budget.0,
+                "reserved_bytes": snapshot.reserved.0,
+                "peak_bytes": snapshot.peak.0,
+                "by_owner": {
+                    "core": snapshot.by_owner.core,
+                    "gdn_state": snapshot.by_owner.gdn_state,
+                    "context_hot": snapshot.by_owner.context_hot,
+                    "context_cold": snapshot.by_owner.context_cold,
+                    "expert_pinned": snapshot.by_owner.expert_pinned,
+                    "expert_probation": snapshot.by_owner.expert_probation,
+                    "io_staging": snapshot.by_owner.io_staging,
+                    "scratch": snapshot.by_owner.scratch,
+                    "server_reserve": snapshot.by_owner.server_reserve,
+                    "helper_model": snapshot.by_owner.helper_model,
+                },
+            })
+        });
+
     Json(serde_json::json!({
         "budget_bytes": state.config.memory_budget_bytes.unwrap_or(4 * 1024 * 1024 * 1024),
         "observed": {
@@ -123,8 +153,9 @@ async fn memory(State(state): State<AppState>) -> Json<Value> {
             "virtual_bytes": footprint.map(|(_, virtual_bytes, _)| virtual_bytes.0),
             "resident_peak_bytes": footprint.map(|(_, _, peak)| peak.0),
         },
-        "note": "OS-observed process footprint. Per-owner broker reservations are not \
-                 exposed here because the broker is owned by the loaded runtime.",
+        // `null` when no runtime is loaded, which is honest: there is no
+        // broker yet, as opposed to a broker reporting zero.
+        "reserved": reserved,
     }))
 }
 

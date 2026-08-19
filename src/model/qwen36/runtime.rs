@@ -237,6 +237,17 @@ impl Qwen36ReferenceRuntime {
         })
     }
 
+    /// The broker governing this runtime's residency.
+    ///
+    /// `MemoryBroker` is an `Arc` handle, so this shares the accounting
+    /// rather than copying it — a second holder reserving against it is
+    /// charged to the same `--memory` budget, which is the whole point
+    /// (spec §115 invariant 4: every large allocation is registered with
+    /// the broker *before* it happens).
+    pub fn broker(&self) -> MemoryBroker {
+        self.broker.clone()
+    }
+
     pub fn expert_cache_stats(&self) -> Option<crate::experts::ExpertCacheStats> {
         self.expert_cache.as_ref().map(WholeExpertLfuCache::stats)
     }
@@ -524,6 +535,11 @@ impl Qwen36BoundedReferenceRuntime {
             layers,
             decode_index: 0,
         })
+    }
+
+    /// See `Qwen36ReferenceRuntime::broker`.
+    pub fn broker(&self) -> MemoryBroker {
+        self.broker.clone()
     }
 
     pub fn expert_cache_stats(&self) -> crate::experts::ExpertCacheStats {
