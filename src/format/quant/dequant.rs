@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn dispatch_returns_none_for_undecoded_types() {
-        assert!(dequantize_block(GgmlType::F32, &[0u8; 4]).is_some() == false);
+        assert!(dequantize_block(GgmlType::F32, &[0u8; 4]).is_none());
         assert!(dequantize_block(GgmlType::Q5K, &[0u8; 176]).is_none());
     }
 }

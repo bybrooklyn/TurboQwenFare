@@ -61,7 +61,7 @@ impl Qwen36Geometry {
     /// and also verified against the installed model manifest at runtime —
     /// a mismatch there is a fatal architecture error (spec §116).
     pub fn layer_kind(layer: LayerId) -> LayerKind {
-        if (layer.0 as usize + 1) % Self::FULL_ATTENTION_INTERVAL == 0 {
+        if (layer.0 as usize + 1).is_multiple_of(Self::FULL_ATTENTION_INTERVAL) {
             LayerKind::FullAttention
         } else {
             LayerKind::GatedDeltaNet

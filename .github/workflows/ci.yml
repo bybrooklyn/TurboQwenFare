@@ -1,0 +1,41 @@
+# Lane A of the spec's CI lane design (§262): portable, fast, and needs no
+# GPU, no model checkpoint, and no network. Lanes B-E need real hardware
+# (macOS/Metal, NVIDIA, or the 20 GB checkpoint) and are driven locally by
+# the `just qual-*` and `just build-gui` recipes instead.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lane-a:
+    name: portable fast (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both, deliberately: the platform-conditional backend selection is
+        # exactly the kind of thing that only breaks on the platform nobody
+        # builds on. macOS here compiles the Metal backend; Linux compiles
+        # the reference path.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel and components.
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: extractions/setup-just@v2
+
+      - name: Lane A
+        run: just ci
+
+      - name: Backend dependency resolves per platform
+        run: ./scripts/check-platform-backends.sh

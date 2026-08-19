@@ -11,6 +11,7 @@ pub struct Config {
     pub context_limit_tokens: Option<u64>,
     pub enable_vision: bool,
     pub host: Option<String>,
+    pub port: Option<u16>,
 }
 
 /// Parses a size like "4G", "512M", "128K", or a bare integer, into a count

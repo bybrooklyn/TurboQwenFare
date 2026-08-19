@@ -19,7 +19,7 @@ pub mod tiling;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "metal")]
+#[cfg(tqf_metal)]
 use crate::backend::metal::{GpuExecutionState, GpuResidentExpert};
 use crate::backend::reference::{q4k_gemv, sigmoid, silu};
 use crate::dev::inventory::TensorRole;
@@ -35,7 +35,7 @@ use crate::model::qwen36::weights::{
 
 /// Placeholder so the cache's spawn/forward API compiles identically on
 /// non-Metal backends; it is never constructed there.
-#[cfg(not(feature = "metal"))]
+#[cfg(not(tqf_metal))]
 pub(crate) type GpuExecutionState = ();
 
 /// The backing store for one routed expert in the cache. `Cpu` keeps the
@@ -47,7 +47,7 @@ pub(crate) type GpuExecutionState = ();
 /// bytes).
 pub enum ExpertValue {
     Cpu(LoadedQwen36Expert),
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     Gpu(GpuResidentExpert),
 }
 
@@ -55,7 +55,7 @@ impl ExpertValue {
     pub fn stored_bytes(&self) -> Bytes {
         match self {
             ExpertValue::Cpu(cpu) => cpu.stored_bytes(),
-            #[cfg(feature = "metal")]
+            #[cfg(tqf_metal)]
             ExpertValue::Gpu(gpu) => gpu.stored_bytes(),
         }
     }
@@ -64,7 +64,7 @@ impl ExpertValue {
     /// this value was admitted with. GPU values require the cache's GPU
     /// execution state (device/library/pipeline cache) to still exist;
     /// losing it mid-route is a violated internal invariant.
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     pub fn forward(
         &self,
         broker: &MemoryBroker,
@@ -84,7 +84,7 @@ impl ExpertValue {
         }
     }
 
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(tqf_metal))]
     pub fn forward(
         &self,
         broker: &MemoryBroker,
@@ -316,10 +316,10 @@ pub struct WholeExpertLfuCache {
     /// cache) is created lazily on first use and shared behind a mutex so
     /// the cache stays `Send` even though Metal objects are not. `None`
     /// once the CPU fallback is selected (no device available).
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     gpu_state: Option<Arc<Mutex<GpuExecutionState>>>,
     /// Whether new cache admissions should be uploaded to GPU buffers.
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     gpu_enabled: bool,
     /// Phase 23 predictive prefetch (spec §295). Off by default until the
     /// offline replay and a live A/B record a net win; `TQF_PREFETCH_ENABLED`
@@ -402,7 +402,7 @@ fn cache_policy_from_env() -> CachePolicyKind {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(tqf_metal)]
 fn gpu_enabled_from_env() -> bool {
     env_enabled(EXPERT_GPU_ENV)
 }
@@ -422,9 +422,9 @@ impl WholeExpertLfuCache {
                 .unwrap_or_else(ReadFanout::parallel_default),
             policy: cache_policy_from_env(),
             half_life_events: DEFAULT_HALF_LIFE_EVENTS,
-            #[cfg(feature = "metal")]
+            #[cfg(tqf_metal)]
             gpu_state: None,
-            #[cfg(feature = "metal")]
+            #[cfg(tqf_metal)]
             gpu_enabled: gpu_enabled_from_env(),
             prefetch_enabled: env_enabled(PREFETCH_ENABLED_ENV),
             prefetch_depth: prefetch_depth_from_env(),
@@ -457,15 +457,15 @@ impl WholeExpertLfuCache {
     /// entirely within one process. Disabling keeps any already-resident
     /// GPU values (they stay correct to forward); it only stops new
     /// admissions from taking the GPU path.
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     pub fn set_gpu_enabled(&mut self, enabled: bool) {
         self.gpu_enabled = enabled;
     }
 
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(tqf_metal))]
     pub fn set_gpu_enabled(&mut self, _enabled: bool) {}
 
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     pub(crate) fn gpu_expert_count(&self) -> usize {
         self.entries
             .iter()
@@ -473,7 +473,7 @@ impl WholeExpertLfuCache {
             .count()
     }
 
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(tqf_metal))]
     pub(crate) fn gpu_expert_count(&self) -> usize {
         0
     }
@@ -483,7 +483,7 @@ impl WholeExpertLfuCache {
     /// usable Metal device: the flag is cleared and the cache stays on the
     /// CPU baseline, so an A/B run never turns into a crash on a headless
     /// or sandboxed machine.
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     fn init_gpu_state_if_needed(&mut self) {
         if !self.gpu_enabled || self.gpu_state.is_some() {
             return;
@@ -505,9 +505,9 @@ impl WholeExpertLfuCache {
     fn stage_expert_values(
         &mut self,
         staged: Vec<(ExpertId, LoadedQwen36Expert)>,
-        broker: &MemoryBroker,
+        _broker: &MemoryBroker,
     ) -> Result<Vec<(ExpertId, ExpertValue)>> {
-        #[cfg(feature = "metal")]
+        #[cfg(tqf_metal)]
         {
             self.init_gpu_state_if_needed();
             if let Some(state) = &self.gpu_state {
@@ -622,7 +622,7 @@ impl WholeExpertLfuCache {
     pub fn advance_prefetch(
         &mut self,
         loader: &Arc<Qwen36WeightLoader>,
-        broker: &MemoryBroker,
+        _broker: &MemoryBroker,
         from_layer: LayerId,
         to_layer: LayerId,
         route: &RouterResult,
@@ -893,7 +893,7 @@ impl WholeExpertLfuCache {
         input: &[f32],
     ) -> Result<Qwen36Activation> {
         let entry = self.planned_expert(plan, expert)?;
-        #[cfg(feature = "metal")]
+        #[cfg(tqf_metal)]
         {
             if let ExpertValue::Gpu(gpu_expert) = entry {
                 let state = self
@@ -913,7 +913,7 @@ impl WholeExpertLfuCache {
         }
         match entry {
             ExpertValue::Cpu(cpu) => cpu.forward(broker, input),
-            #[cfg(feature = "metal")]
+            #[cfg(tqf_metal)]
             ExpertValue::Gpu(_) => Err(crate::error::InternalError {
                 incident_id: "expert-gpu-state-missing".to_string(),
                 message: "GPU-resident expert value without GPU execution state".to_string(),
@@ -1005,7 +1005,7 @@ impl WholeExpertLfuCache {
 
         let plan_id = self.next_plan_id;
         self.next_plan_id = self.next_plan_id.wrapping_add(1).max(1);
-        let mut plan = BatchExpertPlan {
+        let plan = BatchExpertPlan {
             plan_id,
             layer,
             distinct: distinct.clone(),
@@ -1094,7 +1094,7 @@ impl WholeExpertLfuCache {
                 incident_id: format!("expert-batch-plan-{}-missing", plan.plan_id),
                 message: "active batch plan lost a pinned expert binding".to_string(),
             })?;
-        #[cfg(feature = "metal")]
+        #[cfg(tqf_metal)]
         {
             if let ExpertValue::Gpu(gpu_expert) = &entry.value {
                 let state = self
@@ -1114,7 +1114,7 @@ impl WholeExpertLfuCache {
         }
         match &entry.value {
             ExpertValue::Cpu(cpu) => cpu.forward(broker, input),
-            #[cfg(feature = "metal")]
+            #[cfg(tqf_metal)]
             ExpertValue::Gpu(_) => Err(crate::error::InternalError {
                 incident_id: "expert-gpu-state-missing".to_string(),
                 message: "GPU-resident expert value without GPU execution state".to_string(),

@@ -35,7 +35,7 @@ fn tokenize(text: &str) -> Vec<String> {
             continue;
         }
         tokens.push(raw.to_ascii_lowercase());
-        let subtokens = split_identifier(&raw);
+        let subtokens = split_identifier(raw);
         if subtokens.len() > 1 {
             for sub in subtokens {
                 tokens.push(sub.to_ascii_lowercase());

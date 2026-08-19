@@ -23,5 +23,12 @@ pub mod weights;
 #[cfg(test)]
 mod tests;
 
+// Module facade. `tqf` is a bin-only crate (spec §23: one crate, one
+// binary, no `[lib]` target), so rustc reachability-analyses every
+// `pub use` from `main` and reports the ones the product surface does not
+// yet consume. These re-exports are the module's real interface — keeping
+// them is deliberate; the allows go away as each is wired up.
+#[allow(unused_imports)]
 pub use gte_reranker::GteRerankerRuntime;
+#[allow(unused_imports)]
 pub use runtime::{PplxEmbedRuntime, PplxEmbedding};

@@ -1,10 +1,10 @@
 //! Backend interface: one execution-plan abstraction, platform-specific
 //! implementations underneath (spec Part VII section 48).
 
-#[cfg(feature = "metal")]
+#[cfg(tqf_metal)]
 pub mod metal;
 
-#[cfg(feature = "cuda")]
+#[cfg(tqf_cuda)]
 pub mod cuda;
 
 pub mod reference;

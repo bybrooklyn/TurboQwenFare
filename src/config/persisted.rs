@@ -17,6 +17,7 @@ pub struct PersistedConfig {
     pub context_limit_tokens: Option<u64>,
     pub enable_vision: bool,
     pub host: Option<String>,
+    pub port: Option<u16>,
     /// First-run setup reached a terminal, intentional state (installed or
     /// explicitly declined) — not just "a process happened to run once."
     pub setup_completed: bool,
@@ -82,6 +83,7 @@ mod tests {
             context_limit_tokens: Some(131072),
             enable_vision: true,
             host: None,
+            port: Some(11435),
             setup_completed: true,
         };
         cfg.save(&path).unwrap();

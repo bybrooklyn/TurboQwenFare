@@ -32,9 +32,7 @@ mod vision;
 use clap::Parser;
 
 fn main() -> std::process::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    init_tracing();
 
     let cli = cli::Cli::parse();
 
@@ -45,4 +43,23 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// `EnvFilter::from_default_env()` alone enables *nothing* when `RUST_LOG`
+/// is unset, which silently suppressed every `tracing::warn!` in the crate
+/// — including the port-fallback warning that explains why an Ollama
+/// client cannot see the server. Default to `tqf=info` so operational
+/// warnings are visible out of the box; `RUST_LOG` still overrides.
+///
+/// Logs go to stderr, not stdout. That is load-bearing rather than
+/// stylistic: the MCP server (spec §95) speaks newline-delimited JSON-RPC
+/// over stdout, and a single log line written there corrupts the
+/// transport.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("tqf=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }

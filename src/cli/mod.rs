@@ -39,6 +39,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "HOST")]
     pub host: Option<String>,
 
+    /// Bind port. Defaults to Ollama's 11434, falling back to 11435 if
+    /// that is occupied (spec Part IX section 69). An explicitly
+    /// requested port is never silently moved: if it is busy, that is an
+    /// error, because a client was told to use it.
+    #[arg(long, global = true, value_name = "PORT")]
+    pub port: Option<u16>,
+
     /// Import a local compatible Qwen3.6 Q4 checkpoint instead of the
     /// pinned canonical source.
     #[arg(long, global = true, value_name = "PATH")]
@@ -88,6 +95,7 @@ impl Cli {
                 .transpose()?,
             enable_vision: self.enable_vision,
             host: self.host.clone(),
+            port: self.port,
         })
     }
 }

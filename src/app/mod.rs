@@ -82,7 +82,7 @@ fn run_with_gui(cli: Cli, config: crate::config::Config) -> Result<()> {
 /// the backend device/queue/buffer/pipeline/timing plumbing works end to
 /// end. The full hardware autotune (persisted machine profile, multiple
 /// kernel specializations per spec §51/§77) is a later phase.
-#[cfg(feature = "metal")]
+#[cfg(tqf_metal)]
 fn run_optimize() -> Result<()> {
     println!("tqf optimize: running synthetic Metal bandwidth/GEMV harness (phase 10 baseline)...");
     let report = crate::bench::metal_synthetic::run_synthetic_bandwidth_gemv()?;
@@ -108,7 +108,7 @@ fn run_optimize() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(tqf_metal))]
 fn run_optimize() -> Result<()> {
     println!("tqf optimize: not yet implemented for this backend (phase 10 baseline is Metal-only so far)");
     Ok(())

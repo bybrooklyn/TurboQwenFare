@@ -66,6 +66,7 @@ fn test_router(
         model_installed,
         generation_slot: GenerationSlot::new(),
         generator,
+        model_receipt: None,
         started_at: Instant::now(),
         api_key: api_key.map(Arc::from),
     };

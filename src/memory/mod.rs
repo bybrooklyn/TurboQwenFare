@@ -61,7 +61,7 @@ pub struct MemorySnapshot {
 
 /// Fixed-size per-owner reservation table; `MemoryOwner` has nine
 /// variants so a small array avoids a heap map in the hot path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OwnerReserved {
     pub core: u64,
     pub gdn_state: u64,
@@ -106,23 +106,6 @@ impl OwnerReserved {
             MemoryOwner::HelperModel => &mut self.helper_model,
         };
         *slot = slot.saturating_sub(bytes);
-    }
-}
-
-impl Default for OwnerReserved {
-    fn default() -> Self {
-        Self {
-            core: 0,
-            gdn_state: 0,
-            context_hot: 0,
-            context_cold: 0,
-            expert_pinned: 0,
-            expert_probation: 0,
-            io_staging: 0,
-            scratch: 0,
-            server_reserve: 0,
-            helper_model: 0,
-        }
     }
 }
 
@@ -316,7 +299,7 @@ mod tests {
             let size = 4096u64.saturating_mul((state % 32) + 1);
             let owner = owners[(state as usize >> 3) % owners.len()];
             let class = classes[(state as usize >> 6) % classes.len()];
-            if state % 3 == 0 {
+            if state.is_multiple_of(3) {
                 held.clear();
             }
             match broker.reserve(owner, class, Bytes(size), 64) {
@@ -324,7 +307,7 @@ mod tests {
                     let snapshot = broker.snapshot();
                     assert!(snapshot.reserved.0 <= BUDGET, "step {step}");
                     assert!(snapshot.peak.0 <= BUDGET);
-                    assert_eq!(snapshot.peak.0 >= snapshot.reserved.0, true);
+                    assert!(snapshot.peak.0 >= snapshot.reserved.0);
                     // Per-owner breakdown sums to the total.
                     let by_owner = snapshot.by_owner;
                     let sum = by_owner.core

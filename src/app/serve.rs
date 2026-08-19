@@ -19,7 +19,7 @@ use crate::runtime::{GenerationSlot, Qwen36Generator, Qwen36ResidentReferenceGen
 use crate::server::{self, bind, AppState};
 use crate::setup::flow::{self, SetupOutcome};
 use crate::setup::hardware::{self, HardwareProfile};
-use crate::setup::receipt;
+use crate::setup::receipt::{self, ModelReceipt};
 use crate::source::{self, local::LocalFileSource, manifest::FetchedArtifact, ModelSource};
 
 /// Diagnostic-only escape hatch so the server skeleton can be started and
@@ -43,6 +43,23 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
     let config = effective_config(cli_config, &persisted);
     let memory_budget = Bytes(config.memory_budget_bytes.unwrap_or(4 * 1024 * 1024 * 1024));
     let setup_broker = MemoryBroker::new(memory_budget);
+
+    // The diagnostic skip has to short-circuit the *whole* setup flow, not
+    // just the later "is a model installed" branch. Running `flow::run`
+    // first would either return
+    // `NonInteractiveConfirmationRequired` (making the escape hatch
+    // useless in exactly the non-interactive contexts it exists for) or,
+    // with `--yes`, start a 20 GB download before the skip was ever
+    // consulted.
+    if std::env::var(DEV_SKIP_MODEL_CHECK_ENV).as_deref() == Ok("1") {
+        tracing::warn!(
+            "{DEV_SKIP_MODEL_CHECK_ENV}=1: starting the server with no model install \
+             flow. Every protocol endpoint is served; generation answers with an honest \
+             503. Diagnostic use only."
+        );
+        let runtime = tokio::runtime::Runtime::new()?;
+        return runtime.block_on(run_server(cli, config, false, None, None));
+    }
 
     let first_run = flow::run(cli.yes, &setup_broker)?;
     let mut hardware = first_run.hardware;
@@ -121,7 +138,13 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 "tqf: starting the developer whole-expert streaming reference server over the \
                  bounded runtime."
             );
-            return runtime.block_on(run_server(cli, config, true, Some(generator)));
+            return runtime.block_on(run_server(
+                cli,
+                config,
+                true,
+                Some(generator),
+                Some(receipt),
+            ));
         }
         if std::env::var(DEV_RESIDENT_STREAMING_ENV).as_deref() == Ok("1") {
             let receipts_dir = paths::receipts_dir()?;
@@ -144,7 +167,13 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                     Bytes(budget / 4),
                 )?);
             println!("tqf: starting the Phase 25 resident-core streaming reference server.");
-            return runtime.block_on(run_server(cli, config, true, Some(generator)));
+            return runtime.block_on(run_server(
+                cli,
+                config,
+                true,
+                Some(generator),
+                Some(receipt),
+            ));
         }
         if std::env::var(DEV_RESIDENT_REFERENCE_ENV).as_deref() == Ok("1") {
             let receipts_dir = paths::receipts_dir()?;
@@ -168,7 +197,13 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 "tqf: starting the high-memory resident reference server; this is a developer \
                  parity profile, not the normal bounded-memory runtime."
             );
-            return runtime.block_on(run_server(cli, config, true, Some(generator)));
+            return runtime.block_on(run_server(
+                cli,
+                config,
+                true,
+                Some(generator),
+                Some(receipt),
+            ));
         }
         let receipts_dir = paths::receipts_dir()?;
         let receipt =
@@ -189,19 +224,24 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 Bytes(budget / 4),
             )?);
         println!("tqf: starting bounded Qwen3.6 server.");
-        return runtime.block_on(run_server(cli, config, true, Some(generator)));
+        return runtime.block_on(run_server(
+            cli,
+            config,
+            true,
+            Some(generator),
+            Some(receipt),
+        ));
     }
-    if std::env::var(DEV_SKIP_MODEL_CHECK_ENV).as_deref() != Ok("1") {
-        return Ok(());
-    }
-    if !model_installed {
-        tracing::warn!(
-            "{DEV_SKIP_MODEL_CHECK_ENV}=1: starting the server skeleton with no model \
-             installed. Diagnostic use only."
-        );
-    }
-
-    runtime.block_on(run_server(cli, config, model_installed, None))
+    // Reaching here means setup ran but produced no installed model, and
+    // the diagnostic skip above was not set. Say what to do next rather
+    // than exiting silently, which reads as a crash.
+    println!(
+        "tqf: no model is installed, so there is nothing to serve.\n     \
+         Run `tqf` in a terminal to install the pinned checkpoint, `tqf --yes` to accept \
+         non-interactively,\n     or `tqf --model ./your-qwen36-q4.gguf` to import one you \
+         already have."
+    );
+    Ok(())
 }
 
 /// Drives source verification and canonical GGUF conversion through the
@@ -307,6 +347,9 @@ fn apply_cli_overrides(persisted: &mut PersistedConfig, cli_config: &Config) {
     if let Some(host) = &cli_config.host {
         persisted.host = Some(host.clone());
     }
+    if let Some(port) = cli_config.port {
+        persisted.port = Some(port);
+    }
 }
 
 /// CLI flags win when present; otherwise fall back to what a previous run
@@ -321,6 +364,7 @@ fn effective_config(cli_config: Config, persisted: &PersistedConfig) -> Config {
             .or(persisted.context_limit_tokens),
         enable_vision: cli_config.enable_vision || persisted.enable_vision,
         host: cli_config.host.or_else(|| persisted.host.clone()),
+        port: cli_config.port.or(persisted.port),
     }
 }
 
@@ -329,8 +373,9 @@ async fn run_server(
     config: Config,
     model_installed: bool,
     generator: Option<Arc<dyn Qwen36Generator>>,
+    receipt: Option<ModelReceipt>,
 ) -> Result<()> {
-    let bound = bind::resolve_and_bind(config.host.as_deref(), cli.insecure).await?;
+    let bound = bind::resolve_and_bind(config.host.as_deref(), config.port, cli.insecure).await?;
     tracing::info!(addr = %bound.addr, "tqf listening");
     println!("tqf listening on http://{}", bound.addr);
 
@@ -339,6 +384,10 @@ async fn run_server(
         model_installed,
         generation_slot: GenerationSlot::new(),
         generator,
+        // The Ollama and OpenAI inventory endpoints describe the installed
+        // model from its real trusted receipt (size, digest, source
+        // revision) rather than inventing plausible-looking values.
+        model_receipt: receipt.map(Arc::new),
         started_at: Instant::now(),
         api_key: bound.api_key.map(|k| Arc::from(k.as_str())),
     };

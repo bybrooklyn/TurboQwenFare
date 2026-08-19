@@ -36,6 +36,11 @@ pub struct AppState {
     /// `None` until a trusted converted Qwen3.6 model has loaded. The
     /// protocol layer never fabricates output when this is absent.
     pub generator: Option<Arc<dyn Qwen36Generator>>,
+    /// The validated receipt for the installed model, when there is one.
+    /// Inventory endpoints (`/api/tags`, `/api/show`, `/v1/models`) report
+    /// size, digest, and source revision from this rather than
+    /// synthesizing values that merely look right.
+    pub model_receipt: Option<Arc<crate::setup::receipt::ModelReceipt>>,
     pub started_at: Instant,
     /// `Some` only for non-loopback binds without `--insecure` (spec Part
     /// IX section 74); enforced by the `auth` middleware on the protected

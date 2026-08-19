@@ -669,7 +669,7 @@ fn matvec_payload(
     let mut values = vec![0.0; rows];
     let block_elements = dtype.block_size() as usize;
     let block_bytes = dtype.block_bytes() as usize;
-    if cols % block_elements != 0 {
+    if !cols.is_multiple_of(block_elements) {
         return Err(ModelError::Shape {
             tensor: "Qwen matvec columns per quant block",
             expected: block_elements,
@@ -2150,7 +2150,7 @@ mod tests {
     /// the Phase 20 A/B record (isolated microbenchmark first; decode-loop
     /// A/B decides the default, spec §1005).
     #[test]
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     #[ignore = "requires the canonical .tqf checkpoint; Phase 20 real-weight GPU parity and kernel A/B"]
     fn gpu_resident_expert_matches_cpu_forward_on_canonical_weights() {
         use crate::backend::metal::expert::{GpuExecutionState, GpuKernelKind, GpuResidentExpert};
@@ -2228,7 +2228,7 @@ mod tests {
     /// interleaved wall-time comparison (spec §1005: microbenchmark first,
     /// live-loop wiring later).
     #[test]
-    #[cfg(feature = "metal")]
+    #[cfg(tqf_metal)]
     #[ignore = "requires the canonical .tqf checkpoint; Phase 20 GDN fusion real-weight A/B"]
     fn gdn_fused_projection_matches_cpu_on_canonical_weights() {
         use crate::backend::metal::context::MetalContext;
@@ -2503,7 +2503,7 @@ mod tests {
         block[..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // f16 1.0 scale
         block[2..].fill(0xff); // each quantized value is 15 - 8 = 7
         let tensor = loaded_tensor(&broker, GgmlType::Q4_0, vec![32, 1], block);
-        let output = tensor.matvec(&broker, &vec![1.0; 32]).unwrap();
+        let output = tensor.matvec(&broker, &[1.0; 32]).unwrap();
         assert_eq!(output.values, vec![224.0]);
     }
 
@@ -2518,20 +2518,14 @@ mod tests {
         bytes.extend_from_slice(&expert_one);
         let tensor = loaded_tensor(&broker, GgmlType::Q4_0, vec![32, 1, 2], bytes);
         assert_eq!(
-            tensor
-                .matvec_expert(&broker, 0, &vec![1.0; 32])
-                .unwrap()
-                .values,
+            tensor.matvec_expert(&broker, 0, &[1.0; 32]).unwrap().values,
             vec![224.0]
         );
         assert_eq!(
-            tensor
-                .matvec_expert(&broker, 1, &vec![1.0; 32])
-                .unwrap()
-                .values,
+            tensor.matvec_expert(&broker, 1, &[1.0; 32]).unwrap().values,
             vec![0.0]
         );
-        assert!(tensor.matvec_expert(&broker, 2, &vec![1.0; 32]).is_err());
+        assert!(tensor.matvec_expert(&broker, 2, &[1.0; 32]).is_err());
     }
 
     #[test]

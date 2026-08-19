@@ -62,8 +62,8 @@ impl MtpStatistics {
     }
 
     /// >1.0 means MTP is emitting more tokens per target backbone pass than
-    /// the 1-token-per-pass non-speculative baseline — the direct "net
-    /// accepted tok/s" proxy spec §172 asks the controller to track.
+    /// > the 1-token-per-pass non-speculative baseline — the direct "net
+    /// > accepted tok/s" proxy spec §172 asks the controller to track.
     pub fn emitted_tokens_per_target_pass(&self) -> f64 {
         if self.target_backbone_passes == 0 {
             0.0
