@@ -86,6 +86,7 @@ Ollama unless you point them at the new address.
 just              list every task
 just ci           format, lint, and test — what CI runs
 just smoke-ollama check a running server end to end
+just verify-real  the full acceptance, against the real checkpoint
 ```
 
 ---
@@ -205,9 +206,23 @@ Recipe groups mirror the spec's own CI lane design (§262).
 | Recipe | Lane | Needs |
 |---|---|---|
 | `just ci` | A | nothing — no GPU, no model, no network |
+| `just conformance` | A | nothing — protocol fixtures only |
 | `just build-gui` | B | macOS + Swift toolchain |
 | `just qual-*` | D | the real pinned checkpoint |
+| `just verify-real` | D | the checkpoint; runs the whole acceptance as one command |
 | `just qual-all` | E | everything |
+
+`just conformance` runs the §260 fixtures alone. They are written from the
+specification and never from the implementation (§331): a test derived from current
+behavior cannot fail, which is how a passing test asserting `temperature: 0.7`
+returns 400 came to encode a limitation as the requirement.
+
+`just verify-real` is the only way to check the three things `just ci` structurally
+cannot: greedy parity against the pinned oracle, and both smoke suites against real
+generation instead of an honest `503`. It preflights and names exactly which
+artifacts are missing. It does not cover §289's exit gate — an unmodified
+third-party client completing a conversation — and says so, because no script can
+assert that.
 
 `just test` runs single-threaded: a few tests mutate process-global environment
 variables, which is unsound under the default parallel harness.
