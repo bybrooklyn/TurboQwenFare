@@ -12,6 +12,7 @@
 pub mod convert;
 pub mod forward;
 pub mod geometry;
+pub mod gte_reranker;
 pub mod pooling;
 pub mod quantize;
 pub mod roles;
@@ -22,4 +23,5 @@ pub mod weights;
 #[cfg(test)]
 mod tests;
 
+pub use gte_reranker::GteRerankerRuntime;
 pub use runtime::{PplxEmbedRuntime, PplxEmbedding};

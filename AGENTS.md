@@ -351,6 +351,28 @@ Phases 27-28 land the first long-context (TQKV) work:
   `watch()`) that silently dropped every real watcher event until a
   standalone probe diagnosed it and the real-OS smoke test caught it.
   `docs/research/qualification/phase-42-live-sync.md`.
+- **Phase 43 (GTE reranker):** `helper_model::gte_reranker` — a
+  from-scratch `Alibaba-NLP/gte-reranker-modernbert-base` cross-encoder
+  (ModernBERT: LayerNorm not RMSNorm, fused-QKV full MHA, alternating
+  global/local sliding-window attention with per-layer RoPE theta,
+  layer 0's `attn_norm` is real `Identity`, GeGLU MLP, masked-mean pool
+  + dense/GELU/LayerNorm/Linear head), every architectural fact
+  cross-checked against real `transformers` source and the real
+  checkpoint's safetensors header before implementation. Validated
+  against the checkpoint's own ONNX export via a second oracle
+  technique (ONNX graph-surgery to expose intermediate layer outputs,
+  not just the final logit) — all real pairs match to ~1e-6. Found and
+  fixed a real bug along the way: the checkpoint's own tokenizer.json
+  bakes in `Fixed(8000)` padding applied by both Python's and Rust's
+  tokenizer libraries on every encode call, so a real 36-token pair
+  silently became 8000 tokens with unmasked mean-pooling diluting the
+  signal — explained both the wrong logit and a ~16-minute runtime for
+  3 pairs; fixed by trimming trailing PAD tokens, dropping runtime to
+  7.5s. Not implemented: spec §196's ambiguity heuristic (needs Phase
+  40's hybrid fusion output to threshold against) and the "downstream
+  answer quality/TTFT, not reranker benchmark alone" measurement (needs
+  a live end-to-end RAG pipeline this phase's scope doesn't reach).
+  `docs/research/qualification/phase-43-gte-reranker.md`.
 
 ## Commands
 
