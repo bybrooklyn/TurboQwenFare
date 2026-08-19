@@ -96,11 +96,16 @@ fn walk(
         };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // `.git` is never indexable content (VCS internals, not a
-        // repository's actual files) — skipped unconditionally, the same
-        // way every real code-search tool treats it, rather than relying
-        // on the target repo's own `.gitignore` to say so.
-        if name == ".git" {
+        // Neither `.git` nor `.tqf` is indexable content — VCS internals
+        // and TQF's own index directory, not the repository's files.
+        // Skipped unconditionally, the same way every real code-search
+        // tool treats `.git`, rather than relying on the target repo's own
+        // `.gitignore` to say so.
+        //
+        // `.tqf` matters for a second reason: the index lives there, so
+        // without this a sync reads its own multi-megabyte output back on
+        // every subsequent run and counts it as a scanned file.
+        if name == ".git" || name == ".tqf" {
             continue;
         }
 
@@ -283,6 +288,29 @@ mod tests {
             .unwrap();
         assert_eq!(rust_file.classification.language, Some("Rust"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The index lives in `<root>/.tqf/`, so a scan that walked into it
+    /// would read its own output back on every subsequent run — and
+    /// report a file count that does not correspond to any source file.
+    /// Caught by running a real `tqf sync` twice and noticing it scanned
+    /// four files in a three-file tree.
+    #[test]
+    fn the_index_directory_is_never_scanned() {
+        let root = temp_dir("skips-tqf-dir");
+        write_file(&root.join("src/main.rs"), b"pub fn main() {}\n");
+        write_file(&root.join(".tqf/index.tqi"), b"TQFINDEX\x00\x00binary");
+        write_file(&root.join(".git/config"), b"[core]\n");
+
+        let report = scan_root(&root).unwrap();
+        let paths: Vec<&str> = report
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+
+        assert_eq!(paths, vec!["src/main.rs"], "scanned: {paths:?}");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -11,4 +11,5 @@ pub mod ignore;
 pub mod lexical;
 pub mod scan;
 pub mod sync;
+pub mod tqi;
 pub mod tqvec;

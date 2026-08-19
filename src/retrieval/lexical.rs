@@ -91,6 +91,20 @@ fn split_identifier(raw: &str) -> Vec<String> {
     parts
 }
 
+/// The persistable form of a lexical index (spec §185): postings sorted
+/// by chunk id, the exact identifier lane, per-chunk token counts for
+/// BM25 length normalization, and the chunk paths those counts belong to.
+///
+/// Named rather than returned as a bare 4-tuple so `export` and
+/// `from_parts` describe the same thing and callers destructure against a
+/// documented order.
+pub type PersistedLexical = (
+    std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+    std::collections::BTreeMap<String, Vec<u32>>,
+    Vec<u32>,
+    Vec<String>,
+);
+
 pub struct LexicalIndex {
     postings: HashMap<String, Vec<(u32, u32)>>, // term -> [(chunk_id, term_frequency)]
     chunks: Vec<ChunkEntry>,
@@ -149,6 +163,72 @@ impl LexicalIndex {
             chunks,
             avg_doc_len,
             exact,
+        }
+    }
+
+    /// The index in the form `.tqi` persists (spec §185): postings
+    /// sorted by chunk id, the exact identifier lane, and per-chunk token
+    /// counts, which BM25 needs for length normalization.
+    ///
+    /// Returned rather than serialized here so `retrieval::tqi` owns the
+    /// on-disk layout and this module stays about scoring.
+    pub fn export(&self) -> PersistedLexical {
+        let mut postings: std::collections::BTreeMap<String, Vec<(u32, u32)>> =
+            std::collections::BTreeMap::new();
+        for (term, list) in &self.postings {
+            let mut list = list.clone();
+            // Spec §185: postings are sorted by chunk id. The in-memory
+            // build appends in document order, which is the same thing
+            // today, but persisting relies on it so it is made explicit.
+            list.sort_unstable_by_key(|(chunk, _)| *chunk);
+            postings.insert(term.clone(), list);
+        }
+
+        let mut exact: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for (identifier, list) in &self.exact {
+            let mut list = list.clone();
+            list.sort_unstable();
+            exact.insert(identifier.clone(), list);
+        }
+
+        (
+            postings,
+            exact,
+            self.chunks.iter().map(|c| c.token_count).collect(),
+            self.chunks.iter().map(|c| c.path.clone()).collect(),
+        )
+    }
+
+    /// Rebuilds a searchable index from persisted parts, without
+    /// re-reading or re-tokenizing any source file — which is the whole
+    /// point of persisting it.
+    pub fn from_parts(
+        postings: std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+        exact: std::collections::BTreeMap<String, Vec<u32>>,
+        chunk_lengths: &[u32],
+        paths: &[String],
+    ) -> Self {
+        let chunks: Vec<ChunkEntry> = paths
+            .iter()
+            .zip(chunk_lengths.iter())
+            .map(|(path, token_count)| ChunkEntry {
+                path: path.clone(),
+                token_count: *token_count,
+            })
+            .collect();
+        let total: u64 = chunks.iter().map(|c| c.token_count as u64).sum();
+        let avg_doc_len = if chunks.is_empty() {
+            0.0
+        } else {
+            total as f32 / chunks.len() as f32
+        };
+
+        Self {
+            postings: postings.into_iter().collect(),
+            chunks,
+            avg_doc_len,
+            exact: exact.into_iter().collect(),
         }
     }
 
@@ -355,5 +435,97 @@ mod tests {
             bm25_hits.first(),
             ignore_hits.first(),
         );
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    fn corpus() -> Vec<(String, String)> {
+        vec![
+            (
+                "src/memory/mod.rs".to_string(),
+                "pub struct MemoryBroker { budget: u64 } impl MemoryBroker { pub fn reserve() {} }"
+                    .to_string(),
+            ),
+            (
+                "src/experts/mod.rs".to_string(),
+                "pub struct WholeExpertLfuCache { capacity: usize } fn evict_least_frequent() {}"
+                    .to_string(),
+            ),
+            (
+                "README.md".to_string(),
+                "TurboQwenFare streams experts from SSD through a memory broker.".to_string(),
+            ),
+        ]
+    }
+
+    /// Persisting is only worth anything if what comes back searches the
+    /// same. Compares ranked results, not internal structure.
+    #[test]
+    fn an_exported_index_rebuilds_into_one_that_searches_identically() {
+        let original = LexicalIndex::build(&corpus());
+        let (postings, exact, lengths, paths) = original.export();
+        let rebuilt = LexicalIndex::from_parts(postings, exact, &lengths, &paths);
+
+        assert_eq!(rebuilt.document_count(), original.document_count());
+        assert_eq!(rebuilt.term_count(), original.term_count());
+
+        for query in [
+            "memory broker",
+            "expert cache eviction",
+            "streams experts from ssd",
+            "capacity",
+        ] {
+            let before = original.search(query, 5);
+            let after = rebuilt.search(query, 5);
+            assert_eq!(
+                before.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                after.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                "ranking changed for {query:?}"
+            );
+            for ((_, a), (_, b)) in before.iter().zip(after.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "score changed for {query:?}: {a} vs {b}"
+                );
+            }
+        }
+
+        // The exact lane must survive too — it is case-preserved and
+        // bypasses BM25 entirely.
+        assert_eq!(
+            rebuilt.exact_lookup("MemoryBroker"),
+            original.exact_lookup("MemoryBroker")
+        );
+    }
+
+    /// Spec §185: postings are sorted by chunk id. The persisted form
+    /// relies on it, so the export makes it explicit rather than assuming
+    /// build order.
+    #[test]
+    fn exported_postings_are_sorted_by_chunk_id() {
+        let (postings, exact, _, _) = LexicalIndex::build(&corpus()).export();
+        for (term, list) in &postings {
+            let ids: Vec<u32> = list.iter().map(|(chunk, _)| *chunk).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            assert_eq!(ids, sorted, "postings for {term:?} are not sorted");
+        }
+        for (identifier, list) in &exact {
+            let mut sorted = list.clone();
+            sorted.sort_unstable();
+            assert_eq!(*list, sorted, "exact list for {identifier:?} is not sorted");
+        }
+    }
+
+    #[test]
+    fn an_empty_index_exports_and_rebuilds() {
+        let original = LexicalIndex::build(&[]);
+        let (postings, exact, lengths, paths) = original.export();
+        let rebuilt = LexicalIndex::from_parts(postings, exact, &lengths, &paths);
+        assert_eq!(rebuilt.document_count(), 0);
+        assert!(rebuilt.search("anything", 5).is_empty());
     }
 }

@@ -285,6 +285,38 @@ pub enum ContextError {
 pub enum RetrievalError {
     #[error("retrieval error: {0}")]
     Failed(String),
+
+    // `.tqi` container faults (spec §174-§177). Distinct from
+    // `ContainerError`, whose messages all name `.tqf`: reporting "not a
+    // .tqf container" for an index file would send a reader looking at
+    // the wrong format entirely.
+    #[error("not a .tqi index: bad magic")]
+    IndexBadMagic,
+    #[error("unsupported .tqi format major version {0}")]
+    IndexUnsupportedMajorVersion(u16),
+    #[error("malformed .tqi {what}: expected at least {expected} bytes, found {actual}")]
+    IndexTruncated {
+        what: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("malformed .tqi {0}")]
+    IndexMalformed(&'static str),
+    #[error("integer overflow validating .tqi table bounds")]
+    IndexIntegerOverflow,
+    #[error(".tqi {name} range [{offset}, {offset}+{len}) exceeds file length {file_len}")]
+    IndexOutOfBounds {
+        name: &'static str,
+        offset: u64,
+        len: u64,
+        file_len: u64,
+    },
+    #[error(".tqi {segment} checksum mismatch: expected {expected}, computed {computed}")]
+    IndexChecksumMismatch {
+        segment: &'static str,
+        expected: String,
+        computed: String,
+    },
 }
 
 #[derive(Debug, Error)]
