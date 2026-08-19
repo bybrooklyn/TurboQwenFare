@@ -118,6 +118,12 @@ struct ChatCompletionsRequest {
     presence_penalty: Option<f32>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 fn default_object_schema() -> Value {
@@ -257,57 +263,129 @@ fn validate_model(model: Option<&str>) -> std::result::Result<(), String> {
     }
 }
 
-fn apply_sampling(
-    normalized: &mut NormalizedRequest,
+/// Every sampling knob the request carries, so `apply_sampling` reads as
+/// one mapping rather than a growing positional argument list.
+#[derive(Default)]
+struct RequestedSampling {
     temperature: Option<f32>,
     top_p: Option<f32>,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    seed: Option<u64>,
     maximum: Option<u32>,
+    stop: Option<Value>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+}
+
+/// Maps OpenAI's parameter spelling onto the one internal
+/// `SamplingParams` (spec §153). These used to be rejected wholesale
+/// because no sampler existed; now that `crate::sampling` implements them,
+/// rejecting values real clients send by default would be the lie.
+///
+/// Absent temperature stays `0.0` (greedy), matching the internal default
+/// — a client that says nothing about sampling gets deterministic output.
+fn apply_sampling(
+    normalized: &mut NormalizedRequest,
+    requested: RequestedSampling,
 ) -> std::result::Result<(), String> {
-    if let Some(temperature) = temperature {
-        if !temperature.is_finite() || temperature != 0.0 {
-            return Err(
-                "this correctness runtime currently supports only temperature=0".to_string(),
-            );
-        }
-        normalized.sampling.temperature = temperature;
-    } else {
-        normalized.sampling.temperature = 0.0;
-    }
+    let RequestedSampling {
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        seed,
+        maximum,
+        stop,
+        frequency_penalty,
+        presence_penalty,
+    } = requested;
+
+    normalized.sampling.temperature = match temperature {
+        None => 0.0,
+        Some(value) => range("temperature", value, 0.0, 2.0)?,
+    };
     if let Some(top_p) = top_p {
-        if !top_p.is_finite() || top_p != 1.0 {
-            return Err("this correctness runtime currently supports only top_p=1".to_string());
-        }
-        normalized.sampling.top_p = top_p;
+        normalized.sampling.top_p = range("top_p", top_p, 0.0, 1.0)?;
+    }
+    if let Some(top_k) = top_k {
+        normalized.sampling.top_k = (top_k > 0).then_some(top_k);
+    }
+    if let Some(min_p) = min_p {
+        normalized.sampling.min_p = Some(range("min_p", min_p, 0.0, 1.0)?);
+    }
+    normalized.sampling.seed = seed;
+    if let Some(value) = frequency_penalty {
+        normalized.sampling.frequency_penalty = range("frequency_penalty", value, -2.0, 2.0)?;
+    }
+    if let Some(value) = presence_penalty {
+        normalized.sampling.presence_penalty = range("presence_penalty", value, -2.0, 2.0)?;
     }
     if let Some(maximum) = maximum {
-        if maximum > 256 {
-            return Err("max output tokens must be at most 256 in this build".to_string());
+        if maximum == 0 {
+            return Err("max output tokens must be at least 1".to_string());
         }
         normalized.sampling.max_output_tokens = Some(maximum);
     }
+    normalized.sampling.stop_sequences = parse_stop_sequences(stop)?;
     Ok(())
 }
 
+fn range(name: &str, value: f32, low: f32, high: f32) -> std::result::Result<f32, String> {
+    if !value.is_finite() || value < low || value > high {
+        return Err(format!(
+            "{name} must be a finite value between {low} and {high}"
+        ));
+    }
+    Ok(value)
+}
+
+/// OpenAI accepts `stop` as either a single string or an array of up to
+/// four. Empty strings are dropped rather than accepted: a zero-length
+/// stop sequence matches immediately and would end every generation at
+/// the first token.
+fn parse_stop_sequences(stop: Option<Value>) -> std::result::Result<Vec<String>, String> {
+    const MAX_STOP_SEQUENCES: usize = 4;
+    let Some(stop) = stop else {
+        return Ok(Vec::new());
+    };
+    let sequences = match stop {
+        Value::Null => Vec::new(),
+        Value::String(one) => vec![one],
+        Value::Array(many) => many
+            .into_iter()
+            .map(|entry| match entry {
+                Value::String(text) => Ok(text),
+                _ => Err("stop entries must be strings".to_string()),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        _ => return Err("stop must be a string or an array of strings".to_string()),
+    };
+    if sequences.len() > MAX_STOP_SEQUENCES {
+        return Err(format!(
+            "at most {MAX_STOP_SEQUENCES} stop sequences are supported"
+        ));
+    }
+    Ok(sequences.into_iter().filter(|s| !s.is_empty()).collect())
+}
+
+/// What this build still cannot honor. Both rejections are real
+/// limitations rather than unimplemented plumbing, and spec §204 requires
+/// rejecting rather than silently ignoring them.
 fn validate_unsupported_options(
     n: Option<u32>,
-    stop: Option<&Value>,
     logprobs: Option<bool>,
-    frequency_penalty: Option<f32>,
-    presence_penalty: Option<f32>,
 ) -> std::result::Result<(), String> {
     if n.unwrap_or(1) != 1 {
-        return Err("n must be 1".to_string());
-    }
-    if stop.is_some_and(|value| !value.is_null()) {
-        return Err("stop sequences are not implemented in this build".to_string());
+        // v1 runs one active generation and queues the rest (spec §75), so
+        // there is no second sequence to return.
+        return Err("n must be 1: this build serves one generation per request".to_string());
     }
     if logprobs.unwrap_or(false) {
+        // The decoder keeps only its top-4 pre-softmax candidates for
+        // diagnostics; reporting those as logprobs would be wrong, not
+        // merely partial.
         return Err("logprobs are not implemented in this build".to_string());
-    }
-    if frequency_penalty.unwrap_or(0.0) != 0.0 || presence_penalty.unwrap_or(0.0) != 0.0 {
-        return Err(
-            "frequency and presence penalties are not implemented in this build".to_string(),
-        );
     }
     Ok(())
 }
@@ -337,13 +415,7 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return invalid_request("messages must contain at least one item".to_string());
     }
-    if let Err(message) = validate_unsupported_options(
-        req.n,
-        req.stop.as_ref(),
-        req.logprobs,
-        req.frequency_penalty,
-        req.presence_penalty,
-    ) {
+    if let Err(message) = validate_unsupported_options(req.n, req.logprobs) {
         return invalid_request(message);
     }
     let messages = match req
@@ -378,8 +450,18 @@ async fn chat_completions(
     let mut normalized =
         NormalizedRequest::new(ProtocolFlavor::OpenAiChatCompletions, messages, req.stream);
     normalized.tools = tools;
-    let maximum = req.max_completion_tokens.or(req.max_tokens);
-    if let Err(message) = apply_sampling(&mut normalized, req.temperature, req.top_p, maximum) {
+    let requested = RequestedSampling {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        min_p: req.min_p,
+        seed: req.seed,
+        maximum: req.max_completion_tokens.or(req.max_tokens),
+        stop: req.stop,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+    };
+    if let Err(message) = apply_sampling(&mut normalized, requested) {
         return invalid_request(message);
     }
     if normalized.stream {
@@ -513,7 +595,14 @@ async fn responses(State(state): State<AppState>, Json(req): Json<Value>) -> Res
         },
         None => None,
     };
-    if let Err(message) = apply_sampling(&mut normalized, temperature, top_p, maximum) {
+    let requested = RequestedSampling {
+        temperature,
+        top_p,
+        maximum,
+        stop: req.get("stop").cloned(),
+        ..RequestedSampling::default()
+    };
+    if let Err(message) = apply_sampling(&mut normalized, requested) {
         return invalid_request(message);
     }
     if normalized.stream {

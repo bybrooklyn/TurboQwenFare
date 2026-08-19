@@ -16,6 +16,7 @@ use crate::ids::Bytes;
 use crate::memory::MemoryBroker;
 use crate::model::qwen36::runtime::{Qwen36BoundedReferenceRuntime, Qwen36ReferenceRuntime};
 use crate::runtime::{NormalizedRequest, Role};
+use crate::sampling::Sampler;
 use crate::tokenizer::chat::{self, ChatMessage, ChatRole, ToolSpec};
 use crate::tokenizer::chat::{THINK_END, THINK_START, TOOL_CALL_END, TOOL_CALL_START};
 use crate::tokenizer::TqfTokenizer;
@@ -226,10 +227,15 @@ enum QwenRuntimeInstance {
 }
 
 impl QwenRuntimeInstance {
-    fn decode_greedy(&mut self, token: u32) -> Result<crate::runtime::DecodeToken> {
+    fn decode_step(
+        &mut self,
+        token: u32,
+        sampler: &mut Sampler,
+        history: &[u32],
+    ) -> Result<crate::runtime::DecodeToken> {
         match self {
-            Self::Resident(runtime) => runtime.decode_greedy(token),
-            Self::Bounded(runtime) => runtime.decode_greedy(token),
+            Self::Resident(runtime) => runtime.decode_step(token, sampler, history),
+            Self::Bounded(runtime) => runtime.decode_step(token, sampler, history),
         }
     }
 
@@ -264,6 +270,11 @@ impl QwenRuntimeInstance {
         }
     }
 }
+
+/// Output cap when a request names none. Not a hard ceiling — a request
+/// may ask for as much as the context window allows — just a bound that
+/// keeps an unbounded client from decoding until the context is full.
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 512;
 
 const DEV_DECODE_DIAGNOSTICS_ENV: &str = "TQF_DEV_DECODE_DIAGNOSTICS";
 
@@ -452,10 +463,21 @@ impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
         if prompt.is_empty() {
             return Err(ProtocolError::Invalid("empty tokenized prompt".to_string()).into());
         }
-        let maximum = request.sampling.max_output_tokens.unwrap_or(256).min(256) as usize;
-        if prompt.len().saturating_add(maximum) > self.max_context {
+        // The real bound is the context window, not an arbitrary constant.
+        // A `.min(256)` here would silently truncate any longer request
+        // now that the HTTP layer no longer rejects one — turning a clear
+        // 400 into a mysteriously short answer.
+        let headroom = self.max_context.saturating_sub(prompt.len());
+        let maximum = request
+            .sampling
+            .max_output_tokens
+            .map(|requested| requested as usize)
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+            .min(headroom);
+        if prompt.len() >= self.max_context {
             return Err(ProtocolError::Invalid(format!(
-                "tokenized prompt ({}) plus requested output ({maximum}) exceeds context limit {}",
+                "tokenized prompt ({} tokens) leaves no room for output within the context \
+                 limit of {}",
                 prompt.len(),
                 self.max_context
             ))
@@ -469,6 +491,7 @@ impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
             .lock()
             .expect("tokenizer mutex poisoned")
             .eos_token_id;
+        let mut sampler = Sampler::new(&request.sampling);
         let runtime = Arc::clone(&self.runtime);
         let cancellation_for_decode = cancellation.clone();
         let (generated, reached_eos) =
@@ -517,7 +540,9 @@ impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
                     }
                     let input = next;
                     let cache_before = runtime.expert_cache_stats();
-                    let decoded = runtime.decode_greedy(input)?;
+                    // `output` is this request's generated history, which is
+                    // what the repetition penalties score against.
+                    let decoded = runtime.decode_step(input, &mut sampler, &output)?;
                     let cache_after = runtime.expert_cache_stats();
                     emit_decode_diagnostics(input, &decoded, cache_before, cache_after);
                     next = decoded.token;

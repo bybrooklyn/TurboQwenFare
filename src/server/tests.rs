@@ -398,20 +398,75 @@ async fn responses_normalize_their_flat_function_tool_shape() {
     assert!(response.contains("list_files"));
 }
 
+/// These are the parameters real OpenAI and Ollama clients send by
+/// default. Every one of them used to 400, because no sampler existed;
+/// rejecting them now that `crate::sampling` implements them would be the
+/// lie.
 #[tokio::test]
-async fn chat_rejects_fields_the_greedy_correctness_runtime_cannot_honor() {
+async fn chat_accepts_the_sampling_parameters_real_clients_send() {
     let addr = spawn_test_server_with(true, Some(Arc::new(FixtureGenerator))).await;
     for body in [
         r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0.7}"#,
-        r#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":257}"#,
-        r#"{"messages":[{"role":"alien","content":"hi"}]}"#,
-        r#"{"messages":[{"role":"user","content":"hi"},{"role":"system","content":"late"}]}"#,
-        r#"{"model":"not-the-installed-model","messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0.8,"top_p":0.9}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"top_k":40,"min_p":0.05}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"seed":42}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":2048}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"stop":["\n\n"]}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"stop":"END"}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":0.5,"presence_penalty":0.5}"#,
+    ] {
+        let response = http_request(addr, &post_json("/v1/chat/completions", body)).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "should have been accepted: {body}\n{response}"
+        );
+    }
+}
+
+/// What still gets rejected, and why each rejection is a real limit
+/// rather than unimplemented plumbing (spec §204: reject rather than
+/// silently ignore).
+#[tokio::test]
+async fn chat_rejects_what_this_build_genuinely_cannot_honor() {
+    let addr = spawn_test_server_with(true, Some(Arc::new(FixtureGenerator))).await;
+    for (body, why) in [
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"n":2}"#,
+            "one generation slot serves one sequence (spec §75)",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"logprobs":true}"#,
+            "the decoder keeps only top-4 pre-softmax candidates",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"temperature":5.0}"#,
+            "temperature is out of the accepted range",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"top_p":1.5}"#,
+            "top_p is out of the accepted range",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":0}"#,
+            "a zero-token budget cannot produce output",
+        ),
+        (
+            r#"{"messages":[{"role":"alien","content":"hi"}]}"#,
+            "unknown role",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"},{"role":"system","content":"late"}]}"#,
+            "system messages must lead",
+        ),
+        (
+            r#"{"model":"not-the-installed-model","messages":[{"role":"user","content":"hi"}]}"#,
+            "only the canonical model is served",
+        ),
     ] {
         let response = http_request(addr, &post_json("/v1/chat/completions", body)).await;
         assert!(
             response.starts_with("HTTP/1.1 400"),
-            "expected a structured compatibility error: {response}"
+            "expected a structured compatibility error ({why}): {response}"
         );
     }
 }

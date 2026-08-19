@@ -39,18 +39,51 @@ pub struct ToolDefinition {
     pub parameters_json_schema: String,
 }
 
+/// The one internal sampling representation (spec §153). Every protocol
+/// adapter normalizes its own parameter names into this before the model
+/// loop sees them, so no protocol-specific spelling reaches the decoder.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
+    /// `0.0` means greedy, and is the default. That is deliberate: with a
+    /// non-greedy default, an adapter that forgot to set sampling would
+    /// silently start sampling, which would quietly invalidate every
+    /// greedy-parity qualification record. See `crate::sampling`.
     pub temperature: f32,
     pub top_p: f32,
+    /// Keep only the `k` highest-logit candidates. `None` disables.
+    pub top_k: Option<u32>,
+    /// Relative probability floor, as a fraction of the most likely
+    /// candidate. `None` disables.
+    pub min_p: Option<f32>,
+    /// Explicit RNG seed for reproducible stochastic sampling.
+    pub seed: Option<u64>,
+    /// llama.cpp/Ollama-style repetition penalty; `1.0` disables.
+    pub repeat_penalty: f32,
+    /// How many recent tokens the repetition penalties consider.
+    pub repeat_last_n: usize,
+    /// OpenAI-style penalties; `0.0` disables.
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
+    /// Sequences that end generation when produced. Matched against
+    /// decoded text, not token ids, because a stop string need not align
+    /// to token boundaries (spec §205).
+    pub stop_sequences: Vec<String>,
     pub max_output_tokens: Option<u32>,
 }
 
 impl Default for SamplingParams {
     fn default() -> Self {
         Self {
-            temperature: 1.0,
+            temperature: 0.0,
             top_p: 1.0,
+            top_k: None,
+            min_p: None,
+            seed: None,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            stop_sequences: Vec::new(),
             max_output_tokens: None,
         }
     }
