@@ -1,0 +1,139 @@
+TurboQwenFare (tqf)
+Copyright the TurboQwenFare project contributors.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE in this
+directory). This file lists third-party notices per spec §266
+("NOTICE/third-party notices accessible alongside release").
+
+================================================================
+Directly adapted source (Apache-2.0, attribution required, §96)
+================================================================
+
+`swift/Sources/TqfGUI/Rendering/ResponseMarkdownRenderer.swift`,
+`swift/Sources/TqfGUI/Theme/NVMAIMacTheme.swift`, and
+`swift/Sources/TqfGUI/Components/HUDMetricView.swift`, and
+`swift/Sources/TqfGUI/Diagnostics/MetricFormat.swift` are copied, with
+no functional changes, from the NVMAI project's SwiftUI sources,
+licensed under the Apache License 2.0. The full NVMAI license text is
+reproduced at `swift/NVMAI-LICENSE.txt`; see `swift/NOTICE.md` for the
+complete file-by-file attribution. All other files in this repository
+are original TurboQwenFare source and are not derived from NVMAI or
+any other upstream project.
+
+================================================================
+Third-party Rust dependencies
+================================================================
+
+This list was generated with `cargo license --avoid-dev-deps
+--avoid-build-deps` against the real `Cargo.lock` for this crate
+(277 direct and transitive runtime dependencies, snapshotted
+2026-08-19) — not hand-curated, so it reflects exactly what is
+compiled into a release binary. All licenses below are permissive
+(Apache-2.0, MIT, BSD, ISC, CC0-1.0, Unicode-3.0, CDLA-Permissive-2.0,
+BSL-1.0, Zlib, or a per-crate choice among those); none are copyleft.
+Grouped by declared SPDX license expression, crate names only —
+full per-crate version/repository detail is reproducible at any time
+by re-running the same `cargo license` command against this repo's
+`Cargo.lock`, since dependency versions change across releases and a
+frozen per-version copy here would go stale.
+
+(Apache-2.0 OR MIT) AND Unicode-3.0 (1): unicode-ident
+
+Apache-2.0 (5): esaxx-rs, spm_precompiled, sync_wrapper, tokenizers, tqf
+
+Apache-2.0 AND ISC (1): ring
+
+Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR CC0-1.0 (1): blake3
+
+Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT (3): wasi, wasip2,
+wit-bindgen
+
+Apache-2.0 OR BSD-2-Clause OR MIT (2): zerocopy, zerocopy-derive
+
+Apache-2.0 OR BSL-1.0 (1): ryu
+
+Apache-2.0 OR CC0-1.0 OR MIT-0 (1): constant_time_eq
+
+Apache-2.0 OR ISC OR MIT (2): hyper-rustls, rustls
+
+Apache-2.0 OR LGPL-2.1-or-later OR MIT (2): r-efi, r-efi
+
+Apache-2.0 OR MIT (169): ahash, anstream, anstyle, anstyle-parse,
+anstyle-query, anstyle-wincon, arrayvec, async-trait, atomic-waker,
+base64, bitflags, block-buffer, bumpalo, cfg-if, chacha20, clap,
+clap_builder, clap_derive, clap_lex, colorchoice, core-foundation,
+core-foundation-sys, core-graphics-types, cpufeatures,
+crossbeam-channel, crossbeam-deque, crossbeam-epoch, crossbeam-utils,
+crypto-common, daachorse, dary_heap, derive_builder, derive_builder_core,
+derive_builder_macro, digest, displaydoc, either, encode_unicode,
+equivalent, errno, filetime, fnv, foreign-types, foreign-types-macros,
+foreign-types-shared, form_urlencoded, futures-channel, futures-core,
+futures-sink, futures-task, futures-util, getrandom, half, hashbrown,
+heck, http, httparse, httpdate, ident_case, idna, idna_adapter,
+indexmap, ipnet, is_terminal_polyfill, itertools, itoa, js-sys,
+lazy_static, libc, log, metal, mime, minimal-lexical, monostate,
+monostate-impl, once_cell, once_cell_polyfill, paste, pastey,
+percent-encoding, pin-project-lite, portable-atomic, ppv-lite86,
+proc-macro2, quinn, quinn-proto, quinn-udp, quote, rand, rand_chacha,
+rand_core, rand_pcg, rayon, rayon-cond, rayon-core, regex,
+regex-automata, regex-syntax, reqwest, rustc-hash, rustls-pki-types,
+rustversion, serde, serde_core, serde_derive, serde_json,
+serde_path_to_error, serde_spanned, serde_urlencoded, sha2,
+signal-hook-registry, smallvec, socket2, stable_deref_trait,
+static_assertions, syn, thiserror, thiserror-impl, thread_local,
+tokio-rustls, toml, toml_datetime, toml_edit, toml_write, typenum,
+unicode-normalization-alignments, unicode-segmentation, unicode-width,
+unicode_categories, url, utf8_iter, utf8parse, wasm-bindgen,
+wasm-bindgen-futures, wasm-bindgen-macro, wasm-bindgen-macro-support,
+wasm-bindgen-shared, web-sys, web-time, windows-link, windows-sys,
+windows-targets, windows_aarch64_gnullvm, windows_aarch64_msvc,
+windows_i686_gnu, windows_i686_gnullvm, windows_i686_msvc,
+windows_x86_64_gnu, windows_x86_64_gnullvm, windows_x86_64_msvc,
+zeroize
+
+Apache-2.0 OR MIT OR Zlib (5): lru-slab, macro_rules_attribute,
+macro_rules_attribute-proc_macro, tinyvec, tinyvec_macros
+
+BSD-2-Clause (1): arrayref
+
+BSD-3-Clause (1): subtle
+
+BSD-3-Clause AND MIT (1): matchit
+
+CC0-1.0 (1): notify
+
+CDLA-Permissive-2.0 (1): webpki-roots
+
+ISC (4): inotify, inotify-sys, rustls-webpki, untrusted
+
+MIT (52): axum, axum-core, block, bytes, castaway, compact_str,
+console, crunchy, darling, darling_core, darling_macro, fsevent-sys,
+generic-array, http-body, http-body-util, hyper, hyper-util,
+indicatif, kqueue, kqueue-sys, malloc_buf, matchers, mio, nom,
+nu-ansi-term, objc, onig, onig_sys, sharded-slab, slab, strsim,
+synstructure, tokio, tokio-macros, tokio-stream, tokio-util, tower,
+tower-http, tower-layer, tower-service, tracing, tracing-attributes,
+tracing-core, tracing-log, tracing-subscriber, try-lock, unit-prefix,
+valuable, want, winnow, zmij
+
+MIT OR Unlicense (5): aho-corasick, memchr, same-file, walkdir,
+winapi-util
+
+Unicode-3.0 (18): icu_collections, icu_locale_core, icu_normalizer,
+icu_normalizer_data, icu_properties, icu_properties_data, icu_provider,
+litemap, potential_utf, tinystr, writeable, yoke, yoke-derive,
+zerofrom, zerofrom-derive, zerotrie, zerovec, zerovec-derive
+
+================================================================
+Reproducing this file
+================================================================
+
+    cargo install cargo-license
+    cargo license --avoid-dev-deps --avoid-build-deps
+
+No bundled model weights (Qwen3.6-35B-A3B, the pplx-embed/GTE-reranker
+helper models, or the vision mmproj sidecar) are part of this
+repository or its release artifacts (spec §266's "no bundled
+Qwen/helper weights") — all are downloaded and checksum-verified at
+first run per each checkpoint's own upstream license (see
+`src/source/pinned.rs` for the pinned source URLs and hashes).

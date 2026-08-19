@@ -7,6 +7,8 @@ pub mod auth;
 pub mod bind;
 pub mod ollama;
 pub mod openai;
+#[cfg(test)]
+mod security_tests;
 pub mod stub;
 #[cfg(test)]
 mod tests;

@@ -505,6 +505,26 @@ Phases 27-28 land the first long-context (TQKV) work:
   no ≤1% quality qualification at 1M yet (Phase 32's own 99.8%
   score-preservation check only covers 16,384 tokens).
   `docs/research/qualification/phase-49-1m-research.md`.
+- **Phase 52 (release hardening):** the tractable real subset of a
+  phase that as literally specified assumes CI/clean-machine/release
+  infrastructure this environment doesn't have (see the qualification
+  doc for the full honest list of what wasn't attempted and why).
+  Four new real server security tests (`src/server/security_tests.rs`,
+  spec §261): a 32 MB giant body (confirms axum's 2 MB default limit
+  rejects it fast, not hung/OOM), an invalid-UTF-8 body (rejected 4xx,
+  server stays healthy afterward), a 1 MB oversized header, and —
+  previously **zero coverage** — the `require_api_key` auth gate
+  itself (missing header, wrong scheme, wrong token, correct token,
+  unauthenticated `/health`). Added the real, previously-missing
+  `LICENSE` file (Apache-2.0, full text) and `NOTICE` (TQF's own
+  header, the existing NVMAI attribution, and a machine-generated
+  `cargo license` inventory of all 277 real runtime dependencies —
+  **zero copyleft**, confirmed not assumed). Documented `.tqf`'s real
+  version-freeze guarantee (`FORMAT_MAJOR=1`, already enforced by the
+  reader's own major-version rejection) versus `.tqi`, which cannot be
+  frozen because it was never built as a persisted format (Phase 42's
+  own honest scope boundary, unchanged).
+  `docs/research/qualification/phase-52-release-hardening.md`.
 
 ## Commands
 

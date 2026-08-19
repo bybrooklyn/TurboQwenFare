@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::runtime::{GeneratedOutput, GenerationSlot, NormalizedRequest, Qwen36Generator};
 use crate::server::{self, AppState};
 
-async fn spawn_test_server(model_installed: bool) -> SocketAddr {
+pub(super) async fn spawn_test_server(model_installed: bool) -> SocketAddr {
     spawn_test_server_with(model_installed, None).await
 }
 
@@ -28,10 +28,24 @@ async fn spawn_test_server_with(
     model_installed: bool,
     generator: Option<Arc<dyn Qwen36Generator>>,
 ) -> SocketAddr {
+    spawn_router(test_router(model_installed, generator, None)).await
+}
+
+/// spec §268/§261: same test server, but with the protected sub-router's
+/// `require_api_key` gate actually enabled — used by
+/// `security_tests::api_key_gate_rejects_missing_or_wrong_bearer_and_
+/// accepts_the_right_one`, which had no coverage before Phase 52.
+pub(super) async fn spawn_test_server_with_api_key(
+    model_installed: bool,
+    api_key: &str,
+) -> SocketAddr {
+    spawn_router(test_router(model_installed, None, Some(api_key))).await
+}
+
+async fn spawn_router(router: axum::Router) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let router = test_router(model_installed, generator);
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
             eprintln!("test server exited: {err}");
@@ -42,14 +56,18 @@ async fn spawn_test_server_with(
     addr
 }
 
-fn test_router(model_installed: bool, generator: Option<Arc<dyn Qwen36Generator>>) -> axum::Router {
+fn test_router(
+    model_installed: bool,
+    generator: Option<Arc<dyn Qwen36Generator>>,
+    api_key: Option<&str>,
+) -> axum::Router {
     let state = AppState {
         config: Arc::new(Config::default()),
         model_installed,
         generation_slot: GenerationSlot::new(),
         generator,
         started_at: Instant::now(),
-        api_key: None,
+        api_key: api_key.map(Arc::from),
     };
 
     server::build_router(state)
@@ -130,11 +148,11 @@ async fn http_request(addr: SocketAddr, request: &str) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn get(path: &str) -> String {
+pub(super) fn get(path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
 }
 
-fn post_json(path: &str, body: &str) -> String {
+pub(super) fn post_json(path: &str, body: &str) -> String {
     format!(
         "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -319,7 +337,7 @@ async fn chat_completion_streaming_formats_generator_output_and_done_marker() {
 
 #[tokio::test]
 async fn streaming_responds_before_generation_finishes() {
-    let router = test_router(true, Some(Arc::new(DelayedGenerator)));
+    let router = test_router(true, Some(Arc::new(DelayedGenerator)), None);
     let response = router
         .oneshot(
             Request::post("/v1/chat/completions")
