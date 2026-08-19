@@ -195,6 +195,17 @@ Phases 27-28 land the first long-context (TQKV) work:
   verified boundary+draft pair versus fetching each independently,
   averaged across 5,080 real (layer, consecutive-step) pairs.
   `docs/research/qualification/phase-33-mtp.md`.
+- **Phase 34 (2G profile):** spec §40's staged sequence, stage 2 first.
+  Real construction of the *entire* 40-layer context/recurrent-state
+  footprint (30 GDN states + 10 TQKV-Q4 full-attention layers at 128K)
+  inside a real 2 GiB broker: **0.731 GiB used, 1.269 GiB headroom** for
+  weights/expert-cache. Stage 1 (real decode under a 2 GiB broker with a
+  384 MiB expert cache, checked against the established BF16-4GiB
+  baseline) and stage 3 (15 tok/s) status recorded in the doc — stage 3
+  is not attempted since Phase 25/29 already establish the reference
+  compute path can't close that floor even with more cache, and spec §40
+  itself says a 2G speed miss doesn't invalidate the 4G system.
+  `docs/research/qualification/phase-34-2g-profile.md`.
 
 ## Commands
 

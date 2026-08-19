@@ -664,4 +664,66 @@ mod tests {
             continuation_from_live == continuation_from_restored,
         );
     }
+
+    /// Phase 34 2G qualification, stage 1 of spec §40's staged sequence
+    /// ("first prove correct Q4 generation under 2 GiB"): opens the
+    /// bounded runtime against a real 2 GiB broker with TQKV-Q4 and a
+    /// tiny expert cache, decodes the same real prompt continuation the
+    /// Phase 27 8-step baseline used, and checks the tokens are identical
+    /// to that already-established-correct BF16-under-4GiB sequence
+    /// (`[220, 16, 15, 15, 15, 20332, 1740, 369]`,
+    /// `docs/research/qualification/phase-27-tqkv-baseline.md`) — i.e.
+    /// shrinking the budget by half and switching KV backends must not
+    /// change the model's real output.
+    #[test]
+    #[ignore = "requires the canonical .tqf checkpoint with TQF_TQKV_ENABLED=1 TQF_TQKV_PRECISION=q4; Phase 34 2G qualification"]
+    fn canonical_decode_under_2gib_with_tqkv_q4_matches_the_4gib_bf16_baseline() {
+        assert!(
+            crate::context::tqkv::tqkv_enabled(),
+            "set TQF_TQKV_ENABLED=1 TQF_TQKV_PRECISION=q4 for the 2G profile (spec section 40/162)"
+        );
+        let tqf = std::env::var("TQF_CANONICAL_TQF").expect("set TQF_CANONICAL_TQF");
+        let two_gib: u64 = 2 * 1024 * 1024 * 1024;
+        let expert_cache_bytes: u64 = std::env::var("TQF_2G_EXPERT_CACHE_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(384 * 1024 * 1024);
+        let steps: usize = std::env::var("TQF_2G_QUAL_STEPS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let broker = MemoryBroker::new(Bytes(two_gib));
+        let mut runtime = Qwen36BoundedReferenceRuntime::open(
+            Path::new(&tqf),
+            broker.clone(),
+            steps.max(64),
+            Bytes(expert_cache_bytes),
+        )
+        .unwrap();
+        let mut token = 32u32;
+        let mut sequence = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let decoded = runtime.decode_greedy(token).unwrap();
+            sequence.push(decoded.token);
+            token = decoded.token;
+        }
+        let peak_reserved = broker.snapshot().reserved;
+        println!(
+            "phase34_2g_qual steps={steps} expert_cache_bytes={expert_cache_bytes} peak_reserved_mib={} tokens={:?}",
+            peak_reserved.0 / (1024 * 1024),
+            sequence,
+        );
+        assert!(
+            peak_reserved.0 <= two_gib,
+            "broker reservation {} exceeded the 2 GiB hard wall",
+            peak_reserved.0
+        );
+        if steps == 8 {
+            assert_eq!(
+                sequence,
+                vec![220, 16, 15, 15, 15, 20332, 1740, 369],
+                "2G/TQKV-Q4 decode diverged from the established 4G/BF16 baseline"
+            );
+        }
+    }
 }

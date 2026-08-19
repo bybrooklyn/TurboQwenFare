@@ -113,6 +113,36 @@ pub fn all_ten_layers_reserved_bytes(
     Ok(broker.snapshot().reserved)
 }
 
+/// Phase 34 (spec §306, §40): real construction of the *entire* 40-layer
+/// context/recurrent-state footprint — all 30 GDN states plus all 10
+/// full-attention layers at `max_tokens` under `choice` — the same shape
+/// `Qwen36BoundedReferenceRuntime::open` builds, so this is what a real
+/// 2G-profile session's standing context memory actually costs before any
+/// resident weights or expert-cache budget is subtracted.
+pub fn full_context_state_reserved_bytes(
+    broker: &MemoryBroker,
+    max_tokens: usize,
+    choice: BackendChoice,
+) -> Result<Bytes> {
+    let mut gdn_states = Vec::new();
+    let mut full_attention = Vec::new();
+    for layer in 0..Qwen36Geometry::NUM_LAYERS {
+        let id = LayerId(layer as u8);
+        match Qwen36Geometry::layer_kind(id) {
+            crate::ids::LayerKind::GatedDeltaNet => {
+                gdn_states.push(crate::model::qwen36::gdn::GdnState::new(broker, id)?);
+            }
+            crate::ids::LayerKind::FullAttention => {
+                full_attention.push(FullAttentionLayer::new_with_backend(
+                    broker, id, max_tokens, choice,
+                )?);
+            }
+        }
+    }
+    assert_eq!(gdn_states.len() + full_attention.len(), Qwen36Geometry::NUM_LAYERS);
+    Ok(broker.snapshot().reserved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +197,33 @@ mod tests {
             bf16_reserved.0,
             bf16_reserved.0 as f64 / (1024.0 * 1024.0 * 1024.0),
             bf16_reserved.0 < four_gib.0,
+        );
+    }
+
+    /// Phase 34 stage-1 memory check (spec §40: "first prove correct Q4
+    /// generation under 2 GiB", then "128K logical context"): the entire
+    /// 40-layer context/recurrent-state footprint (30 GDN + 10 TQKV-Q4
+    /// full-attention at 128K) inside a real 2 GiB broker.
+    #[test]
+    fn full_context_state_at_128k_tqkv_q4_fits_under_2gib_with_headroom() {
+        let two_gib = Bytes(2 * 1024 * 1024 * 1024);
+        let broker = MemoryBroker::new(two_gib);
+        let reserved = full_context_state_reserved_bytes(
+            &broker,
+            131_072,
+            BackendChoice::Tqkv(TqkvPrecision::Q4),
+        )
+        .unwrap();
+        assert!(
+            reserved.0 < two_gib.0,
+            "full 40-layer context state {} exceeded the 2 GiB budget",
+            reserved.0
+        );
+        println!(
+            "phase34_memory context_state_128k_q4_bytes={} gib={:.3} headroom_gib={:.3}",
+            reserved.0,
+            reserved.0 as f64 / (1024.0 * 1024.0 * 1024.0),
+            (two_gib.0 - reserved.0) as f64 / (1024.0 * 1024.0 * 1024.0),
         );
     }
 
