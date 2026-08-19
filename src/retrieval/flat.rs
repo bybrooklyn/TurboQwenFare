@@ -304,6 +304,25 @@ mod tests {
             started.elapsed().as_millis()
         );
 
+        // Optionally persist the real computed FP32 vectors so later
+        // phases (Phase 39's TQVec candidate benchmark) can reuse this
+        // corpus without re-running the expensive reference forward pass
+        // — same "recapture the trace, replay offline" precedent as the
+        // committed `raw-a-128-route-trace.json` fixture.
+        if let Ok(dump_path) = std::env::var("TQF_PPLX_FLAT_CORPUS_DUMP") {
+            let dump: Vec<serde_json::Value> = store
+                .records
+                .iter()
+                .map(|r| serde_json::json!({"id": r.id, "fp32": r.fp32}))
+                .collect();
+            std::fs::write(
+                &dump_path,
+                serde_json::to_vec(&serde_json::json!({"documents": dump})).unwrap(),
+            )
+            .expect("write corpus dump");
+            println!("phase38_corpus_dump path={dump_path}");
+        }
+
         let queries = [
             (
                 "how does the memory broker account for reserved bytes per owner",
@@ -326,6 +345,7 @@ mod tests {
         let k = 5;
         let mut int8_recalls = Vec::new();
         let mut binary_recalls = Vec::new();
+        let mut query_dump: Vec<serde_json::Value> = Vec::new();
         for (query_text, expected_top_id) in queries {
             let query_embedding = runtime
                 .embed_with_input_budget(query_text, None, Some(max_input_tokens))
@@ -353,6 +373,20 @@ mod tests {
                 top_id.contains(expected_top_id.trim_start_matches("src/"))
                     || top_id == expected_top_id
             );
+            query_dump.push(serde_json::json!({
+                "text": query_text,
+                "fp32": query_fp32,
+                "fp32_ground_truth_top_k": ground_truth,
+            }));
+        }
+
+        if let Ok(dump_path) = std::env::var("TQF_PPLX_FLAT_QUERY_DUMP") {
+            std::fs::write(
+                &dump_path,
+                serde_json::to_vec(&serde_json::json!({"queries": query_dump})).unwrap(),
+            )
+            .expect("write query dump");
+            println!("phase38_query_dump path={dump_path}");
         }
 
         let mean_int8_recall = int8_recalls.iter().sum::<f32>() / int8_recalls.len() as f32;

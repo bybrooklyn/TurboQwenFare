@@ -7,3 +7,4 @@ pub mod flat;
 pub mod ignore;
 pub mod lexical;
 pub mod scan;
+pub mod tqvec;

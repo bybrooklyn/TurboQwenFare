@@ -275,6 +275,22 @@ Phases 27-28 land the first long-context (TQKV) work:
   was **0.85** (0.8/0.8/0.8/1.0), establishing the real recall-loss floor
   a future TQVec candidate (Phase 39) needs to beat.
   `docs/research/qualification/phase-38-flat-semantic-baseline.md`.
+- **Phase 39 (TQVec research):** `retrieval::tqvec` — RESEARCH CANDIDATES
+  A-F from spec §190 (native INT8; binary-coarse+INT8; binary-coarse+
+  grouped Q5/Q4 with real `f16` per-group scales; rotated Q4/Q5 via a
+  real fixed randomized-sign-flip + fast Walsh-Hadamard transform;
+  residual hierarchy), none wired into a live index per spec §300's
+  rule. Measured on Phase 38's real corpus/query embeddings (committed
+  as `raw-a-phase38-flat-*.json` fixtures so the benchmark reruns in
+  ~0.1s without re-embedding): A/B both hit perfect recall@5 (1028/1060
+  bytes); grouped Q5/Q4 without rotation lose recall (0.95/0.90 at
+  738/610 bytes); **rotation measurably recovers that loss at the
+  identical byte budget** (Q5: 1.00, Q4: 0.95) — a real, reproduced
+  finding (Phase 28 found the same qualitative rotation effect for TQKV,
+  independently confirmed here for TQVec on different real data). The
+  residual hierarchy's cheap base-only score reproduces Phase 38's 0.85
+  Hamming floor; adding the residual lifts it to 0.95.
+  `docs/research/qualification/phase-39-tqvec-candidates.md`.
 
 ## Commands
 
