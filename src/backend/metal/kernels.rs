@@ -980,6 +980,13 @@ pub fn q8_gemv(
     Ok(bytes_to_f32_vec(out_buf.as_slice()))
 }
 
+/// The four GDN projections a fused launch produces in one pass, in the
+/// order the kernel writes them: `(qkv, z, a, b)`. Named rather than
+/// returned as a bare 4-tuple so the signature stays readable — and so
+/// callers destructure against a documented order instead of positional
+/// guesswork.
+pub type GdnProjections = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
 /// Phase 20 GDN four-way projection fusion (spec §292): computes
 /// `qkv | z | a | b` projections of one 2048-wide hidden state in a single
 /// launch whose threadgroups stage the input once. Returns
@@ -999,7 +1006,7 @@ pub fn gdn_fused_projection(
     z_rows: usize,
     a_rows: usize,
     b_rows: usize,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+) -> Result<GdnProjections> {
     const GDN_HIDDEN: usize = 2048;
     assert_eq!(
         hidden.len(),
