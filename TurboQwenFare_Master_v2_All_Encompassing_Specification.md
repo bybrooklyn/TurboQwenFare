@@ -5101,11 +5101,26 @@ Do not start aggressive cache work until 512-token reference sequence passes.
 
 Wire normalized GenerateRequest to model session and streaming adapters. Tool-call parsing/formatting must be tested before `--open` integrations depend on it.
 
+"Streaming adapters" means **all** of the compatibility surfaces this document requires, not the OpenAI one alone. The full set, with its owning section:
+
+| Surface | Required by | Owning phase |
+|---|---|---|
+| OpenAI Chat Completions / Responses / models | §70 | 16 |
+| Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`, `/api/embed` | §73, §210 | **16a** |
+| Anthropic Messages | §72 | **16b** |
+| Sampling parameters behind all three | §153, §204 | **15a** |
+
+**Exit gate.** A phase-16 build answers on the default port for every surface in that table, and each returns its own protocol's shapes and its own error envelope (§212). Registering a module that compiles but serves no routes does not close this gate — the check is a request over a socket, not the presence of a source file.
+
+Historical note: the first implementation of this phase wired only the OpenAI adapter and was marked complete, because the phase text said "streaming adapters" without enumerating them. `src/server/{ollama,anthropic}/mod.rs` existed as doc-comment-only modules for the whole of phases 17-52. The table above exists so that cannot recur.
+
 # 289. Phase 17 — canonical autoinstall
 
-Combine setup/source/conversion/profile quick tune. A fresh user should now reach a working OpenAI server through plain `tqf` without knowing GGUF.
+Combine setup/source/conversion/profile quick tune. A fresh user should now reach a working server through plain `tqf` without knowing GGUF.
 
 This is the first **useful build** milestone.
+
+**Exit gate.** "Useful" is measured against a real third-party client, not against this project's own test suite. At least one unmodified external client — the `ollama` CLI, Open WebUI, or a coding client via `--open` — must complete a real conversation against the server. `curl` passing while a real client fails is the specific outcome this gate exists to catch, because the two differ on framing details (NDJSON vs SSE, the terminal `done` object, default sampling parameters) that a hand-written request will not exercise.
 
 # 290. Phase 18 — out-of-core expert baseline
 
@@ -5286,6 +5301,124 @@ Measure actual PCIe/SSD topology, tune pinned staging/cache, and establish 6GB-c
 
 Run full fuzz/fault/memory/protocol/quality/performance/license/clean-machine suite. Freeze `.tqf`/`.tqi` major versions for the release and document migration guarantees.
 
+# 329. Retrofitted phases: work no phase owned
+
+Sections 272-324 define fifty-three phases and omit five pieces of work this
+document requires elsewhere. The omission is not academic: every one of them was
+still unbuilt after all fifty-three phases were reported complete, because a
+phase-driven implementation only builds what a phase names.
+
+These are numbered by the phase they belong *beside* rather than appended after
+Phase 52, because they are not post-release work — they are gaps in the existing
+sequence. Their section numbers (329+) are out of document order deliberately:
+renumbering 325-328 would invalidate every `§NNN` cross-reference in the
+codebase, the qualification records, and `AGENTS.md`.
+
+# 330. Phase 2a — CI lanes
+
+Belongs with Phase 2, whose own text says to "establish protocol/test
+architecture now."
+
+Implement §262's Lane A as an actual workflow on an actual runner, from the
+first phase that produces a binary: format check, lint at deny-warnings, the
+full no-hardware test suite, and a guard that the platform-conditional backend
+dependency resolves per target. Lanes B-E are defined in §262 and gated on
+hardware; Lane A is not, and has no excuse to be absent.
+
+**Exit gate.** A push builds and tests on both a Linux and a macOS runner. A
+task runner exposes the same lane locally under one command, so "works on my
+machine" and "passes CI" are the same check.
+
+Historical note: `.github/workflows` did not exist through Phase 52. Because
+nothing ever built the crate on Linux, `cargo build` had been failing there —
+the default feature set pulled an Apple-only dependency — without any phase
+noticing.
+
+# 331. Phase 2b — protocol conformance fixtures
+
+Belongs with Phase 2, and must be written *before* the adapters they check.
+
+Implement §260's golden fixtures: request in, expected response or event
+sequence out, for every surface in Phase 16's table plus tool calls, structured
+output, errors, and cancellation.
+
+The rule that gives this phase its value: **a conformance fixture is written
+from this specification, never from the implementation's current behavior.** A
+fixture derived from the code cannot fail, because it ratifies whatever the code
+already does — including its bugs and its unimplemented parameters.
+
+**Exit gate.** Each fixture cites the section it encodes. A limitation is
+expressed as a fixture asserting the documented *rejection* (§204's "reject
+rather than silently ignore"), never as a fixture asserting the limitation is
+correct behavior.
+
+Historical note: the pre-existing suite contained a test asserting that
+`temperature: 0.7` returns HTTP 400. It passed. Its name encoded the runtime's
+limitation as though it were the requirement, so the suite agreed with the
+server while the server disagreed with §204 and with every real client.
+
+# 332. Phase 15a — sampling
+
+Belongs with Phase 15, which produces the logits this consumes.
+
+Implement §153's `SamplingConfig` over the LM-head output: temperature, top-k,
+top-p, min-p, repetition/frequency/presence penalties, stop sequences, and a
+seeded generator. Normalize every protocol's parameter spelling into this one
+internal representation at the HTTP boundary.
+
+**Exit gate — and it is the binding constraint on this phase.** Greedy decode
+must remain bit-identical to the pre-sampling implementation, because every
+oracle-parity record in the qualification ledger compares a greedy token
+sequence against an independent runtime. Satisfy it structurally: greedy is a
+distinct code path returning the argmax the decode loop already computed for its
+diagnostics, selected on an exact `temperature == 0.0` comparison — not a
+softmax that happens to converge on argmax as temperature approaches zero. The
+internal default temperature is `0.0`, so an adapter that fails to set sampling
+decodes deterministically rather than silently sampling.
+
+Verify by running the greedy oracle comparison against the real checkpoint
+before and after, and diffing the token sequences byte for byte.
+
+# 333. Phase 16a — Ollama compatibility surface
+
+Implement §73 and §210: `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`,
+`/api/ps`, `/api/embed`, plus the two endpoints real clients probe before
+anything else — `GET /` returning the fixed liveness string, and
+`GET /api/version`. Model-management endpoints (§210: "not required") return an
+explicit 501 naming why, never an anonymous 404.
+
+Four details break every real client while a hand-written `curl` still looks
+correct, so each is part of the gate:
+
+- **NDJSON, not SSE.** `application/x-ndjson`, one bare JSON object per line, no
+  `data:` prefix and no `[DONE]` sentinel.
+- **The terminal object.** Clients terminate on `"done": true`, not on the
+  socket closing. Omitting it hangs them.
+- **`stream` defaults to true**, the opposite of the OpenAI surface.
+- **Tag tolerance.** Clients send `qwen3.6:35b`; responses normalize to the
+  canonical ID per §203, and inventory endpoints report real values from the
+  trusted receipt rather than plausible-looking ones.
+
+**Exit gate.** The §260 fixtures pass, *and* an unmodified Ollama client
+completes a conversation (§289's gate).
+
+**Auth placement is part of this phase, not a follow-up.** These routes serve
+generation, so they belong behind the same API-key layer as the OpenAI routes
+(§74). Only the two unauthenticated liveness probes sit outside it. Merging the
+whole surface at the router's top level is the path of least resistance and
+silently exposes generation on a non-loopback bind.
+
+# 334. Phase 16b — Anthropic compatibility surface
+
+Implement §72: `POST /v1/messages` and `/v1/messages/count_tokens`, with
+Anthropic's own streaming event names and its own error envelope (§212).
+`max_tokens` is required by that API and absent means a 400, matching the real
+service.
+
+**Exit gate.** The §260 fixtures pass, and `tqf --open claude` completes a real
+turn — which is the reason this surface exists at all, since that flag points
+`ANTHROPIC_BASE_URL` here.
+
 # 325. Cross-phase rule: reference paths survive optimization
 
 Do not delete every simple implementation as soon as a faster one appears. Keep compact reference paths for:
@@ -5325,6 +5458,48 @@ CLEANUP
 
 A correctness TODO cannot be silently deferred behind performance work. Research TODOs do not block release unless tied to a locked acceptance gate.
 
+# 335. Cross-phase rule: a phase is not done until its surface is reachable
+
+The failure this rule exists to prevent has already happened once, across
+roughly forty phases, and it did not involve anyone writing something untrue.
+
+Each phase delivered a real, measured library. Each phase's record honestly
+noted what remained — "not wired into the live decode loop yet", "not wired to
+actual `--open` CLI parsing yet", "not yet wired into `POST /v1/embeddings`".
+Every one of those statements was accurate. What never happened was anyone
+reading the accumulated caveats together and concluding that the product did not
+work. "Phase complete" meant "library delivered and measured", which was true
+every time, while `tqf` served 404 on every Ollama route it was listening for.
+
+Therefore:
+
+**A phase that produces a capability is not complete until that capability is
+reachable through the product surface the user actually touches** — a CLI
+command in §3, an HTTP route, or a documented flag — or until the phase record
+states in one sentence that it is not reachable and names the phase that will
+make it so.
+
+Three consequences:
+
+1. **Prefer an honest 501 to a silent gap.** A capability that cannot be wired
+   yet, because it needs an artifact or hardware that does not exist, returns an
+   explicit error naming what is missing. A module that compiles but is
+   unreachable is invisible; a 501 that says "the pplx-embed checkpoint is not
+   pinned in this build" is a work item.
+
+2. **Batch commits hide exit gates.** Landing six phases in one commit means
+   checking six gates as one. Phases 13-18 were committed together under a
+   subject about the runtime baseline; the two server phases inside that batch
+   are where the entire protocol surface went missing.
+
+3. **The reachability check is a request or an invocation, never a file
+   listing.** `pub mod ollama;` in a module tree looks like coverage. A doc
+   comment in `ollama/mod.rs` looks like a module. Neither answers a socket.
+
+This rule is subordinate to §326: making a capability reachable means wiring it
+to the surface this document already specifies, never inventing new scope to
+justify the wiring.
+
 # 328. Master v2 implementation handoff checklist
 
 An implementation agent beginning work should be able to answer yes to all of these from this document:
@@ -5347,6 +5522,9 @@ An implementation agent beginning work should be able to answer yes to all of th
 - Which API fields/protocols are supported? **Baseline defined.**
 - How is SwiftUI kept in the same binary? **Build/ABI/lifecycle defined.**
 - How do I prove 4G/15tok/s/≤1%? **Qualification protocols defined.**
+- Which phase owns each protocol surface, and how do I know it answers? **§288's table and §335.**
+- What builds and tests my work on every push? **§330 Lane A.**
+- Are my tests derived from this document or from my own code? **§331 — from this document.**
 
 Where this document still offers alternatives, it explicitly names the reference baseline and the benchmark that chooses the replacement. That is intentional: hardware research cannot be honestly specified as a fake certainty before measurement.
 

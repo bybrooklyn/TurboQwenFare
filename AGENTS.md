@@ -17,6 +17,37 @@ The spec uses a decision-status vocabulary that controls how much latitude an im
 - **RESEARCH CANDIDATE** — deliberately experimental; failure is an acceptable, recordable outcome.
 - **BENCHMARK-SELECTED** — multiple valid implementations exist; the benchmark winner becomes default.
 
+### Read this before reporting a phase complete
+
+The spec's phase list (§272-324) had five holes, and all five survived every one of the
+fifty-three phases being reported done. Nothing untrue was written: each phase delivered a
+real, measured library and honestly noted what remained unwired. Nobody summed the caveats.
+The result was a server that listened on Ollama's port and answered 404 on every Ollama
+route, while the ledger said the phases were complete.
+
+The spec now closes that:
+
+- **§335 — a phase is not done until its surface is reachable.** A capability is complete
+  when a CLI command, HTTP route, or documented flag reaches it — or when the phase record
+  says in one sentence that it is not reachable and names the phase that will fix it. Prefer
+  an honest `501` naming the missing artifact over a module that compiles and is unreachable.
+  The check is a request or an invocation, never a file listing: `pub mod ollama;` looks like
+  coverage and answers nothing.
+- **§288's table** names every protocol surface and its owning phase, so "streaming adapters"
+  can no longer mean "the OpenAI one".
+- **§289's exit gate** measures "useful build" against an unmodified third-party client, not
+  against this project's own tests.
+- **§329-334** retrofit the phases nothing owned: **2a** CI lanes, **2b** conformance
+  fixtures, **15a** sampling, **16a** Ollama, **16b** Anthropic.
+- **§331** — conformance fixtures are written from the spec, never from the code. A test
+  derived from current behavior cannot fail. The pre-existing suite had one asserting
+  `temperature: 0.7` returns 400; it passed, and it encoded a limitation as the requirement.
+
+Practical consequences for routine work here: run `just ci` before claiming anything builds
+or passes; run `just smoke-ollama` against a live server before claiming an endpoint works;
+and do not batch phases into one commit, because six exit gates checked as one is how the
+protocol surface went missing in the first place.
+
 Implementation coverage now extends through the Phase 18 reference/bounded baseline: BF16 virtual-GQA
 full attention, exact MoE routing/shared/routed computation, a 40-layer decode graph, normalized
 OpenAI streaming adapters, canonical download/conversion/receipt startup, and a whole-expert cache
