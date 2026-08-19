@@ -3,6 +3,7 @@
 //! core inference validity.
 
 pub mod classify;
+pub mod flat;
 pub mod ignore;
 pub mod lexical;
 pub mod scan;

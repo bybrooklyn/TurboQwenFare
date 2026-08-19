@@ -56,7 +56,29 @@ impl PplxEmbedRuntime {
     /// truncation is applied before quantization when `mrl_dim` is
     /// `Some(_)` and smaller than the base 1024-d embedding.
     pub fn embed(&self, text: &str, mrl_dim: Option<usize>) -> Result<PplxEmbedding> {
-        let token_ids = self.tokenizer.encode(text, true)?;
+        self.embed_with_input_budget(text, mrl_dim, None)
+    }
+
+    /// As `embed`, but truncates the *input* token sequence to
+    /// `max_input_tokens` before running the encoder. The reference
+    /// forward pass here is an unoptimized scalar loop whose cost is
+    /// dominated by input length (linear per-token projection cost
+    /// dwarfs the model's own quadratic attention term until sequences
+    /// reach several thousand tokens — see the Phase 38 qualification
+    /// doc), so bulk-indexing real documents needs a bounded token
+    /// budget to stay tractable; this is a resource control, not a
+    /// change to model semantics (the checkpoint's own 32K context
+    /// window is unaffected).
+    pub fn embed_with_input_budget(
+        &self,
+        text: &str,
+        mrl_dim: Option<usize>,
+        max_input_tokens: Option<usize>,
+    ) -> Result<PplxEmbedding> {
+        let mut token_ids = self.tokenizer.encode(text, true)?;
+        if let Some(max) = max_input_tokens {
+            token_ids.truncate(max);
+        }
         let hidden = encode_sequence(&self.weights, &token_ids);
         let pooled = mean_pool(&hidden);
         let truncated = match mrl_dim {

@@ -259,6 +259,22 @@ Phases 27-28 land the first long-context (TQKV) work:
   wired into `POST /v1/embeddings` — this phase delivers the runtime and
   its qualification, not the HTTP route.
   `docs/research/qualification/phase-37-pplx-helper-runtime.md`.
+- **Phase 38 (flat semantic baseline):** `retrieval::flat::FlatVectorStore`
+  — the gold recall baseline every future approximate index is measured
+  against (spec §189). Full L2-normalized FP32 reference vectors, a
+  separate per-vector-scale linear INT8 control (distinct from Phase
+  37's model-native tanh-INT8 compact output), the model's own native
+  sign-based binary/Hamming output reused as the binary control, MRL
+  prefix+renormalize, and brute-force scalar exact search (REFERENCE
+  BASELINE tier — SIMD kernels are later work if this is ever shown to
+  matter). Measured on ten real files from this crate's own source tree
+  across four distinct semantic clusters, embedded through the real
+  Phase 37 runtime: all four real natural-language queries top-1-matched
+  their intended file under the FP32 gold ranking; linear INT8 recall@5
+  was **perfect (1.0)**; the native binary/Hamming control's recall@5
+  was **0.85** (0.8/0.8/0.8/1.0), establishing the real recall-loss floor
+  a future TQVec candidate (Phase 39) needs to beat.
+  `docs/research/qualification/phase-38-flat-semantic-baseline.md`.
 
 ## Commands
 
