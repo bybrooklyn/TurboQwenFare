@@ -37,7 +37,10 @@ fn main() -> std::process::ExitCode {
     let cli = cli::Cli::parse();
 
     match app::run(cli) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        // `tqf doctor` reports failure through its exit code so it is
+        // usable in a script, so the code comes from `run`, not from
+        // whether it returned `Ok`.
+        Ok(code) => code,
         Err(err) => {
             eprintln!("tqf: {err}");
             std::process::ExitCode::FAILURE

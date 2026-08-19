@@ -68,6 +68,8 @@ pub enum ConfigError {
     Environment(String),
     #[error("failed to serialize config: {0}")]
     Serialize(String),
+    #[error("invalid --open value {0:?}: expected one of opencode, claude, codex")]
+    InvalidClient(String),
 }
 
 #[derive(Debug, Error)]
@@ -76,6 +78,11 @@ pub enum SetupError {
     Declined,
     #[error("no model installed and no interactive terminal to confirm setup (use --yes)")]
     NonInteractiveConfirmationRequired,
+    /// A coding client could not be prepared or launched (spec §99-100).
+    /// Distinct from `ConfigError::InvalidClient`, which is a bad flag
+    /// value rather than a failure to run a valid one.
+    #[error("could not launch the coding client: {0}")]
+    ClientLaunch(String),
 }
 
 #[derive(Debug, Error)]

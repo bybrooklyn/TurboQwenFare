@@ -529,7 +529,12 @@ Phases 27-28 land the first long-context (TQKV) work:
 ## Commands
 
 ```sh
-cargo build                 # debug build (Metal backend by default on macOS)
+just                        # list every task recipe (install: cargo install just)
+just ci                     # fmt --check + clippy -D warnings + the full fast suite
+just serve                  # dev server with no checkpoint required
+just smoke-ollama           # curl the Ollama surface against a running server
+
+cargo build                 # debug build; works on every platform
 cargo build --release       # release profile: LTO, codegen-units=1, panics unwind (not abort)
 cargo run -- --headless     # run the server without launching the SwiftUI GUI
 cargo test                  # run the full test suite
@@ -539,11 +544,20 @@ cargo clippy
 cargo fmt
 ```
 
-Feature flags select the compute backend at compile time (exactly one is expected per build):
-`--features metal` (default) or `--features cuda`. There is no generic/CPU-only inference backend.
+Feature flags select the compute backend at compile time: `--features metal` (default) or
+`--features cuda`. `metal` is in `default` but resolves to a no-op off macOS, because
+`metal-sys` is declared in a `[target.'cfg(target_os = "macos")'.dependencies]` table and is
+absent from the dependency graph elsewhere. `build.rs` emits a single `tqf_metal` cfg meaning
+"the feature is on *and* this target can use it", which is what the backend-conditional sites
+test; `scripts/check-platform-backends.sh` guards the wiring and runs in `just ci`.
 
-There is no CI workflow configured yet (`.github/workflows` does not exist) despite the spec defining
-one (section 262, "CI lane design", Lanes A–E) — don't assume CI enforces anything today.
+Off macOS the crate compiles against `backend::reference`, a portable scalar path. That is not
+a shipping inference backend — CUDA (§322-323) is unimplemented — but it is what makes
+`cargo build` and `cargo test` work everywhere.
+
+`.github/workflows/ci.yml` runs Lane A (§262) on Linux and macOS: `just ci`, plus the
+platform-backend guard. Lanes B–E need real hardware or the checkpoint and are driven locally
+by `just build-gui` and `just qual-*`.
 
 ## Architecture
 
@@ -661,7 +675,7 @@ this pattern rather than passing around bare `u64`/`usize`.
 
 ```
 tqf | tqf --headless | tqf --memory 8G | tqf --context 1M | tqf --enable-vision
-tqf --host 0.0.0.0 | tqf --model ./compatible-qwen36-q4.gguf
+tqf --host 0.0.0.0 | tqf --port 11434 | tqf --model ./compatible-qwen36-q4.gguf
 tqf sync . | tqf unsync . | tqf --open {opencode,claude,codex}
 tqf status | tqf doctor | tqf optimize
 ```

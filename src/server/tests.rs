@@ -784,3 +784,93 @@ async fn streamed_and_non_streamed_answers_agree() {
     assert_eq!(streamed_text, expected);
     assert_eq!(parsed["choices"][0]["message"]["content"], expected);
 }
+
+// ---------------------------------------------------------------------
+// Native diagnostics namespace (spec §211).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_native_status_endpoint_distinguishes_installed_from_loaded() {
+    // A valid receipt can exist while the runtime failed to construct, so
+    // conflating the two would hide the most confusing real state.
+    let addr = spawn_test_server_with(true, None).await;
+    let response = http_request(addr, &get("/tqf/status")).await;
+    let body: serde_json::Value =
+        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap_or("")).expect("JSON body");
+
+    assert_eq!(body["model"]["installed"], true, "{body}");
+    assert_eq!(body["model"]["loaded"], false, "{body}");
+    assert_eq!(body["model"]["id"], "qwen3.6-35b-a3b");
+    assert!(body["backend"].is_string(), "{body}");
+
+    let addr = spawn_test_server_with(true, Some(Arc::new(FixtureGenerator))).await;
+    let response = http_request(addr, &get("/tqf/status")).await;
+    let body: serde_json::Value =
+        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap_or("")).expect("JSON body");
+    assert_eq!(body["model"]["loaded"], true, "{body}");
+}
+
+#[tokio::test]
+async fn the_native_memory_endpoint_reports_real_os_numbers() {
+    let addr = spawn_test_server(true).await;
+    let response = http_request(addr, &get("/tqf/memory")).await;
+    let body: serde_json::Value =
+        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap_or("")).expect("JSON body");
+
+    assert!(
+        body["observed"]["resident_bytes"].as_u64().unwrap_or(0) > 0,
+        "resident memory must be a real reading: {body}"
+    );
+    // The per-owner broker breakdown is deliberately absent rather than
+    // fabricated, and the response says so.
+    assert!(
+        body["note"].as_str().unwrap_or_default().contains("broker"),
+        "{body}"
+    );
+}
+
+/// The endpoint must report the backend that is *live*, not the one that
+/// is available: TQKV is opt-in, and a caller reading "tqkv" while BF16
+/// runs would be misled about its own memory.
+#[tokio::test]
+async fn the_native_context_endpoint_reports_the_live_kv_backend() {
+    let addr = spawn_test_server(true).await;
+    let response = http_request(addr, &get("/tqf/context")).await;
+    let body: serde_json::Value =
+        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap_or("")).expect("JSON body");
+
+    assert_eq!(
+        body["kv_backend"], "bf16",
+        "TQKV is opt-in, so an unconfigured server must report bf16: {body}"
+    );
+    assert_eq!(body["selective_attention"], false, "{body}");
+}
+
+#[tokio::test]
+async fn the_native_indexes_endpoint_explains_why_it_is_empty() {
+    let addr = spawn_test_server(true).await;
+    let response = http_request(addr, &get("/tqf/indexes")).await;
+    let body: serde_json::Value =
+        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap_or("")).expect("JSON body");
+
+    assert_eq!(body["indexes"], serde_json::json!([]));
+    assert!(
+        body["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not implemented"),
+        "an empty list must say why: {body}"
+    );
+}
+
+/// `/v1/tqf/metrics` is what the Phase 47 SwiftUI inspector reads, so
+/// adding the spec's `/tqf/metrics` spelling must not break it.
+#[tokio::test]
+async fn both_metrics_paths_serve_the_same_payload() {
+    let addr = spawn_test_server(true).await;
+    for path in ["/tqf/metrics", "/v1/tqf/metrics"] {
+        let response = http_request(addr, &get(path)).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+        assert!(response.contains("resident_bytes"), "{path}: {response}");
+    }
+}

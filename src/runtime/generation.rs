@@ -255,6 +255,19 @@ pub trait Qwen36Generator: Send + Sync {
         Ok(output)
     }
 
+    /// Real token count for a request's rendered prompt.
+    ///
+    /// Anthropic's `count_tokens` endpoint exists so a client can size a
+    /// conversation before sending it, which only helps if the number is
+    /// the tokenizer's rather than an estimate. Defaults to an error so
+    /// an implementation without a tokenizer says so instead of guessing.
+    fn count_prompt_tokens(&self, _request: &NormalizedRequest) -> Result<usize> {
+        Err(
+            ProtocolError::Invalid("token counting is unavailable for this generator".to_string())
+                .into(),
+        )
+    }
+
     /// Whether `generate_streaming` really emits deltas during decode
     /// rather than one chunk at the end. Tests assert against this instead
     /// of guessing from timing.
@@ -528,6 +541,10 @@ impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
     ) -> Result<GeneratedOutput> {
         self.run_generation(request, cancellation, Some(events))
             .await
+    }
+
+    fn count_prompt_tokens(&self, request: &NormalizedRequest) -> Result<usize> {
+        Ok(self.prompt_tokens(request)?.len())
     }
 
     fn streams_incrementally(&self) -> bool {

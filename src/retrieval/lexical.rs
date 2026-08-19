@@ -152,6 +152,13 @@ impl LexicalIndex {
         }
     }
 
+    /// Distinct BM25 terms across the whole index — a cheap measure of
+    /// how much vocabulary a scan actually produced, which is what
+    /// `tqf sync` reports to show the index is real rather than empty.
+    pub fn term_count(&self) -> usize {
+        self.postings.len()
+    }
+
     pub fn document_count(&self) -> usize {
         self.chunks.len()
     }

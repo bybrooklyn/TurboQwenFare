@@ -70,6 +70,7 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .merge(openai::routes())
         .merge(ollama::routes())
+        .merge(anthropic::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,

@@ -137,6 +137,7 @@ pub async fn generate_streaming_with_session(
 fn not_ready_body(message: &str, request: &NormalizedRequest) -> Response {
     match request.protocol {
         ProtocolFlavor::Ollama => ollama_not_ready(message, request.stream),
+        ProtocolFlavor::Anthropic => anthropic_not_ready(message, request.stream),
         _ if request.stream => sse_error(message).into_response(),
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -150,6 +151,23 @@ fn not_ready_body(message: &str, request: &NormalizedRequest) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Anthropic's `{"type": "error", "error": {...}}` envelope. A streaming
+/// request receives it as an SSE `error` event, which is how Anthropic's
+/// own stream reports a mid-flight failure.
+fn anthropic_not_ready(message: &str, stream: bool) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": message},
+    });
+    if stream {
+        return Sse::new(tokio_stream::iter(vec![Ok::<_, Infallible>(
+            Event::default().event("error").data(body.to_string()),
+        )]))
+        .into_response();
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
 /// Ollama's flat `{"error": "..."}` envelope. A streaming request gets it

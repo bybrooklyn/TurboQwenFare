@@ -648,7 +648,7 @@ struct OpenAiFunctionCall {
 }
 
 /// Seconds since the Unix epoch, as OpenAI's `created` field wants.
-pub(crate) fn unix_seconds() -> u64 {
+pub fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

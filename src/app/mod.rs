@@ -1,35 +1,52 @@
 //! Top-level app orchestration: CLI dispatch and the first-run → server
 //! lifecycle (spec Part V section 28).
 
+mod doctor;
+mod open;
 mod serve;
+mod status;
+mod sync;
 
 use crate::cli::{Cli, Command};
 use crate::error::Result;
 
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> Result<std::process::ExitCode> {
     tracing::debug!(?cli, "tqf starting");
+
+    // Speaking MCP means this process is a subprocess of a coding client
+    // with a JSON-RPC transport on stdout. It has to short-circuit
+    // everything else — including config parsing side effects and any
+    // `println!` — before another code path can write to stdout and
+    // corrupt the transport.
+    if cli.mcp_stdio {
+        return run_mcp_stdio().map(|()| std::process::ExitCode::SUCCESS);
+    }
+
     let config = cli.build_config()?;
 
     match &cli.command {
-        Some(Command::Sync { path }) => {
-            tracing::warn!(?path, "tqf sync: not yet implemented (phase 42)");
-            Ok(())
-        }
-        Some(Command::Unsync { path }) => {
-            tracing::warn!(?path, "tqf unsync: not yet implemented (phase 42)");
-            Ok(())
-        }
-        Some(Command::Status) => {
-            println!("tqf status: not yet implemented (phase 2 server skeleton)");
-            Ok(())
-        }
-        Some(Command::Doctor) => {
-            println!("tqf doctor: not yet implemented (phase 36 receipt/index hardening)");
-            Ok(())
-        }
-        Some(Command::Optimize) => run_optimize(),
-        None => run_server_or_gui(cli, config),
+        Some(Command::Sync { path }) => sync::run_sync(path).map(|()| ok()),
+        Some(Command::Unsync { path }) => sync::run_unsync(path).map(|()| ok()),
+        Some(Command::Status) => status::run(&config).map(|()| ok()),
+        Some(Command::Doctor) => doctor::run(&config),
+        Some(Command::Optimize) => run_optimize().map(|()| ok()),
+        None => run_server_or_gui(cli, config).map(|()| ok()),
     }
+}
+
+fn ok() -> std::process::ExitCode {
+    std::process::ExitCode::SUCCESS
+}
+
+/// Serves the Model Context Protocol over stdio (spec §95, §228).
+///
+/// The index is `None`: nothing persists one yet, and spec §44 explicitly
+/// allows the server to work without an index — its data tools then
+/// return ordinary informative results rather than protocol errors.
+fn run_mcp_stdio() -> Result<()> {
+    use std::io::{stdin, stdout, BufReader};
+    crate::mcp::stdio::run_stdio_loop(None, BufReader::new(stdin().lock()), stdout().lock())?;
+    Ok(())
 }
 
 /// spec §98: headless mode runs the server exactly as before, blocking
@@ -40,6 +57,14 @@ pub fn run(cli: Cli) -> Result<()> {
 /// handed to the compiled-in SwiftUI app, per spec §98's "transfer the
 /// main thread to a C-callable Swift entrypoint."
 fn run_server_or_gui(cli: Cli, config: crate::config::Config) -> Result<()> {
+    // `--open` needs the server up *and* its real bound address before it
+    // can write a client config, so it runs the server on a background
+    // thread and waits for the address rather than assuming the default
+    // port.
+    if let Some(client) = cli.open.clone() {
+        let kind = open::parse_client(&client)?;
+        return run_with_client(cli, config, kind);
+    }
     if cli.headless {
         return serve::start(&cli, config);
     }
@@ -75,6 +100,53 @@ fn run_with_gui(cli: Cli, config: crate::config::Config) -> Result<()> {
     // behavior every other macOS app has.
     let _ = server_thread;
     Ok(())
+}
+
+/// Runs the server on a background thread, waits until it actually
+/// answers, then launches the coding client against its real address. The
+/// process exits when the client does, matching spec §224's "server exits
+/// with the tqf process".
+fn run_with_client(
+    cli: Cli,
+    config: crate::config::Config,
+    kind: crate::integrations::config::ClientKind,
+) -> Result<()> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let server_cli = cli.clone();
+    let server =
+        std::thread::spawn(move || serve::start_reporting(&server_cli, config, Some(sender)));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let addr = runtime.block_on(async move {
+        match receiver.await {
+            Ok(addr) if open::wait_until_ready(addr).await => Some(addr),
+            Ok(addr) => {
+                tracing::error!(%addr, "the server bound but never became ready");
+                None
+            }
+            // The sender was dropped: the server thread failed before
+            // binding, and its own error is the useful one.
+            Err(_) => None,
+        }
+    });
+
+    let Some(addr) = addr else {
+        return match server.join() {
+            Ok(result) => result,
+            Err(_) => Err(crate::error::SetupError::ClientLaunch(
+                "the server thread panicked before binding".to_string(),
+            )
+            .into()),
+        };
+    };
+
+    let result = open::launch(&cli, kind, addr);
+    // The server thread has no shutdown handle here; the process exiting
+    // is what stops it, which is the documented behavior.
+    drop(server);
+    result
 }
 
 /// `tqf optimize` (spec §3): today this is phase 10's exit-criteria

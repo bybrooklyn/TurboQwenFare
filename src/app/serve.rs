@@ -36,7 +36,21 @@ const DEV_RESIDENT_STREAMING_ENV: &str = "TQF_DEV_RESIDENT_STREAMING";
 /// developer qualification profile explicit in startup output.
 const DEV_STREAMING_REFERENCE_ENV: &str = "TQF_DEV_STREAMING_REFERENCE";
 
+/// Starts the server, blocking until it shuts down.
+///
+/// `bound_addr` receives the address the server actually bound. Callers
+/// that launch something against this server need the *real* address:
+/// under port fallback it differs from the default, and handing a client
+/// the default would point it at whatever else holds that port.
 pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
+    start_reporting(cli, cli_config, None)
+}
+
+pub fn start_reporting(
+    cli: &Cli,
+    cli_config: Config,
+    bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
+) -> Result<()> {
     let config_path = paths::config_path()?;
     let mut persisted = PersistedConfig::load(&config_path)?;
     apply_cli_overrides(&mut persisted, &cli_config);
@@ -58,7 +72,7 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
              503. Diagnostic use only."
         );
         let runtime = tokio::runtime::Runtime::new()?;
-        return runtime.block_on(run_server(cli, config, false, None, None));
+        return runtime.block_on(run_server(cli, config, false, None, None, bound_addr));
     }
 
     let first_run = flow::run(cli.yes, &setup_broker)?;
@@ -144,6 +158,7 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 true,
                 Some(generator),
                 Some(receipt),
+                bound_addr,
             ));
         }
         if std::env::var(DEV_RESIDENT_STREAMING_ENV).as_deref() == Ok("1") {
@@ -173,6 +188,7 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 true,
                 Some(generator),
                 Some(receipt),
+                bound_addr,
             ));
         }
         if std::env::var(DEV_RESIDENT_REFERENCE_ENV).as_deref() == Ok("1") {
@@ -203,6 +219,7 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 true,
                 Some(generator),
                 Some(receipt),
+                bound_addr,
             ));
         }
         let receipts_dir = paths::receipts_dir()?;
@@ -230,6 +247,7 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
             true,
             Some(generator),
             Some(receipt),
+            bound_addr,
         ));
     }
     // Reaching here means setup ran but produced no installed model, and
@@ -374,10 +392,15 @@ async fn run_server(
     model_installed: bool,
     generator: Option<Arc<dyn Qwen36Generator>>,
     receipt: Option<ModelReceipt>,
+    bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 ) -> Result<()> {
     let bound = bind::resolve_and_bind(config.host.as_deref(), config.port, cli.insecure).await?;
     tracing::info!(addr = %bound.addr, "tqf listening");
     println!("tqf listening on http://{}", bound.addr);
+    if let Some(reporter) = bound_addr {
+        // A closed receiver just means the caller stopped caring.
+        let _ = reporter.send(bound.addr);
+    }
 
     let state = AppState {
         config: Arc::new(config),

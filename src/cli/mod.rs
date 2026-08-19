@@ -64,6 +64,18 @@ pub struct Cli {
     /// key (spec Part IX section 74). Unsafe; opt-in only.
     #[arg(long, global = true)]
     pub insecure: bool,
+
+    /// Speak the Model Context Protocol over stdio instead of starting a
+    /// server (spec §95, §228).
+    ///
+    /// Hidden rather than a listed subcommand: spec §3 fixes the
+    /// user-facing command surface, and this is not something a person
+    /// runs by hand — it is the command `--open` writes into a coding
+    /// client's config so the client can launch it. Adding a visible row
+    /// to a table users read, for a flag only another program uses,
+    /// would make the product look more complicated than it is.
+    #[arg(long, global = true, hide = true)]
+    pub mcp_stdio: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
