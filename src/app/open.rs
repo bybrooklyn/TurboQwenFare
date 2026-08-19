@@ -185,6 +185,103 @@ mod tests {
         assert!(!rendered.contains("11434"), "{rendered}");
     }
 
+    /// Drives the real launch path — `ensure_client_available` through
+    /// `run_to_completion` — against a fake `codex` on PATH, the same
+    /// technique Phase 45 used with `sh`. This is what catches the
+    /// env-var and working-directory plumbing that the config-content
+    /// tests above cannot see.
+    #[test]
+    fn launching_a_client_passes_it_the_config_and_cleans_up_afterwards() {
+        // Deliberately NOT the `tqf-open-{pid}-{n}` shape: that is exactly
+        // what `write_ephemeral_config` generates, and colliding with it
+        // meant its cleanup deleted this test's own fixture.
+        let unique = format!(
+            "tqf-fakeclient-{}-{}",
+            std::process::id(),
+            LAUNCH_TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let fake_bin = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&fake_bin).expect("temp dir");
+
+        // A stand-in that records the environment it was given, so the
+        // test observes what a real client would actually receive.
+        let observed = fake_bin.join("observed.txt");
+        let script = fake_bin.join("codex");
+        let body = format!(
+            "#!/bin/sh\n{{ echo \"CODEX_HOME=$CODEX_HOME\"; pwd; ls; }} > {}\nexit 0\n",
+            observed.display()
+        );
+        std::fs::write(&script, body).expect("write fake client");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let previous_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: guarded by LAUNCH_TEST_LOCK so no other test in this
+        // binary reads or writes PATH concurrently.
+        let _guard = LAUNCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{previous_path}", fake_bin.display()));
+        }
+
+        let binary = ensure_client_available(ClientKind::Codex, |_| false)
+            .expect("the fake client must be found on PATH");
+        let config = build_ephemeral_config(
+            ClientKind::Codex,
+            "http://127.0.0.1:11439/v1",
+            "/bin/tqf",
+            &["--mcp-stdio"],
+        );
+        let written = write_ephemeral_config(&config, &std::env::temp_dir())
+            .expect("writing the ephemeral config must succeed");
+        let config_dir = written.dir.clone();
+        assert!(
+            config_dir.exists(),
+            "the config directory must exist while running"
+        );
+
+        let command = build_launch_command(&binary, &config, &written);
+        let status = run_to_completion(command, written).expect("the fake client must run");
+        assert!(status.success());
+
+        let seen = std::fs::read_to_string(&observed).unwrap_or_else(|error| {
+            panic!(
+                "the client must have run (status {status:?}, script {}, observed {}): {error}\n                 script contents:\n{}",
+                script.display(),
+                observed.display(),
+                std::fs::read_to_string(&script).unwrap_or_default()
+            )
+        });
+        assert!(
+            seen.contains(&config_dir.display().to_string()),
+            "the client must be pointed at the ephemeral config: {seen}"
+        );
+        assert!(
+            seen.contains("config.toml"),
+            "the config file must be present in the client's working directory: {seen}"
+        );
+
+        // Spec §99: "remove the temporary environment/config when it
+        // exits" — on every exit path, not just the happy one.
+        assert!(
+            !config_dir.exists(),
+            "the ephemeral config directory must be deleted after the client exits"
+        );
+
+        unsafe {
+            std::env::set_var("PATH", previous_path);
+        }
+        let _ = std::fs::remove_dir_all(&fake_bin);
+    }
+
+    /// PATH is process-global, so the launch test must not race any other
+    /// test that reads it.
+    static LAUNCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static LAUNCH_TEST_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
     /// `--open` writes an MCP command naming this binary's hidden stdio
     /// entrypoint, so that flag existing is load-bearing rather than
     /// decorative.

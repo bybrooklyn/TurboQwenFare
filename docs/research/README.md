@@ -15,6 +15,11 @@ back up with the how/when/source of each value.
 - [`oracles/`](oracles/) — versioned, token-only outputs from pinned external
   research runtimes. TQF consumes these as qualification inputs; external
   runtime code is never linked or shipped.
+- [`qualification/product-surface-wiring.md`](qualification/product-surface-wiring.md) —
+  not a spec phase: the record of making the qualified engine behave like the
+  product spec §3 describes (the Linux build failure, the absent Ollama
+  surface, real sampling and streaming, and the defects found by running
+  things rather than reading them).
 - [`qualification/`](qualification/) — immutable result records tying a TQF
   commit and canonical source fingerprint to an executed oracle fixture and
   its measured cache/broker evidence, including
