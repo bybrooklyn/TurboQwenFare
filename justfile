@@ -34,6 +34,12 @@ fmt:
 fmt-check:
     cargo fmt --check
 
+# Do NOT run `cargo clippy --fix` here. A fix is derived from the code the
+# compiler can currently see, so on Linux it rewrites `#[cfg(tqf_metal)]`
+# code as though the Metal branch did not exist — it once renamed a
+# parameter that branch uses to `_broker` and broke the macOS build. Apply
+# clippy fixes by hand, and let two-platform CI confirm them.
+#
 # `dead_code` is allowed here and tracked separately by `just dead-code`:
 # large parts of the crate are qualified library code not yet wired into
 # the product, and burying real signals in a gate nobody can pass helps

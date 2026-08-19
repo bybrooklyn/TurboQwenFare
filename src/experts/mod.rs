@@ -502,10 +502,17 @@ impl WholeExpertLfuCache {
     /// enabled and dropping the CPU copy so one expert's Q4_K bytes are
     /// charged to the broker exactly once (Phase 20 module doc's "sole
     /// backing store" variant, spec §50's shared-buffer expert slot shape).
+    ///
+    /// `broker` is used only by the `tqf_metal` branch, which compiles out
+    /// entirely on other targets — so the allow is conditional rather than
+    /// the name being underscore-prefixed. A `cargo clippy --fix` run on
+    /// Linux once renamed it to `_broker`, which broke the macOS build,
+    /// because a fix derived under one cfg cannot see the other.
+    #[cfg_attr(not(tqf_metal), allow(unused_variables))]
     fn stage_expert_values(
         &mut self,
         staged: Vec<(ExpertId, LoadedQwen36Expert)>,
-        _broker: &MemoryBroker,
+        broker: &MemoryBroker,
     ) -> Result<Vec<(ExpertId, ExpertValue)>> {
         #[cfg(tqf_metal)]
         {

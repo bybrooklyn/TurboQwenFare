@@ -48,6 +48,13 @@ or passes; run `just smoke-ollama` against a live server before claiming an endp
 and do not batch phases into one commit, because six exit gates checked as one is how the
 protocol surface went missing in the first place.
 
+One platform-specific trap worth stating outright: **never run `cargo clippy --fix` in this
+crate.** A fix is derived from the code the compiler can currently see, so running it on
+Linux rewrites `#[cfg(tqf_metal)]` code as though the Metal branch did not exist. It has
+already renamed a parameter that branch actually uses to `_broker`, breaking the macOS build
+while Linux stayed green. Apply clippy findings by hand and let CI's macOS lane confirm
+them.
+
 Implementation coverage now extends through the Phase 18 reference/bounded baseline: BF16 virtual-GQA
 full attention, exact MoE routing/shared/routed computation, a 40-layer decode graph, normalized
 OpenAI streaming adapters, canonical download/conversion/receipt startup, and a whole-expert cache
