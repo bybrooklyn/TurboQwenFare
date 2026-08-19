@@ -60,9 +60,22 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
 /// `/v1/tqf/metrics` stays as an alias because the Phase 47 SwiftUI
 /// inspector already reads it; `/tqf/metrics` is the spec's own spelling
 /// and what new callers should use.
+/// The only endpoint that must answer before any credential is
+/// presented: `bind::probe_health` uses it to tell an existing tqf from
+/// some other process squatting on the port, which happens during bind,
+/// before a key could be supplied. It reports liveness and version only.
+pub fn public_routes() -> Router<AppState> {
+    Router::new().route("/health", get(health))
+}
+
+/// Native diagnostics (spec §211). These sit behind the API-key layer:
+/// §211 requires that "sensitive project paths should not be exposed to
+/// non-loopback clients without authentication", and `/tqf/status`
+/// reports the model container path, source revision, and the memory and
+/// context configuration. Loopback binds mint no key, so local tools —
+/// including the GUI inspector — are unaffected.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/health", get(health))
         .route("/v1/tqf/metrics", get(metrics))
         .route("/tqf/metrics", get(metrics))
         .route("/tqf/status", get(status))

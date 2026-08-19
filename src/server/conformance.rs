@@ -66,6 +66,10 @@ enum Expect {
     LastLineEq(&'static str, &'static str),
     /// At least this many NDJSON lines / SSE `data:` payloads.
     MinLines(usize),
+    /// Anthropic streaming: every `content_block_delta` names a delta
+    /// type consistent with the `content_block_start` that opened its
+    /// index, and no block receives a delta before it is opened.
+    TypedBlockDeltas,
 }
 
 // ---------------------------------------------------------------- helpers
@@ -240,6 +244,61 @@ fn check(fixture: &Fixture, raw: &str) -> Vec<String> {
                         }
                     }
                     None => fail("response had no payload lines".to_string()),
+                }
+            }
+            Expect::TypedBlockDeltas => {
+                use std::collections::HashMap;
+                let mut open: HashMap<u64, String> = HashMap::new();
+                for line in payload_lines(body) {
+                    let Ok(value) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+                    let index = value.get("index").and_then(Value::as_u64);
+                    match value.get("type").and_then(Value::as_str) {
+                        Some("content_block_start") => {
+                            if let (Some(index), Some(kind)) = (
+                                index,
+                                value
+                                    .get("content_block")
+                                    .and_then(|b| b.get("type"))
+                                    .and_then(Value::as_str),
+                            ) {
+                                open.insert(index, kind.to_string());
+                            }
+                        }
+                        Some("content_block_delta") => {
+                            let Some(index) = index else { continue };
+                            let delta_type = value
+                                .get("delta")
+                                .and_then(|d| d.get("type"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            match open.get(&index) {
+                                None => fail(format!(
+                                    "delta on block {index} before any content_block_start"
+                                )),
+                                Some(block) => {
+                                    let expected = match delta_type {
+                                        "text_delta" => "text",
+                                        "thinking_delta" => "thinking",
+                                        "input_json_delta" => "tool_use",
+                                        other => other,
+                                    };
+                                    if block != expected {
+                                        fail(format!(
+                                            "`{delta_type}` emitted into a `{block}` block"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Some("content_block_stop") => {
+                            if let Some(index) = index {
+                                open.remove(&index);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Expect::MinLines(min) => {
@@ -621,6 +680,27 @@ const ANTHROPIC: &[Fixture] = &[
         body: r#"{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"hi"}]}"#,
         expect: &[Expect::Status(200), Expect::Field("input_tokens")],
     },
+    // The FixtureGenerator emits a tool call, so `stop_reason` is
+    // `tool_use` — which obliges the body to carry the tool_use block the
+    // client is supposed to execute. Claiming the stop reason without the
+    // block leaves a client waiting for a call it was never given.
+    Fixture {
+        spec: "§72",
+        name: "a tool_use stop reason comes with a tool_use content block",
+        method: Method::Post,
+        path: "/v1/messages",
+        body: r#"{"model":"qwen3.6-35b-a3b","max_tokens":64,"messages":[{"role":"user","content":"list files"}],"tools":[{"name":"list_files","description":"list","input_schema":{"type":"object"}}]}"#,
+        expect: &[
+            Expect::Status(200),
+            Expect::FieldEq("stop_reason", r#""tool_use""#),
+            Expect::FieldEq("content.1.type", r#""tool_use""#),
+            Expect::Field("content.1.id"),
+            Expect::FieldEq("content.1.name", r#""list_files""#),
+            // `input` is a parsed object in Anthropic's shape, never a
+            // JSON string.
+            Expect::Field("content.1.input"),
+        ],
+    },
     Fixture {
         spec: "§72/§71",
         name: "streaming uses Anthropic's own event names",
@@ -633,6 +713,24 @@ const ANTHROPIC: &[Fixture] = &[
             Expect::BodyContains("content_block_delta"),
             Expect::BodyContains("message_stop"),
             Expect::BodyLacks("chat.completion.chunk"),
+        ],
+    },
+    // A typed delta must arrive inside a block opened with the matching
+    // type. Qwen3.6's prompt always opens `<think>`, so a stream that
+    // emitted `thinking_delta` into a block started as `{"type":"text"}`
+    // broke a real SDK client on the first delta of every response.
+    Fixture {
+        spec: "§72",
+        name: "a thinking delta is not emitted into a text block",
+        method: Method::Post,
+        path: "/v1/messages",
+        body: r#"{"model":"qwen3.6-35b-a3b","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        expect: &[
+            Expect::Status(200),
+            Expect::BodyContains("content_block_start"),
+            // Every opened block is closed before the message ends.
+            Expect::BodyContains("content_block_stop"),
+            Expect::TypedBlockDeltas,
         ],
     },
 ];

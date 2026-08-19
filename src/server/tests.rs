@@ -926,3 +926,113 @@ async fn both_metrics_paths_serve_the_same_payload() {
         assert!(response.contains("resident_bytes"), "{path}: {response}");
     }
 }
+
+/// Emits a reasoning delta before its text, the way a real Qwen3.6
+/// generation does — its prompt always opens `<think>`, so the first
+/// events of every response are reasoning. The other doubles never emit
+/// `Reasoning`, which is why a bug that broke exactly that case survived.
+struct ReasoningGenerator;
+
+#[async_trait::async_trait]
+impl Qwen36Generator for ReasoningGenerator {
+    async fn generate(
+        &self,
+        _request: NormalizedRequest,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::error::Result<GeneratedOutput> {
+        GeneratedOutput::from_model_text("the answer")
+    }
+
+    async fn generate_streaming(
+        &self,
+        _request: NormalizedRequest,
+        _cancellation: tokio_util::sync::CancellationToken,
+        events: tokio::sync::mpsc::Sender<crate::runtime::stream_decoder::StreamEvent>,
+    ) -> crate::error::Result<GeneratedOutput> {
+        use crate::runtime::stream_decoder::StreamEvent;
+        let _ = events
+            .send(StreamEvent::Reasoning("weighing it up".to_string()))
+            .await;
+        let _ = events
+            .send(StreamEvent::TextDelta("the answer".to_string()))
+            .await;
+        GeneratedOutput::from_model_text("the answer")
+    }
+
+    fn streams_incrementally(&self) -> bool {
+        true
+    }
+}
+
+/// Regression (spec §72): reasoning was streamed as a `thinking_delta`
+/// into the index-0 block, which was unconditionally opened as
+/// `{"type":"text"}`. A real Anthropic SDK client raises on a delta whose
+/// type does not match its block — and since Qwen3.6 always opens
+/// `<think>`, that was the first delta of every streamed response.
+#[tokio::test]
+async fn anthropic_streams_reasoning_in_its_own_thinking_block() {
+    let addr = spawn_test_server_with(true, Some(Arc::new(ReasoningGenerator))).await;
+
+    let response = http_request(
+        addr,
+        &post_json(
+            "/v1/messages",
+            r#"{"model":"qwen3.6-35b-a3b","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    )
+    .await;
+
+    let events: Vec<serde_json::Value> = sse_payloads(&response)
+        .iter()
+        .filter_map(|p| serde_json::from_str(p).ok())
+        .collect();
+
+    // Walk the stream the way a client does: a delta is only legal inside
+    // an open block of the matching type.
+    let mut open: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut saw_thinking_delta = false;
+    let mut saw_text_delta = false;
+
+    for event in &events {
+        let index = event.get("index").and_then(serde_json::Value::as_u64);
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("content_block_start") => {
+                let kind = event["content_block"]["type"].as_str().unwrap_or_default();
+                open.insert(index.unwrap(), kind.to_string());
+            }
+            Some("content_block_delta") => {
+                let index = index.expect("a delta must name its block");
+                let delta_type = event["delta"]["type"].as_str().unwrap_or_default();
+                let block = open
+                    .get(&index)
+                    .unwrap_or_else(|| panic!("delta on block {index} before it was opened"));
+                match delta_type {
+                    "thinking_delta" => {
+                        saw_thinking_delta = true;
+                        assert_eq!(block, "thinking", "thinking delta in a {block} block");
+                    }
+                    "text_delta" => {
+                        saw_text_delta = true;
+                        assert_eq!(block, "text", "text delta in a {block} block");
+                    }
+                    other => panic!("unexpected delta type {other}"),
+                }
+            }
+            Some("content_block_stop") => {
+                open.remove(&index.expect("a stop must name its block"));
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_thinking_delta,
+        "no thinking delta was streamed: {response}"
+    );
+    assert!(saw_text_delta, "no text delta was streamed: {response}");
+    assert!(
+        open.is_empty(),
+        "content blocks left unterminated: {open:?}"
+    );
+    assert!(response.contains("message_stop"));
+}

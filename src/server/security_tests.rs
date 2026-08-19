@@ -199,3 +199,54 @@ async fn oversized_header_value_is_rejected_not_hung() {
         "unexpected response shape: {response:.200}"
     );
 }
+
+/// Regression (spec §74, §211): the native `/tqf/*` diagnostics were
+/// merged outside the protected sub-router, so on a `0.0.0.0` bind they
+/// answered with no API key — and `/tqf/status` reports the model
+/// container path, source revision, and memory/context configuration.
+/// Only pre-credential liveness probes belong in the unauthenticated
+/// tier.
+#[tokio::test]
+async fn native_diagnostics_require_the_api_key_while_liveness_probes_do_not() {
+    let addr = super::tests::spawn_test_server_with_api_key(true, "secret-key").await;
+
+    for path in [
+        "/tqf/status",
+        "/tqf/memory",
+        "/tqf/context",
+        "/tqf/indexes",
+        "/tqf/metrics",
+        "/v1/tqf/metrics",
+    ] {
+        let response = super::tests::http_request(addr, &super::tests::get(path)).await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "{path} must require the API key, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+        assert!(
+            !response.contains("container"),
+            "{path} leaked the model container path without a key"
+        );
+    }
+
+    // Liveness must still answer unauthenticated: `bind::probe_health`
+    // calls it during bind, before any key could be presented.
+    for path in ["/health", "/", "/api/version"] {
+        let response = super::tests::http_request(addr, &super::tests::get(path)).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "{path} must answer without a key, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+    }
+
+    // And with the key, the diagnostics work.
+    let authorized = super::tests::http_request(
+        addr,
+        "GET /tqf/status HTTP/1.1\r\nHost: localhost\r\n\
+         Authorization: Bearer secret-key\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(authorized.starts_with("HTTP/1.1 200"), "{authorized}");
+}

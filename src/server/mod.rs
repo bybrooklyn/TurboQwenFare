@@ -69,17 +69,24 @@ pub struct AppState {
 /// Merging the Ollama routes at this top level is the path of least
 /// resistance and would silently expose generation with no auth.
 pub fn build_router(state: AppState) -> Router {
+    // Everything that generates, embeds, or describes what is installed.
+    // The native `/tqf/*` diagnostics belong here too: `/tqf/status`
+    // reports the container path and source revision, which §211 says
+    // must not reach a non-loopback client unauthenticated.
     let protected = Router::new()
         .merge(openai::routes())
         .merge(ollama::routes())
         .merge(anthropic::routes())
+        .merge(tqf_api::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,
         ));
 
+    // Pre-credential liveness probes only. Each leaks a fixed string or a
+    // version number and nothing about the model or the machine.
     Router::new()
-        .merge(tqf_api::routes())
+        .merge(tqf_api::public_routes())
         .merge(ollama::unauthenticated_routes())
         .merge(protected)
         .with_state(state)

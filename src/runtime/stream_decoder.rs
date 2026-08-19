@@ -203,8 +203,21 @@ impl IncrementalOutputDecoder {
                 }
             }
 
-            // A completed stop sequence ends the generation at the match.
-            if let Some((at, _)) = self.first_stop_match() {
+            // Whichever delimiter appears first in the buffer wins.
+            // Checking for a stop match unconditionally first would emit
+            // everything before it as text — including a whole
+            // `<tool_call>` block sitting between here and the stop.
+            let stop_at = self.first_stop_match().map(|(at, _)| at);
+            let tool_at = self.pending.find(TOOL_CALL_START);
+
+            let stop_is_first = match (stop_at, tool_at) {
+                (Some(stop), Some(tool)) => stop < tool,
+                (Some(_), None) => true,
+                _ => false,
+            };
+
+            if stop_is_first {
+                let at = stop_at.expect("stop_is_first implies a stop match");
                 let emit: String = self.pending[..at].into();
                 if !emit.is_empty() {
                     events.push(StreamEvent::TextDelta(emit));
@@ -214,7 +227,7 @@ impl IncrementalOutputDecoder {
                 return Ok(());
             }
 
-            if let Some(at) = self.pending.find(TOOL_CALL_START) {
+            if let Some(at) = tool_at {
                 let emit: String = self.pending[..at].into();
                 if !emit.is_empty() {
                     events.push(StreamEvent::TextDelta(emit));
@@ -492,6 +505,29 @@ mod tests {
     /// A generation that runs out of budget mid-block reports `Length` and
     /// drops the partial rather than leaking it — a stream cannot retract
     /// bytes, so it cannot raise the protocol error the batch path does.
+    /// Regression: `drain` tested for a stop match before a tool-call
+    /// opener, so when both landed in one buffer with the tool call first,
+    /// everything up to the stop — including the raw `<tool_call>` markup —
+    /// was emitted as visible text. Whichever delimiter comes first in the
+    /// buffer has to win.
+    #[test]
+    fn a_stop_after_a_tool_call_does_not_leak_the_markup_as_text() {
+        let (events, _) = run(
+            &[
+                r#"</think>before <tool_call>{"name":"ls","arguments":{}}</tool_call> after STOP tail"#,
+            ],
+            &["STOP"],
+        );
+        let text = visible(&events);
+        assert!(
+            !text.contains("tool_call"),
+            "raw tool-call markup leaked as visible text: {text:?}"
+        );
+        assert!(!text.contains("arguments"), "tool JSON leaked: {text:?}");
+        assert_eq!(text, "before  after ");
+        assert_eq!(tool_calls(&events).len(), 1);
+    }
+
     #[test]
     fn an_unterminated_tool_call_reports_length_and_leaks_nothing() {
         let (events, finish) = run(&[r#"</think>hi <tool_call>{"name":"l"#], &[]);

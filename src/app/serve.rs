@@ -394,7 +394,14 @@ async fn run_server(
     receipt: Option<ModelReceipt>,
     bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 ) -> Result<()> {
-    let bound = bind::resolve_and_bind(config.host.as_deref(), config.port, cli.insecure).await?;
+    // `--port` on this run is explicit; a port that only came from the
+    // persisted config is a preference that may still fall back.
+    let port_request = match (cli.port, config.port) {
+        (Some(explicit), _) => bind::PortRequest::Explicit(explicit),
+        (None, Some(remembered)) => bind::PortRequest::Preferred(remembered),
+        (None, None) => bind::PortRequest::Default,
+    };
+    let bound = bind::resolve_and_bind(config.host.as_deref(), port_request, cli.insecure).await?;
     tracing::info!(addr = %bound.addr, "tqf listening");
     println!("tqf listening on http://{}", bound.addr);
     if let Some(reporter) = bound_addr {

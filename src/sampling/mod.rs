@@ -249,8 +249,20 @@ fn draw(probabilities: &[Candidate], rng: &mut Xoshiro256PlusPlus) -> u32 {
 
 /// Descending order with NaN sorted last, so a NaN logit can never win a
 /// comparison and be selected.
+///
+/// Mapping an incomparable pair to `Equal` is not a valid total order, and
+/// `sort_unstable_by` may place NaN anywhere under an inconsistent
+/// comparator — at real vocabulary sizes it reliably lands at index 0,
+/// where `draw`'s non-finite-total fallback then returns it. NaN is
+/// therefore ordered explicitly rather than left to `unwrap_or`.
 fn compare_desc(a: f32, b: f32) -> std::cmp::Ordering {
-    b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        // `a` is NaN: it sorts after `b` in a descending order.
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => b.partial_cmp(&a).expect("neither value is NaN"),
+    }
 }
 
 /// xoshiro256++ — small, fast, and with a long enough period that a
@@ -405,6 +417,28 @@ mod tests {
     /// A NaN logit must never be selected. `compare_desc` sorts NaN last
     /// and `top_logit_candidates`' `>` comparison is false against NaN, so
     /// both paths agree.
+    /// Regression: the original comparator mapped an incomparable pair to
+    /// `Ordering::Equal`, which is not a valid total order. `sort_unstable_by`
+    /// is free to place NaN anywhere under an inconsistent comparator, and at
+    /// realistic vocabulary sizes it lands at index 0 — where `draw`'s
+    /// non-finite-total fallback then returns it. The four-element test below
+    /// passed only because four elements are too few to trigger it.
+    #[test]
+    fn a_nan_logit_never_wins_at_realistic_vocabulary_size() {
+        let mut values: Vec<f32> = (0..4096).map(|i| i as f32 * 0.001).collect();
+        values[2000] = f32::NAN;
+        let expected = top_logit_candidates(&values)[0].token;
+
+        let mut sampler = Sampler::new(&stochastic(1.0, 17));
+        for _ in 0..200 {
+            let token = sampler.select(&values, &[], expected);
+            assert!(
+                !values[token as usize].is_nan(),
+                "selected the NaN token {token}"
+            );
+        }
+    }
+
     #[test]
     fn a_nan_logit_is_never_selected() {
         let values = vec![1.0, f32::NAN, 3.0, f32::NAN];

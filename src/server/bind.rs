@@ -24,9 +24,27 @@ pub struct BoundServer {
     pub api_key: Option<String>,
 }
 
+/// How firmly the caller wants a particular port.
+///
+/// The distinction is load-bearing. An explicit `--port` must be bound
+/// exactly, because a client was told to use it and silently relocating
+/// the server breaks precisely the caller who was most specific. A port
+/// remembered from a previous run is only a preference: replaying it with
+/// explicit-strictness would mean that using `--port` once permanently
+/// disabled the 11434→11435 fallback for every later bare `tqf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortRequest {
+    /// No preference: the default port, with fallback.
+    Default,
+    /// Remembered from a previous run: try it, fall back if it is busy.
+    Preferred(u16),
+    /// Named on this run's command line: bind it or fail.
+    Explicit(u16),
+}
+
 pub async fn resolve_and_bind(
     host: Option<&str>,
-    requested_port: Option<u16>,
+    requested_port: PortRequest,
     insecure: bool,
 ) -> Result<BoundServer> {
     let ip: IpAddr = match host {
@@ -36,11 +54,22 @@ pub async fn resolve_and_bind(
             .map_err(|_| ConfigError::InvalidHost(h.to_string()))?,
     };
 
-    // An explicitly requested port is never silently moved: a client was
-    // told to use it, so relocating the server would break exactly the
-    // caller who was most specific about what they wanted.
     let (listener, _port) = match requested_port {
-        Some(requested) => {
+        // A remembered preference still falls back, because nobody was
+        // told to expect it on this run.
+        PortRequest::Preferred(preferred) => {
+            match TcpListener::bind(SocketAddr::new(ip, preferred)).await {
+                Ok(listener) => (listener, preferred),
+                Err(_) => {
+                    tracing::warn!(
+                        preferred,
+                        "the remembered port is busy; falling back to the default"
+                    );
+                    bind_with_fallback(ip).await?
+                }
+            }
+        }
+        PortRequest::Explicit(requested) => {
             let listener = TcpListener::bind(SocketAddr::new(ip, requested))
                 .await
                 .map_err(|err| {
@@ -54,7 +83,7 @@ pub async fn resolve_and_bind(
                 })?;
             (listener, requested)
         }
-        None => bind_with_fallback(ip).await?,
+        PortRequest::Default => bind_with_fallback(ip).await?,
     };
     // Ask the socket, don't assume: with `--port 0` the caller wants an
     // OS-assigned ephemeral port, and reporting the *requested* number
@@ -218,7 +247,7 @@ mod tests {
     /// through the 11434/11435 fallback pair.
     #[tokio::test]
     async fn an_explicit_port_is_bound_exactly_and_never_falls_back() {
-        let bound = resolve_and_bind(Some("127.0.0.1"), Some(0), false)
+        let bound = resolve_and_bind(Some("127.0.0.1"), PortRequest::Explicit(0), false)
             .await
             .expect("binding an ephemeral port must succeed");
         assert_ne!(bound.addr.port(), DEFAULT_PORT);
@@ -238,7 +267,8 @@ mod tests {
         let squatter = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let occupied = squatter.local_addr().unwrap().port();
 
-        let result = resolve_and_bind(Some("127.0.0.1"), Some(occupied), false).await;
+        let result =
+            resolve_and_bind(Some("127.0.0.1"), PortRequest::Explicit(occupied), false).await;
 
         let error = result.err().expect("an occupied explicit port must fail");
         let message = error.to_string();
@@ -257,7 +287,8 @@ mod tests {
     #[tokio::test]
     async fn a_non_loopback_bind_requires_a_key_unless_insecure() {
         // 0.0.0.0 is bindable in any environment that can bind loopback.
-        let Ok(bound) = resolve_and_bind(Some("0.0.0.0"), Some(0), false).await else {
+        let Ok(bound) = resolve_and_bind(Some("0.0.0.0"), PortRequest::Explicit(0), false).await
+        else {
             return; // sandbox refuses non-loopback binds; nothing to assert
         };
         assert!(
@@ -265,7 +296,7 @@ mod tests {
             "a non-loopback bind must require an API key"
         );
 
-        let insecure = resolve_and_bind(Some("0.0.0.0"), Some(0), true)
+        let insecure = resolve_and_bind(Some("0.0.0.0"), PortRequest::Explicit(0), true)
             .await
             .expect("insecure non-loopback bind must succeed");
         assert!(
@@ -282,5 +313,45 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         assert_eq!(identify_occupant(addr).await, Occupant::Unknown);
+    }
+
+    /// Regression: `--port` was written into the persisted config and
+    /// then replayed as an *explicit* request on every later run, so
+    /// using the flag once permanently disabled the 11434→11435 fallback
+    /// — and turned a busy port into a hard startup failure for a user
+    /// who had not asked for that port on this run.
+    #[tokio::test]
+    async fn a_remembered_port_falls_back_while_an_explicit_one_does_not() {
+        let squatter = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied = squatter.local_addr().unwrap().port();
+
+        // Remembered: busy is not fatal, it just moves.
+        let preferred =
+            resolve_and_bind(Some("127.0.0.1"), PortRequest::Preferred(occupied), false)
+                .await
+                .expect("a remembered port must fall back rather than fail");
+        assert_ne!(preferred.addr.port(), occupied);
+
+        // Explicit: busy is an error, because a client was told this port.
+        let explicit =
+            resolve_and_bind(Some("127.0.0.1"), PortRequest::Explicit(occupied), false).await;
+        assert!(
+            explicit.is_err(),
+            "an explicitly requested busy port must fail rather than relocate"
+        );
+    }
+
+    /// A free remembered port is still honored — falling back is only for
+    /// when it is unavailable.
+    #[tokio::test]
+    async fn a_free_remembered_port_is_used_as_is() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let bound = resolve_and_bind(Some("127.0.0.1"), PortRequest::Preferred(free), false)
+            .await
+            .expect("a free remembered port must bind");
+        assert_eq!(bound.addr.port(), free);
     }
 }

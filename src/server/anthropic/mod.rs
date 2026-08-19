@@ -62,6 +62,13 @@ struct MessagesRequest {
     top_k: Option<u32>,
     #[serde(default)]
     stop_sequences: Vec<String>,
+    /// Anthropic's tool shape matches OpenAI's function schema closely
+    /// enough that the shared normalizer handles both. Without this
+    /// field the definitions were silently discarded, so the model was
+    /// never told the tools existed while `stop_reason` could still
+    /// claim `tool_use`.
+    #[serde(default)]
+    tools: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +158,29 @@ fn usage(output: &GeneratedOutput) -> Value {
 /// is a 400, so the caller wraps it, and threading a whole
 /// `axum::Response` through the `Err` arm makes the `Result` large enough
 /// to be worth avoiding on a per-request path.
+/// Anthropic declares a tool as `{name, description, input_schema}`;
+/// the shared normalizer expects OpenAI's `{type:"function", function:
+/// {name, description, parameters}}`. Translating here keeps one
+/// normalizer rather than two nearly-identical ones.
+fn anthropic_tools_as_function_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.get("name").cloned().unwrap_or(Value::Null),
+                    "description": tool.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": tool
+                        .get("input_schema")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                },
+            })
+        })
+        .collect()
+}
+
 fn normalize(req: MessagesRequest) -> std::result::Result<NormalizedRequest, String> {
     model_id::resolve(req.model.as_deref())?;
     let Some(max_tokens) = req.max_tokens else {
@@ -211,6 +241,8 @@ fn normalize(req: MessagesRequest) -> std::result::Result<NormalizedRequest, Str
 
     let mut normalized = NormalizedRequest::new(ProtocolFlavor::Anthropic, messages, req.stream);
     normalized.sampling = sampling;
+    normalized.tools =
+        crate::server::openai::normalize_tools(anthropic_tools_as_function_tools(&req.tools))?;
     Ok(normalized)
 }
 
@@ -228,17 +260,162 @@ async fn messages(State(state): State<AppState>, Json(req): Json<MessagesRequest
     }
 }
 
+/// Per-response id. A bare timestamp collides for every request inside
+/// the same second, which matters to clients that key state by id — the
+/// same defect the OpenAI adapter's `response_id` carries a counter to
+/// avoid.
+/// Which kind of content block is currently open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Text,
+    Thinking,
+    ToolUse,
+}
+
+impl BlockKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Thinking => "thinking",
+            Self::ToolUse => "tool_use",
+        }
+    }
+}
+
+/// Tracks Anthropic's typed content blocks across a stream: opens one
+/// lazily when the first delta of a kind arrives, closes it when the kind
+/// changes, and advances the block index — which is what makes a stream
+/// that mixes reasoning, text, and tool calls parse in a real SDK client.
+#[derive(Default)]
+struct BlockWriter {
+    open: Option<BlockKind>,
+    index: usize,
+}
+
+impl BlockWriter {
+    fn start(&mut self, kind: BlockKind, block: Value) -> Vec<Result<Event, Infallible>> {
+        let mut events = self.close_open();
+        if events.is_empty() && self.open.is_some() {
+            unreachable!("close_open always emits when a block is open");
+        }
+        events.push(sse(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": self.index,
+                "content_block": block,
+            }),
+        ));
+        self.open = Some(kind);
+        events
+    }
+
+    fn delta(&mut self, kind: BlockKind, delta: Value) -> Vec<Result<Event, Infallible>> {
+        let mut events = if self.open == Some(kind) {
+            Vec::new()
+        } else {
+            let block = match kind {
+                BlockKind::Text => serde_json::json!({"type": "text", "text": ""}),
+                BlockKind::Thinking => serde_json::json!({"type": "thinking", "thinking": ""}),
+                BlockKind::ToolUse => serde_json::json!({"type": "tool_use"}),
+            };
+            self.start(kind, block)
+        };
+        events.push(sse(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": self.index,
+                "delta": delta,
+            }),
+        ));
+        events
+    }
+
+    fn tool_use(
+        &mut self,
+        call: &crate::runtime::generation::GeneratedToolCall,
+    ) -> Vec<Result<Event, Infallible>> {
+        let mut events = self.start(
+            BlockKind::ToolUse,
+            serde_json::json!({
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": {},
+            }),
+        );
+        events.push(sse(
+            "content_block_delta",
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": self.index,
+                "delta": {"type": "input_json_delta", "partial_json": call.arguments_json},
+            }),
+        ));
+        events.extend(self.close_open());
+        events
+    }
+
+    fn close_open(&mut self) -> Vec<Result<Event, Infallible>> {
+        let Some(_) = self.open.take() else {
+            return Vec::new();
+        };
+        let stop = sse(
+            "content_block_stop",
+            serde_json::json!({"type": "content_block_stop", "index": self.index}),
+        );
+        self.index += 1;
+        vec![stop]
+    }
+}
+
 fn message_id() -> String {
-    format!("msg_tqf_{:x}", crate::server::openai::unix_seconds())
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "msg_tqf_{:x}{:x}",
+        crate::server::openai::unix_seconds(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Anthropic represents a tool call as a `tool_use` content block whose
+/// `input` is the parsed argument object, not a JSON string.
+fn tool_use_blocks(output: &GeneratedOutput) -> Vec<Value> {
+    output
+        .tool_calls
+        .iter()
+        .map(|call| {
+            serde_json::json!({
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": serde_json::from_str::<Value>(&call.arguments_json)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            })
+        })
+        .collect()
 }
 
 fn message_object(output: &GeneratedOutput) -> Value {
+    // Without the tool_use blocks the body claimed `stop_reason:
+    // "tool_use"` while carrying no tool call for the client to execute.
+    let mut content = Vec::new();
+    if !output.text.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": output.text}));
+    }
+    content.extend(tool_use_blocks(output));
+    if content.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": ""}));
+    }
+
     serde_json::json!({
         "id": message_id(),
         "type": "message",
         "role": "assistant",
         "model": CANONICAL_MODEL_ID,
-        "content": [{"type": "text", "text": output.text}],
+        "content": content,
         "stop_reason": stop_reason(output.finish_reason),
         "stop_sequence": Value::Null,
         "usage": usage(output),
@@ -261,31 +438,21 @@ fn stream_messages(state: AppState, request: NormalizedRequest) -> Sse<Anthropic
     let id = message_id();
 
     tokio::spawn(async move {
-        let preamble = vec![
-            sse(
-                "message_start",
-                serde_json::json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": CANONICAL_MODEL_ID,
-                        "content": [],
-                        "stop_reason": Value::Null,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
-                    },
-                }),
-            ),
-            sse(
-                "content_block_start",
-                serde_json::json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                }),
-            ),
-        ];
+        let preamble = vec![sse(
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": CANONICAL_MODEL_ID,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            }),
+        )];
         for event in preamble {
             if sender.send(event).await.is_err() {
                 cancellation.cancel();
@@ -301,33 +468,38 @@ fn stream_messages(state: AppState, request: NormalizedRequest) -> Sse<Anthropic
                 .await
         });
 
+        // Anthropic's content blocks are typed and must be opened before
+        // any delta and closed before the next block opens. Emitting a
+        // `thinking_delta` against a block started as `{"type":"text"}`
+        // makes a real SDK client raise on the first delta — and since the
+        // Qwen3.6 prompt always opens `<think>`, that is every streamed
+        // response. So the block is opened lazily, by the first event that
+        // needs one, and reopened whenever the kind changes.
+        let mut blocks = BlockWriter::default();
+
         loop {
             tokio::select! {
                 event = model_rx.recv() => {
                     let Some(event) = event else { break };
                     let rendered = match event {
-                        StreamEvent::TextDelta(text) => sse(
-                            "content_block_delta",
-                            serde_json::json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": text},
-                            }),
+                        StreamEvent::TextDelta(text) => blocks.delta(
+                            BlockKind::Text,
+                            serde_json::json!({"type": "text_delta", "text": text}),
                         ),
-                        // Anthropic's own name for reasoning deltas.
-                        StreamEvent::Reasoning(text) => sse(
-                            "content_block_delta",
-                            serde_json::json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "thinking_delta", "thinking": text},
-                            }),
+                        StreamEvent::Reasoning(text) => blocks.delta(
+                            BlockKind::Thinking,
+                            serde_json::json!({"type": "thinking_delta", "thinking": text}),
                         ),
-                        StreamEvent::ToolCall(_) => continue,
+                        // A tool call arrives already complete, so its
+                        // block opens, streams its arguments as one
+                        // `input_json_delta`, and closes immediately.
+                        StreamEvent::ToolCall(call) => blocks.tool_use(&call),
                     };
-                    if sender.send(rendered).await.is_err() {
-                        cancellation.cancel();
-                        return;
+                    for event in rendered {
+                        if sender.send(event).await.is_err() {
+                            cancellation.cancel();
+                            return;
+                        }
                     }
                 }
                 _ = sender.closed() => {
@@ -337,12 +509,17 @@ fn stream_messages(state: AppState, request: NormalizedRequest) -> Sse<Anthropic
             }
         }
 
+        // Whatever block is still open has to be closed before
+        // `message_delta`, or the client sees an unterminated block.
+        for event in blocks.close_open() {
+            if sender.send(event).await.is_err() {
+                cancellation.cancel();
+                return;
+            }
+        }
+
         let tail = match generation.await {
             Ok(Ok(output)) => vec![
-                sse(
-                    "content_block_stop",
-                    serde_json::json!({"type": "content_block_stop", "index": 0}),
-                ),
                 sse(
                     "message_delta",
                     serde_json::json!({
