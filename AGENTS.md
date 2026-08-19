@@ -450,6 +450,34 @@ Phases 27-28 land the first long-context (TQKV) work:
   in this environment, and no "supported configuration action" exists
   yet to wire through the inspector (both honestly noted).
   `docs/research/qualification/phase-47-ui-refinement.md`.
+- **Phase 48 (vision encoder):** `src/vision/` — a from-scratch CLIP-style
+  ViT encoder (1152 hidden, 16 heads, 27 layers, 4304 feed-forward) plus
+  Qwen3-VL's `qwen3vl_merger` projector, for the pinned
+  `mmproj-Qwen3.6-35B-A3B-Q8_0.gguf` sidecar (previously pinned, never
+  read until this phase). Every architectural fact — dual summed patch
+  convs, patches reordered into 2x2-merge-block-major order *before*
+  bias/position-embedding add and before all 27 layers (not just at a
+  final reshape), 2D vision M-RoPE's exact frequency/pairing scheme,
+  bilinear `align_corners` position-table resize — was derived from real
+  llama.cpp source (`tools/mtmd/models/qwen3vl.cpp`,
+  `ggml-cpu/ops.cpp`'s `ggml_mrope_cache_init`/`rotate_pairs`), read but
+  not linked. Validated against a real `llama-mtmd-debug` oracle run on
+  the real pinned checkpoint (96x96 synthetic image), matching the
+  oracle's own captured intermediate trace at every one of 8 checkpoints
+  through the full 27-layer pipeline (e.g. final merger output: oracle
+  sum 17.6264 vs TQF 17.7014) — agreement within ordinary float
+  non-associativity, the same class of finding as
+  `raw-a-512-divergence-investigation.md`. Found and fixed a real test
+  methodology bug along the way: `llama-mtmd-debug`'s "gray" fixture
+  feeds pixel value 0.5 directly as the *already-normalized* model
+  input (bypassing `(raw - mean) / std` preprocessing entirely), not a
+  raw pixel that normalizes to 0.0 — caught by cross-checking a loaded
+  bias tensor directly against the real GGUF file before doubting the
+  model logic. Not yet wired into `--enable-vision`, the CLI flag, or
+  the OpenAI multimodal content-part protocol mapping — this phase
+  delivers the runtime and its oracle-validated qualification, not the
+  end-to-end HTTP route.
+  `docs/research/qualification/phase-48-vision-encoder.md`.
 
 ## Commands
 
