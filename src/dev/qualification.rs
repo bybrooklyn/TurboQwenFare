@@ -553,11 +553,20 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(16);
+        // Must exceed `steps` (the KV cache's hard capacity, `ModelError::
+        // ContextCapacity` once full) - default padded above the historical
+        // fixed 64-token qualification context so short runs still probe
+        // the same capacity this test always has, while longer runs (e.g.
+        // crossing a TQKV 256-token page boundary) can raise both.
+        let max_context: usize = std::env::var("TQF_TQKV_QUAL_MAX_CONTEXT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| steps.max(64));
         let broker = MemoryBroker::new(Bytes(FOUR_GIB));
         let mut runtime = Qwen36BoundedReferenceRuntime::open(
             Path::new(&tqf),
             broker.clone(),
-            64,
+            max_context,
             Bytes(DEFAULT_EXPERT_CACHE_BYTES),
         )
         .unwrap();

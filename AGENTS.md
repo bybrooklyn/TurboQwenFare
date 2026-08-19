@@ -157,6 +157,16 @@ Phases 27-28 land the first long-context (TQKV) work:
   Real restart reuse demonstrated: a snapshot survives dropping the store
   handle entirely and reopening a fresh one against the same directory,
   restoring byte-identical state. `docs/research/qualification/phase-30-prefix-store.md`.
+- **Phase 31 (256K/TQAttn trigger):** applies spec §303's own decision
+  rule after extending Phase 29's isolated-attention-step measurement to
+  262,144 tokens. Memory: TQKV-Q4 at 256K reserves 1.31 GiB (fits 4G); BF16
+  at 256K needs 5.00 GiB (does not fit 4G at all, independent of speed).
+  Performance: attention alone costs **822 ms/step (BF16)** and
+  **3,331 ms/step (TQKV-Q4)** at 256K — 12.3x and 49.9x over the 15 tok/s
+  budget before any I/O or MoE work. Per §303's literal rule this formally
+  **triggers Phase 32 (TQAttn)** — full attention cannot stay the default
+  beyond this point on the reference implementation.
+  `docs/research/qualification/phase-31-256k-tqattn-trigger.md`.
 
 ## Commands
 

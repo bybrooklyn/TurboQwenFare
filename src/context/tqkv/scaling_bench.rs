@@ -87,6 +87,16 @@ pub fn measure_one_step_at_depth(
 /// broker, and confirm the reservation succeeds and leaves headroom under
 /// a 4 GiB budget for everything else (resident core + expert cache).
 pub fn all_ten_layers_at_128k_tqkv_q4_reserved_bytes(broker: &MemoryBroker) -> Result<Bytes> {
+    all_ten_layers_reserved_bytes(broker, 131_072, BackendChoice::Tqkv(TqkvPrecision::Q4))
+}
+
+/// Same construction, parameterized by context length and backend — Phase
+/// 31 (spec §303) reuses this at 256K for both BF16 and TQKV-Q4.
+pub fn all_ten_layers_reserved_bytes(
+    broker: &MemoryBroker,
+    max_tokens: usize,
+    choice: BackendChoice,
+) -> Result<Bytes> {
     let mut layers = Vec::with_capacity(Qwen36Geometry::FULL_ATTENTION_LAYERS);
     for layer in 0..Qwen36Geometry::NUM_LAYERS {
         if Qwen36Geometry::layer_kind(LayerId(layer as u8)) == crate::ids::LayerKind::FullAttention
@@ -94,8 +104,8 @@ pub fn all_ten_layers_at_128k_tqkv_q4_reserved_bytes(broker: &MemoryBroker) -> R
             layers.push(FullAttentionLayer::new_with_backend(
                 broker,
                 LayerId(layer as u8),
-                131_072,
-                BackendChoice::Tqkv(TqkvPrecision::Q4),
+                max_tokens,
+                choice,
             )?);
         }
     }
@@ -125,6 +135,41 @@ mod tests {
         );
     }
 
+    /// Phase 31 memory half (spec §303, table row 31: "256K usable within
+    /// 4G and <=1%"): really constructs all ten full-attention layers at
+    /// 262,144-token (256K) capacity, for both TQKV-Q4 and the BF16
+    /// reference, inside one 4 GiB broker.
+    #[test]
+    fn ten_full_attention_layers_at_256k_capacity_check() {
+        let four_gib = Bytes(4 * 1024 * 1024 * 1024);
+
+        let broker_q4 = MemoryBroker::new(four_gib);
+        let q4_reserved = all_ten_layers_reserved_bytes(
+            &broker_q4,
+            262_144,
+            BackendChoice::Tqkv(TqkvPrecision::Q4),
+        )
+        .unwrap();
+        assert!(
+            q4_reserved.0 < four_gib.0,
+            "TQKV-Q4 256K reservation {} exceeded the 4 GiB budget",
+            q4_reserved.0
+        );
+
+        let broker_bf16 = MemoryBroker::new(Bytes(u64::MAX / 2));
+        let bf16_reserved =
+            all_ten_layers_reserved_bytes(&broker_bf16, 262_144, BackendChoice::Bf16).unwrap();
+
+        println!(
+            "phase31_memory tqkv_q4_256k_bytes={} gib={:.3} bf16_256k_bytes={} gib={:.3} bf16_fits_4gib={}",
+            q4_reserved.0,
+            q4_reserved.0 as f64 / (1024.0 * 1024.0 * 1024.0),
+            bf16_reserved.0,
+            bf16_reserved.0 as f64 / (1024.0 * 1024.0 * 1024.0),
+            bf16_reserved.0 < four_gib.0,
+        );
+    }
+
     #[test]
     fn seeding_reaches_the_declared_depth_and_one_step_completes() {
         let point =
@@ -133,19 +178,21 @@ mod tests {
         assert!(point.one_step_elapsed.as_secs() < 5);
     }
 
-    /// Phase 29's populated-context attention-cost scaling table (spec
-    /// §301). Run with `--release --ignored --nocapture`; the measured
-    /// numbers are transcribed into
-    /// `docs/research/qualification/phase-29-128k-gate.md`. Debug builds
-    /// are ~10-50x slower than release for this scalar numeric loop, so
-    /// this is release-only and marked ignored like the other
-    /// real-hardware qualification runs (it needs no checkpoint, but does
-    /// need minutes of wall clock at the top end).
+    /// Phase 29/31's populated-context attention-cost scaling table (spec
+    /// §301, §303), extended through 256K for the Phase 31 "measure at
+    /// 256K, decide full-vs-TQAttn" trigger. Run with
+    /// `--release --ignored --nocapture`; the measured numbers are
+    /// transcribed into `docs/research/qualification/phase-29-128k-gate.md`
+    /// and `phase-31-256k-tqattn-trigger.md`. Debug builds are ~10-50x
+    /// slower than release for this scalar numeric loop, so this is
+    /// release-only and marked ignored like the other real-hardware
+    /// qualification runs (it needs no checkpoint, but does need minutes of
+    /// wall clock at the top end).
     #[test]
-    #[ignore = "run with --release; Phase 29 populated-context attention scaling"]
+    #[ignore = "run with --release; Phase 29/31 populated-context attention scaling"]
     fn attention_cost_scales_with_populated_context_depth_toward_128k() {
         let depths = [
-            512usize, 4_096, 16_384, 65_536, 131_072,
+            512usize, 4_096, 16_384, 65_536, 131_072, 262_144,
         ];
         for &depth in &depths {
             let max_tokens = depth + 1;
