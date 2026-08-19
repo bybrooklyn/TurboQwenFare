@@ -15,6 +15,7 @@ use crate::format::gguf;
 use crate::ids::Bytes;
 use crate::memory::MemoryBroker;
 use crate::model::qwen36::runtime::{Qwen36BoundedReferenceRuntime, Qwen36ReferenceRuntime};
+use crate::runtime::stream_decoder::{IncrementalOutputDecoder, StreamEvent, StreamFinish};
 use crate::runtime::{NormalizedRequest, Role};
 use crate::sampling::Sampler;
 use crate::tokenizer::chat::{self, ChatMessage, ChatRole, ToolSpec};
@@ -30,11 +31,28 @@ pub struct GeneratedToolCall {
     pub arguments_json: String,
 }
 
+/// Real token counts and timings for one generation.
+///
+/// Ollama clients display tok/s computed from these, and OpenAI clients
+/// bill and budget against `usage`. Reporting zeros would be a quiet lie
+/// in a number users actually read, so these are measured, never
+/// synthesized.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GenerationUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    /// Wall time spent turning the prompt into a first token.
+    pub prefill: std::time::Duration,
+    /// Wall time spent producing the remaining tokens.
+    pub decode: std::time::Duration,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeneratedOutput {
     pub text: String,
     pub tool_calls: Vec<GeneratedToolCall>,
     pub finish_reason: &'static str,
+    pub usage: GenerationUsage,
 }
 
 impl GeneratedOutput {
@@ -70,6 +88,7 @@ impl GeneratedOutput {
             text: plain,
             tool_calls: calls,
             finish_reason,
+            usage: GenerationUsage::default(),
         })
     }
 
@@ -99,7 +118,7 @@ fn visible_after_thinking(text: String) -> String {
         .unwrap_or(text)
 }
 
-fn parse_tool_call(body: &str, index: usize) -> Result<GeneratedToolCall> {
+pub(crate) fn parse_tool_call(body: &str, index: usize) -> Result<GeneratedToolCall> {
     if body.starts_with('{') {
         let wire: ToolCallWire = serde_json::from_str(body).map_err(|error| {
             ProtocolError::Invalid(format!("model emitted invalid tool-call JSON: {error}"))
@@ -206,6 +225,42 @@ pub trait Qwen36Generator: Send + Sync {
         request: NormalizedRequest,
         cancellation: CancellationToken,
     ) -> Result<GeneratedOutput>;
+
+    /// Streams a generation, sending each [`StreamEvent`] as it is
+    /// produced and returning the assembled output.
+    ///
+    /// The default implementation runs `generate()` and emits its result
+    /// as one delta, so every existing implementor — including the test
+    /// doubles — keeps working unchanged. Implementors that can really
+    /// stream override it; [`Qwen36Generator::streams_incrementally`]
+    /// reports which behavior a caller is getting.
+    ///
+    /// A send failure means the client is gone: implementations stop
+    /// promptly rather than finishing a generation nobody will read.
+    async fn generate_streaming(
+        &self,
+        request: NormalizedRequest,
+        cancellation: CancellationToken,
+        events: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) -> Result<GeneratedOutput> {
+        let output = self.generate(request, cancellation).await?;
+        if !output.text.is_empty() {
+            let _ = events
+                .send(StreamEvent::TextDelta(output.text.clone()))
+                .await;
+        }
+        for call in &output.tool_calls {
+            let _ = events.send(StreamEvent::ToolCall(call.clone())).await;
+        }
+        Ok(output)
+    }
+
+    /// Whether `generate_streaming` really emits deltas during decode
+    /// rather than one chunk at the end. Tests assert against this instead
+    /// of guessing from timing.
+    fn streams_incrementally(&self) -> bool {
+        false
+    }
 }
 
 /// An actual, fixed-graph Qwen3.6 generator for the high-memory resident
@@ -213,7 +268,10 @@ pub trait Qwen36Generator: Send + Sync {
 /// path: Phase 14 makes this oracle useful for parity, while Phase 18 is what
 /// makes the same graph fit the normal bounded-memory product contract.
 pub struct Qwen36ResidentReferenceGenerator {
-    tokenizer: Mutex<TqfTokenizer>,
+    /// `Arc` so the decode worker can hold it too: incremental
+    /// detokenization runs inside the `spawn_blocking` loop, right beside
+    /// the model step that produced the token.
+    tokenizer: Arc<Mutex<TqfTokenizer>>,
     // Retains the conservative GGUF metadata/tokenizer allocation envelope
     // for as long as the derived tokenizer is live.
     _tokenizer_source: gguf::GgufFile,
@@ -342,7 +400,7 @@ impl Qwen36ResidentReferenceGenerator {
         let tokenizer = TqfTokenizer::from_gguf(&gguf)?;
         let runtime = Qwen36ReferenceRuntime::open_resident(tqf_path, broker, max_context)?;
         Ok(Self {
-            tokenizer: Mutex::new(tokenizer),
+            tokenizer: Arc::new(Mutex::new(tokenizer)),
             _tokenizer_source: gguf,
             runtime: Arc::new(Mutex::new(QwenRuntimeInstance::Resident(runtime))),
             max_context,
@@ -366,7 +424,7 @@ impl Qwen36ResidentReferenceGenerator {
         let runtime =
             Qwen36BoundedReferenceRuntime::open(tqf_path, broker, max_context, expert_cache_bytes)?;
         Ok(Self {
-            tokenizer: Mutex::new(tokenizer),
+            tokenizer: Arc::new(Mutex::new(tokenizer)),
             _tokenizer_source: gguf,
             runtime: Arc::new(Mutex::new(QwenRuntimeInstance::Bounded(runtime))),
             max_context,
@@ -398,7 +456,7 @@ impl Qwen36ResidentReferenceGenerator {
             expert_cache_bytes,
         )?;
         Ok(Self {
-            tokenizer: Mutex::new(tokenizer),
+            tokenizer: Arc::new(Mutex::new(tokenizer)),
             _tokenizer_source: gguf,
             runtime: Arc::new(Mutex::new(QwenRuntimeInstance::Resident(runtime))),
             max_context,
@@ -459,21 +517,47 @@ impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
         request: NormalizedRequest,
         cancellation: CancellationToken,
     ) -> Result<GeneratedOutput> {
+        self.run_generation(request, cancellation, None).await
+    }
+
+    async fn generate_streaming(
+        &self,
+        request: NormalizedRequest,
+        cancellation: CancellationToken,
+        events: tokio::sync::mpsc::Sender<StreamEvent>,
+    ) -> Result<GeneratedOutput> {
+        self.run_generation(request, cancellation, Some(events))
+            .await
+    }
+
+    fn streams_incrementally(&self) -> bool {
+        true
+    }
+}
+
+impl Qwen36ResidentReferenceGenerator {
+    /// The single decode loop behind both `generate` and
+    /// `generate_streaming`.
+    ///
+    /// Sharing it is deliberate: two loops would eventually disagree, and
+    /// "the streamed answer differs from the batch answer" is exactly the
+    /// bug class spec §71 warns about. The only difference between the two
+    /// entry points is whether `events` is `Some`.
+    ///
+    /// Threading: all model work stays inside `spawn_blocking` (spec §25 —
+    /// the decode loop must not run on the Tokio executor). Only decoded
+    /// stream events cross back, via `blocking_send`, which applies
+    /// backpressure to the *blocking* thread rather than a Tokio worker.
+    async fn run_generation(
+        &self,
+        request: NormalizedRequest,
+        cancellation: CancellationToken,
+        events: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<GeneratedOutput> {
         let prompt = self.prompt_tokens(&request)?;
         if prompt.is_empty() {
             return Err(ProtocolError::Invalid("empty tokenized prompt".to_string()).into());
         }
-        // The real bound is the context window, not an arbitrary constant.
-        // A `.min(256)` here would silently truncate any longer request
-        // now that the HTTP layer no longer rejects one — turning a clear
-        // 400 into a mysteriously short answer.
-        let headroom = self.max_context.saturating_sub(prompt.len());
-        let maximum = request
-            .sampling
-            .max_output_tokens
-            .map(|requested| requested as usize)
-            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
-            .min(headroom);
         if prompt.len() >= self.max_context {
             return Err(ProtocolError::Invalid(format!(
                 "tokenized prompt ({} tokens) leaves no room for output within the context \
@@ -483,89 +567,212 @@ impl Qwen36Generator for Qwen36ResidentReferenceGenerator {
             ))
             .into());
         }
+        // The real bound is the context window, not an arbitrary constant.
+        // A `.min(256)` here would silently truncate any longer request now
+        // that the HTTP layer no longer rejects one — turning a clear 400
+        // into a mysteriously short answer.
+        let headroom = self.max_context.saturating_sub(prompt.len());
+        let maximum = request
+            .sampling
+            .max_output_tokens
+            .map(|requested| requested as usize)
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+            .min(headroom);
+        let prompt_tokens = prompt.len() as u32;
         if maximum == 0 {
-            return GeneratedOutput::from_model_text("");
+            return Ok(GeneratedOutput {
+                usage: GenerationUsage {
+                    prompt_tokens,
+                    ..GenerationUsage::default()
+                },
+                ..GeneratedOutput::from_model_text("")?
+            });
         }
+
         let eos = self
             .tokenizer
             .lock()
             .expect("tokenizer mutex poisoned")
             .eos_token_id;
         let mut sampler = Sampler::new(&request.sampling);
+        let mut decoder =
+            IncrementalOutputDecoder::new(request.sampling.stop_sequences.clone(), true);
         let runtime = Arc::clone(&self.runtime);
+        let tokenizer = Arc::clone(&self.tokenizer);
         let cancellation_for_decode = cancellation.clone();
-        let (generated, reached_eos) =
-            tokio::task::spawn_blocking(move || -> Result<(Vec<u32>, bool)> {
-                let mut runtime = runtime.lock().expect("Qwen runtime mutex poisoned");
-                runtime.reset_session();
+
+        let decoded = tokio::task::spawn_blocking(move || -> Result<DecodeRun> {
+            let mut runtime = runtime.lock().expect("Qwen runtime mutex poisoned");
+            runtime.reset_session();
+            if cancellation_for_decode.is_cancelled() {
+                return Err(TqfError::Cancelled);
+            }
+
+            // Phase 26: chunked prefill with expert-set dedup (the resident
+            // runtimes) or the per-token reference loop.
+            let prefill_started = std::time::Instant::now();
+            let cache_before = runtime.expert_cache_stats();
+            let next = runtime.prefill(&prompt)?;
+            let prefill = prefill_started.elapsed();
+            let cache_after = runtime.expert_cache_stats();
+            tracing::info!(
+                prompt_tokens = prompt.len(),
+                prefill_ms = prefill.as_secs_f64() * 1000.0,
+                "Qwen3.6 prefill"
+            );
+            if let (Some(before), Some(after)) = (cache_before, cache_after) {
+                tracing::info!(
+                    prefill_expert_hits = after.hits.saturating_sub(before.hits),
+                    prefill_expert_misses = after.misses.saturating_sub(before.misses),
+                    prefill_raw_miss_bytes = after
+                        .raw_miss_bytes
+                        .0
+                        .saturating_sub(before.raw_miss_bytes.0),
+                    prefill_demand_io_ms =
+                        after.demand_io_nanos.saturating_sub(before.demand_io_nanos) as f64 / 1e6,
+                    "Qwen3.6 prefill expert I/O"
+                );
+            }
+
+            let decode_started = std::time::Instant::now();
+            let mut next = next;
+            let mut generated = Vec::with_capacity(maximum);
+            let mut stream_state = crate::tokenizer::DecodeStreamState::default();
+            let mut collected = Vec::new();
+            let mut reached_eos = false;
+            let mut client_gone = false;
+
+            for _ in 0..maximum {
                 if cancellation_for_decode.is_cancelled() {
                     return Err(TqfError::Cancelled);
                 }
-                // Phase 26: chunked prefill with expert-set dedup (the
-                // resident runtimes) or the per-token reference loop.
-                let prefill_started = std::time::Instant::now();
-                let cache_before = runtime.expert_cache_stats();
-                let next = runtime.prefill(&prompt)?;
-                let cache_after = runtime.expert_cache_stats();
-                tracing::info!(
-                    prompt_tokens = prompt.len(),
-                    prefill_ms = prefill_started.elapsed().as_secs_f64() * 1000.0,
-                    "Qwen3.6 prefill"
-                );
-                if let (Some(before), Some(after)) = (cache_before, cache_after) {
-                    tracing::info!(
-                        prefill_expert_hits = after.hits.saturating_sub(before.hits),
-                        prefill_expert_misses = after.misses.saturating_sub(before.misses),
-                        prefill_raw_miss_bytes = after
-                            .raw_miss_bytes
-                            .0
-                            .saturating_sub(before.raw_miss_bytes.0),
-                        prefill_demand_io_ms =
-                            after.demand_io_nanos.saturating_sub(before.demand_io_nanos) as f64
-                                / 1e6,
-                        "Qwen3.6 prefill expert I/O"
-                    );
+                generated.push(next);
+                if Some(next) == eos {
+                    reached_eos = true;
+                    break;
                 }
-                let mut next = next;
-                let mut output = Vec::with_capacity(maximum);
-                let mut reached_eos = false;
-                for _ in 0..maximum {
-                    if cancellation_for_decode.is_cancelled() {
-                        return Err(TqfError::Cancelled);
+
+                // Decode this token to text and turn it into whatever is
+                // safe to show, before running the next model step: a
+                // client should see token N while the GPU works on N+1.
+                let text = tokenizer
+                    .lock()
+                    .expect("tokenizer mutex poisoned")
+                    .decode_step(&mut stream_state, next)?;
+                if let Some(text) = text {
+                    for event in decoder.push(&text)? {
+                        collected.push(event.clone());
+                        if let Some(sender) = &events {
+                            // A closed receiver means the client hung up.
+                            // Stop rather than finish a generation nobody
+                            // is reading — it holds the single generation
+                            // slot the whole time (spec §75).
+                            if sender.blocking_send(event).is_err() {
+                                client_gone = true;
+                                break;
+                            }
+                        }
                     }
-                    output.push(next);
-                    if Some(next) == eos {
-                        reached_eos = true;
+                }
+                if client_gone || decoder.stopped() {
+                    break;
+                }
+
+                let input = next;
+                let cache_before = runtime.expert_cache_stats();
+                // `generated` is this request's history, which is what the
+                // repetition penalties score against.
+                let decoded = runtime.decode_step(input, &mut sampler, &generated)?;
+                let cache_after = runtime.expert_cache_stats();
+                emit_decode_diagnostics(input, &decoded, cache_before, cache_after);
+                next = decoded.token;
+            }
+
+            let (tail, finish) = decoder.finish()?;
+            for event in tail {
+                collected.push(event.clone());
+                if let Some(sender) = &events {
+                    if sender.blocking_send(event).is_err() {
+                        client_gone = true;
                         break;
                     }
-                    let input = next;
-                    let cache_before = runtime.expert_cache_stats();
-                    // `output` is this request's generated history, which is
-                    // what the repetition penalties score against.
-                    let decoded = runtime.decode_step(input, &mut sampler, &output)?;
-                    let cache_after = runtime.expert_cache_stats();
-                    emit_decode_diagnostics(input, &decoded, cache_before, cache_after);
-                    next = decoded.token;
                 }
-                Ok((output, reached_eos))
+            }
+
+            Ok(DecodeRun {
+                events: collected,
+                finish,
+                reached_eos,
+                stopped: decoder.stopped(),
+                client_gone,
+                completion_tokens: generated.len() as u32,
+                prefill,
+                decode: decode_started.elapsed(),
             })
-            .await
-            .map_err(|error| {
-                TqfError::Internal(crate::error::InternalError {
-                    incident_id: format!("resident-reference-generate-{error}"),
-                    message: "reference decode worker panicked or was cancelled".to_string(),
-                })
-            })??;
-        let text = self
-            .tokenizer
-            .lock()
-            .expect("tokenizer mutex poisoned")
-            .decode(&generated, true)?;
-        let mut output = GeneratedOutput::from_qwen_continuation(text)?;
-        if !reached_eos && output.finish_reason == "stop" {
-            output.finish_reason = "length";
+        })
+        .await
+        .map_err(|error| {
+            TqfError::Internal(crate::error::InternalError {
+                incident_id: format!("resident-reference-generate-{error}"),
+                message: "reference decode worker panicked or was cancelled".to_string(),
+            })
+        })??;
+
+        Ok(decoded.into_output(prompt_tokens))
+    }
+}
+
+/// What one decode loop produced, before it is shaped into a
+/// `GeneratedOutput`.
+struct DecodeRun {
+    events: Vec<StreamEvent>,
+    finish: StreamFinish,
+    reached_eos: bool,
+    stopped: bool,
+    client_gone: bool,
+    completion_tokens: u32,
+    prefill: std::time::Duration,
+    decode: std::time::Duration,
+}
+
+impl DecodeRun {
+    fn into_output(self, prompt_tokens: u32) -> GeneratedOutput {
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for event in self.events {
+            match event {
+                // Reasoning is deliberately not part of `text`: the
+                // compatibility surfaces expose assistant content, and
+                // `<think>` output is not that (see `visible_after_thinking`).
+                StreamEvent::Reasoning(_) => {}
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::ToolCall(call) => tool_calls.push(call),
+            }
         }
-        Ok(output)
+
+        // Ran to the token budget without EOS, a stop match, or a client
+        // disconnect: the answer was cut off, and clients rely on
+        // "length" to know that.
+        let finish_reason = match self.finish {
+            StreamFinish::ToolCalls => "tool_calls",
+            StreamFinish::Length => "length",
+            StreamFinish::Stop if !self.reached_eos && !self.stopped && !self.client_gone => {
+                "length"
+            }
+            StreamFinish::Stop => "stop",
+        };
+
+        GeneratedOutput {
+            text,
+            tool_calls,
+            finish_reason,
+            usage: GenerationUsage {
+                prompt_tokens,
+                completion_tokens: self.completion_tokens,
+                prefill: self.prefill,
+                decode: self.decode,
+            },
+        }
     }
 }
 

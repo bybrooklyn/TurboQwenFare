@@ -8,6 +8,7 @@ pub mod generation;
 pub mod mtp;
 pub mod request;
 pub mod session;
+pub mod stream_decoder;
 
 // Module facade. `tqf` is a bin-only crate (spec §23: one crate, one
 // binary, no `[lib]` target), so rustc reachability-analyses every

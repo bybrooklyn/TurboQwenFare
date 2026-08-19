@@ -94,6 +94,74 @@ impl Qwen36Generator for FixtureGenerator {
     }
 }
 
+/// A double that really streams: it emits one delta per word with a gap
+/// between them, so tests can prove deltas arrive during generation
+/// rather than in a single burst at the end. The existing doubles use the
+/// trait's default `generate_streaming`, which cannot distinguish the two.
+struct IncrementalFixtureGenerator {
+    words: Vec<&'static str>,
+}
+
+impl IncrementalFixtureGenerator {
+    fn new() -> Self {
+        Self {
+            words: vec!["one ", "two ", "three ", "four ", "five"],
+        }
+    }
+
+    fn full_text(&self) -> String {
+        self.words.concat()
+    }
+}
+
+#[async_trait::async_trait]
+impl Qwen36Generator for IncrementalFixtureGenerator {
+    async fn generate(
+        &self,
+        _request: NormalizedRequest,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::error::Result<GeneratedOutput> {
+        GeneratedOutput::from_model_text(self.full_text())
+    }
+
+    async fn generate_streaming(
+        &self,
+        _request: NormalizedRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+        events: tokio::sync::mpsc::Sender<crate::runtime::stream_decoder::StreamEvent>,
+    ) -> crate::error::Result<GeneratedOutput> {
+        use crate::runtime::stream_decoder::StreamEvent;
+        let mut emitted = String::new();
+        for word in &self.words {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                _ = cancellation.cancelled() => return Err(crate::error::TqfError::Cancelled),
+            }
+            if events
+                .send(StreamEvent::TextDelta((*word).to_string()))
+                .await
+                .is_err()
+            {
+                // Client hung up: stop rather than finish a generation
+                // nobody will read.
+                break;
+            }
+            emitted.push_str(word);
+        }
+        let mut output = GeneratedOutput::from_model_text(emitted)?;
+        output.usage = crate::runtime::generation::GenerationUsage {
+            prompt_tokens: 7,
+            completion_tokens: self.words.len() as u32,
+            ..Default::default()
+        };
+        Ok(output)
+    }
+
+    fn streams_incrementally(&self) -> bool {
+        true
+    }
+}
+
 struct CancellationAwareGenerator {
     entered: Arc<Notify>,
     observed_cancellation: Arc<Notify>,
@@ -503,4 +571,216 @@ async fn responses_accept_structured_text_input_and_instructions() {
         response.starts_with("HTTP/1.1 200"),
         "unexpected response: {response}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Real streaming (spec §71). Before this, "streaming" awaited the whole
+// generation and emitted it as one event, so every one of these
+// properties was vacuously true and none of them were tested.
+// ---------------------------------------------------------------------
+
+/// Extracts the `data:` payloads of an SSE response body.
+fn sse_payloads(response: &str) -> Vec<String> {
+    response
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(str::to_string)
+        .collect()
+}
+
+fn delta_contents(payloads: &[String]) -> Vec<String> {
+    payloads
+        .iter()
+        .filter(|p| *p != "[DONE]")
+        .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .filter_map(|v| {
+            v["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn chat_streaming_emits_one_chunk_per_delta_not_one_at_the_end() {
+    let generator = IncrementalFixtureGenerator::new();
+    let expected = generator.full_text();
+    let addr = spawn_test_server_with(true, Some(Arc::new(generator))).await;
+
+    let response = http_request(
+        addr,
+        &post_json(
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"count"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    let contents = delta_contents(&sse_payloads(&response));
+    assert!(
+        contents.len() >= 5,
+        "expected one chunk per delta, got {}: {response}",
+        contents.len()
+    );
+    assert_eq!(
+        contents.concat(),
+        expected,
+        "reassembled deltas must equal the full text"
+    );
+}
+
+/// Exactly-once delivery: NVMAI hit real double-delivery bugs here, and
+/// spec §71 asks for regression tests that make the class impossible.
+#[tokio::test]
+async fn each_delta_is_delivered_exactly_once() {
+    let generator = IncrementalFixtureGenerator::new();
+    let addr = spawn_test_server_with(true, Some(Arc::new(generator))).await;
+
+    let response = http_request(
+        addr,
+        &post_json(
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"count"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    let contents = delta_contents(&sse_payloads(&response));
+    // The fixture's words are all distinct, so any duplicate delivery
+    // shows up as a repeated entry.
+    let unique: std::collections::HashSet<&String> = contents.iter().collect();
+    assert_eq!(
+        unique.len(),
+        contents.len(),
+        "a delta was delivered more than once: {contents:?}"
+    );
+
+    let payloads = sse_payloads(&response);
+    assert_eq!(
+        payloads.iter().filter(|p| *p == "[DONE]").count(),
+        1,
+        "exactly one [DONE] sentinel must terminate the stream"
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_chat_completion_reports_finish_reason_and_usage() {
+    let generator = IncrementalFixtureGenerator::new();
+    let addr = spawn_test_server_with(true, Some(Arc::new(generator))).await;
+
+    let response = http_request(
+        addr,
+        &post_json(
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"count"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    let payloads = sse_payloads(&response);
+    let terminal = payloads
+        .iter()
+        .filter(|p| *p != "[DONE]")
+        .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .find(|v| !v["choices"][0]["finish_reason"].is_null())
+        .expect("a terminal chunk with a finish_reason must be sent");
+
+    assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+    assert_eq!(terminal["usage"]["completion_tokens"], 5);
+    assert_eq!(terminal["usage"]["prompt_tokens"], 7);
+    assert_eq!(terminal["usage"]["total_tokens"], 12);
+}
+
+/// Every chunk must carry a stable, per-response id. The previous
+/// hardcoded `"chatcmpl-tqf-local"` meant every response in the process
+/// shared one id, so clients keying by it collided.
+#[tokio::test]
+async fn streamed_chunks_share_one_id_that_differs_between_responses() {
+    let addr =
+        spawn_test_server_with(true, Some(Arc::new(IncrementalFixtureGenerator::new()))).await;
+    let body = r#"{"messages":[{"role":"user","content":"count"}],"stream":true}"#;
+
+    let ids_of = |response: &str| -> Vec<String> {
+        sse_payloads(response)
+            .iter()
+            .filter(|p| *p != "[DONE]")
+            .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+            .filter_map(|v| v["id"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let first = ids_of(&http_request(addr, &post_json("/v1/chat/completions", body)).await);
+    let second = ids_of(&http_request(addr, &post_json("/v1/chat/completions", body)).await);
+
+    assert!(!first.is_empty() && !second.is_empty());
+    assert!(
+        first.iter().all(|id| *id == first[0]),
+        "chunks within one response must share an id: {first:?}"
+    );
+    assert_ne!(first[0], second[0], "two responses must not share an id");
+}
+
+#[tokio::test]
+async fn responses_streaming_emits_incremental_output_text_deltas() {
+    let generator = IncrementalFixtureGenerator::new();
+    let expected = generator.full_text();
+    let addr = spawn_test_server_with(true, Some(Arc::new(generator))).await;
+
+    let response = http_request(
+        addr,
+        &post_json("/v1/responses", r#"{"input":"count","stream":true}"#),
+    )
+    .await;
+
+    let deltas: Vec<String> = sse_payloads(&response)
+        .iter()
+        .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .filter(|v| v["type"] == "response.output_text.delta")
+        .filter_map(|v| v["delta"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        deltas.len() >= 5,
+        "expected incremental output_text deltas, got {}: {response}",
+        deltas.len()
+    );
+    assert_eq!(deltas.concat(), expected);
+    assert!(
+        response.contains("response.completed"),
+        "the stream must terminate with response.completed"
+    );
+}
+
+/// A non-streaming request must produce exactly what the streamed deltas
+/// reassemble to. Without this, "the streamed answer differs from the
+/// batch answer" is a whole live bug class.
+#[tokio::test]
+async fn streamed_and_non_streamed_answers_agree() {
+    let generator = IncrementalFixtureGenerator::new();
+    let expected = generator.full_text();
+    let addr = spawn_test_server_with(true, Some(Arc::new(generator))).await;
+
+    let streamed = http_request(
+        addr,
+        &post_json(
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"count"}],"stream":true}"#,
+        ),
+    )
+    .await;
+    let batch = http_request(
+        addr,
+        &post_json(
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"count"}]}"#,
+        ),
+    )
+    .await;
+
+    let streamed_text = delta_contents(&sse_payloads(&streamed)).concat();
+    let body = batch.split("\r\n\r\n").nth(1).expect("a response body");
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON body");
+
+    assert_eq!(streamed_text, expected);
+    assert_eq!(parsed["choices"][0]["message"]["content"], expected);
 }

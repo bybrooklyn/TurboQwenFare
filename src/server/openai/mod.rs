@@ -18,6 +18,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::stream_decoder::StreamEvent;
 use crate::runtime::{
     GeneratedOutput, Message, MessageToolCall, NormalizedRequest, ProtocolFlavor, Role,
     ToolDefinition,
@@ -629,10 +630,14 @@ async fn embeddings(State(_state): State<AppState>, Json(_req): Json<Value>) -> 
 
 #[derive(Serialize)]
 struct ChatCompletion {
-    id: &'static str,
+    id: String,
     object: &'static str,
+    /// Real OpenAI responses carry this and some clients require it; it
+    /// was previously absent.
+    created: u64,
     model: &'static str,
     choices: Vec<ChatChoice>,
+    usage: Usage,
 }
 
 #[derive(Serialize)]
@@ -664,6 +669,44 @@ struct OpenAiFunctionCall {
     arguments: String,
 }
 
+/// Seconds since the Unix epoch, as OpenAI's `created` field wants.
+pub(crate) fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A per-response id. The previous constant `"chatcmpl-tqf-local"` was
+/// returned for *every* request, so any client that keys or deduplicates
+/// responses by id saw them all collide.
+fn response_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}-{:x}{:x}",
+        unix_seconds(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[derive(Serialize)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+impl From<crate::runtime::generation::GenerationUsage> for Usage {
+    fn from(usage: crate::runtime::generation::GenerationUsage) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.prompt_tokens + usage.completion_tokens,
+        }
+    }
+}
+
 fn tool_calls(output: &GeneratedOutput) -> Vec<OpenAiToolCall> {
     output
         .tool_calls
@@ -681,9 +724,11 @@ fn tool_calls(output: &GeneratedOutput) -> Vec<OpenAiToolCall> {
 
 fn chat_completion(output: GeneratedOutput) -> ChatCompletion {
     let tool_calls = tool_calls(&output);
+    let usage = output.usage.into();
     ChatCompletion {
-        id: "chatcmpl-tqf-local",
+        id: response_id("chatcmpl"),
         object: "chat.completion",
+        created: unix_seconds(),
         model: CANONICAL_MODEL_ID,
         choices: vec![ChatChoice {
             index: 0,
@@ -694,192 +739,304 @@ fn chat_completion(output: GeneratedOutput) -> ChatCompletion {
             },
             finish_reason: output.finish_reason,
         }],
+        usage,
     }
 }
 
 fn response_object(output: GeneratedOutput) -> Value {
+    let usage = Usage::from(output.usage);
     serde_json::json!({
-        "id": "resp-tqf-local",
+        "id": response_id("resp"),
         "object": "response",
+        "created_at": unix_seconds(),
         "model": CANONICAL_MODEL_ID,
+        "status": "completed",
         "output_text": output.text,
         "finish_reason": output.finish_reason,
         "tool_calls": tool_calls(&output),
+        "usage": {
+            "input_tokens": usage.prompt_tokens,
+            "output_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        },
     })
 }
 
-fn chat_completion_events(output: GeneratedOutput) -> Vec<Result<Event, Infallible>> {
-    let mut events = Vec::new();
-    if !output.text.is_empty() {
-        events.push(Ok(Event::default().data(
-            serde_json::json!({
-                "id": "chatcmpl-tqf-local",
-                "object": "chat.completion.chunk",
-                "model": CANONICAL_MODEL_ID,
-                "choices": [{"index": 0, "delta": {"content": output.text}, "finish_reason": null}],
-            })
-            .to_string(),
-        )));
-    }
-    if !output.tool_calls.is_empty() {
-        events.push(Ok(Event::default().data(
-            serde_json::json!({
-                "id": "chatcmpl-tqf-local",
-                "object": "chat.completion.chunk",
-                "model": CANONICAL_MODEL_ID,
-                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls(&output)}, "finish_reason": null}],
-            })
-            .to_string(),
-        )));
-    }
-    events.push(Ok(Event::default().data(
+/// Runs a streamed generation and pumps its events through `to_sse` as
+/// they arrive.
+///
+/// This is where "streaming" stopped being a lie: it used to `await` the
+/// whole generation and then emit the entire text as one event, so a
+/// client saw nothing until the model was finished. Now the model task
+/// sends each delta and this task forwards it immediately.
+///
+/// Cancellation has two halves, and both are needed. `CancelOnDropStream`
+/// fires when hyper drops the body — the only signal for a client that
+/// vanishes while the generator is blocked mid-decode. The
+/// `sender.closed()` arm catches a receiver dropped while this task is
+/// waiting for send capacity.
+fn spawn_event_stream<F>(
+    state: AppState,
+    request: NormalizedRequest,
+    preamble: Vec<Result<Event, Infallible>>,
+    to_sse: F,
+) -> Sse<CancelOnDropStream>
+where
+    F: Fn(StreamPhase<'_>) -> Vec<Result<Event, Infallible>> + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::mpsc::channel(32);
+    let session = crate::runtime::Session::new();
+    let cancellation = session.cancellation.clone();
+    let cancellation_on_drop = cancellation.clone();
+
+    tokio::spawn(async move {
+        for event in preamble {
+            if sender.send(event).await.is_err() {
+                cancellation.cancel();
+                return;
+            }
+        }
+
+        // Bounded so a client that stops reading applies real
+        // backpressure to the decode loop rather than letting events pile
+        // up without limit.
+        let (model_events, mut model_rx) = tokio::sync::mpsc::channel(32);
+        let pump_state = state.clone();
+        let pump_request = request.clone();
+        let generation = tokio::spawn(async move {
+            stub::generate_streaming_with_session(&pump_state, &pump_request, session, model_events)
+                .await
+        });
+
+        loop {
+            tokio::select! {
+                event = model_rx.recv() => {
+                    let Some(event) = event else { break };
+                    for sse in to_sse(StreamPhase::Event(&event)) {
+                        if sender.send(sse).await.is_err() {
+                            cancellation.cancel();
+                            return;
+                        }
+                    }
+                }
+                _ = sender.closed() => {
+                    cancellation.cancel();
+                    return;
+                }
+            }
+        }
+
+        let finished = match generation.await {
+            Ok(Ok(output)) => to_sse(StreamPhase::Completed(&output)),
+            Ok(Err(_)) | Err(_) => to_sse(StreamPhase::Failed),
+        };
+        for sse in finished {
+            if sender.send(sse).await.is_err() {
+                cancellation.cancel();
+                return;
+            }
+        }
+    });
+
+    Sse::new(CancelOnDropStream {
+        inner: ReceiverStream::new(receiver),
+        cancellation: cancellation_on_drop,
+    })
+    .keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+/// What a protocol adapter is being asked to render.
+pub enum StreamPhase<'a> {
+    Event(&'a StreamEvent),
+    Completed(&'a GeneratedOutput),
+    Failed,
+}
+
+fn chunk(id: &str, created: u64, delta: Value, finish_reason: Value) -> Result<Event, Infallible> {
+    Ok(Event::default().data(
         serde_json::json!({
-            "id": "chatcmpl-tqf-local",
+            "id": id,
             "object": "chat.completion.chunk",
+            "created": created,
             "model": CANONICAL_MODEL_ID,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": output.finish_reason}],
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         })
         .to_string(),
-    )));
-    events.push(Ok(Event::default().data("[DONE]")));
-    events
+    ))
 }
 
 fn stream_chat_completion(state: AppState, request: NormalizedRequest) -> Sse<CancelOnDropStream> {
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let session = crate::runtime::Session::new();
-    let cancellation = session.cancellation.clone();
-    let cancellation_on_drop = cancellation.clone();
-    tokio::spawn(async move {
-        let role = Ok(Event::default().data(
-            serde_json::json!({
-                "id": "chatcmpl-tqf-local",
-                "object": "chat.completion.chunk",
-                "model": CANONICAL_MODEL_ID,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
-            })
-            .to_string(),
-        ));
-        if sender.send(role).await.is_err() {
-            cancellation.cancel();
-            return;
+    let id = response_id("chatcmpl");
+    let created = unix_seconds();
+    let preamble = vec![chunk(
+        &id,
+        created,
+        serde_json::json!({"role": "assistant"}),
+        Value::Null,
+    )];
+
+    spawn_event_stream(state, request, preamble, move |phase| match phase {
+        StreamPhase::Event(StreamEvent::TextDelta(text)) => vec![chunk(
+            &id,
+            created,
+            serde_json::json!({"content": text}),
+            Value::Null,
+        )],
+        // Reasoning is not OpenAI `content`. It is surfaced under a
+        // clearly non-standard key so a client that wants it can opt in,
+        // and one that does not simply ignores an unknown field.
+        StreamPhase::Event(StreamEvent::Reasoning(text)) => vec![chunk(
+            &id,
+            created,
+            serde_json::json!({"reasoning_content": text}),
+            Value::Null,
+        )],
+        StreamPhase::Event(StreamEvent::ToolCall(call)) => vec![chunk(
+            &id,
+            created,
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments_json},
+            }]}),
+            Value::Null,
+        )],
+        StreamPhase::Completed(output) => {
+            let usage = Usage::from(output.usage);
+            vec![
+                Ok(Event::default().data(
+                    serde_json::json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": CANONICAL_MODEL_ID,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": output.finish_reason,
+                        }],
+                        "usage": {
+                            "prompt_tokens": usage.prompt_tokens,
+                            "completion_tokens": usage.completion_tokens,
+                            "total_tokens": usage.total_tokens,
+                        },
+                    })
+                    .to_string(),
+                )),
+                Ok(Event::default().data("[DONE]")),
+            ]
         }
-        tokio::select! {
-            output = stub::generate_with_session(&state, &request, session) => {
-                let events = match output {
-                    Ok(output) => chat_completion_events(output),
-                    Err(_) => vec![
-                        Ok(Event::default().event("error").data("generation unavailable")),
-                        Ok(Event::default().data("[DONE]")),
-                    ],
-                };
-                for event in events {
-                    if sender.send(event).await.is_err() {
-                        cancellation.cancel();
-                        break;
-                    }
-                }
-            }
-            _ = sender.closed() => cancellation.cancel(),
-        }
-    });
-    Sse::new(CancelOnDropStream {
-        inner: ReceiverStream::new(receiver),
-        cancellation: cancellation_on_drop,
+        StreamPhase::Failed => vec![
+            Ok(Event::default()
+                .event("error")
+                .data("generation unavailable")),
+            Ok(Event::default().data("[DONE]")),
+        ],
     })
-    .keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    )
 }
 
-/// Responses API uses typed events rather than chat-completion chunks. The
-/// runtime still produces the same protocol-neutral `GeneratedOutput`; only
-/// this boundary chooses the externally visible event names.
-fn response_events(output: GeneratedOutput) -> Vec<Result<Event, Infallible>> {
-    let mut events = Vec::new();
-    if !output.text.is_empty() {
-        events.push(Ok(Event::default()
-            .event("response.output_text.delta")
-            .data(
-                serde_json::json!({
-                    "type": "response.output_text.delta",
-                    "delta": output.text,
-                })
-                .to_string(),
-            )));
-    }
-    for call in tool_calls(&output) {
-        events.push(Ok(Event::default()
-            .event("response.function_call_arguments.done")
-            .data(
-                serde_json::json!({
-                    "type": "response.function_call_arguments.done",
-                    "call_id": call.id,
-                    "name": call.function.name,
-                    "arguments": call.function.arguments,
-                })
-                .to_string(),
-            )));
-    }
-    events.push(Ok(Event::default().event("response.completed").data(
+/// The Responses API uses typed events rather than chat-completion
+/// chunks. The runtime still produces the same protocol-neutral stream;
+/// only this boundary chooses the externally visible event names.
+fn stream_response(state: AppState, request: NormalizedRequest) -> Sse<CancelOnDropStream> {
+    let id = response_id("resp");
+    let created = unix_seconds();
+    let preamble = vec![Ok(Event::default().event("response.created").data(
         serde_json::json!({
-            "type": "response.completed",
-            "response": response_object(output),
+            "type": "response.created",
+            "response": {"id": id, "object": "response", "created_at": created, "status": "in_progress"},
         })
         .to_string(),
-    )));
-    events
-}
+    ))];
 
-fn stream_response(state: AppState, request: NormalizedRequest) -> Sse<CancelOnDropStream> {
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let session = crate::runtime::Session::new();
-    let cancellation = session.cancellation.clone();
-    let cancellation_on_drop = cancellation.clone();
-    tokio::spawn(async move {
-        let created = Ok(Event::default().event("response.created").data(
+    spawn_event_stream(state, request, preamble, move |phase| match phase {
+        StreamPhase::Event(StreamEvent::TextDelta(text)) => {
+            vec![Ok(Event::default()
+                .event("response.output_text.delta")
+                .data(
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "item_id": id,
+                        "output_index": 0,
+                        "delta": text,
+                    })
+                    .to_string(),
+                ))]
+        }
+        // Not an `output_text` delta: reasoning is not assistant output.
+        StreamPhase::Event(StreamEvent::Reasoning(text)) => {
+            vec![Ok(Event::default()
+                .event("response.reasoning_text.delta")
+                .data(
+                    serde_json::json!({
+                        "type": "response.reasoning_text.delta",
+                        "item_id": id,
+                        "output_index": 0,
+                        "delta": text,
+                    })
+                    .to_string(),
+                ))]
+        }
+        StreamPhase::Event(StreamEvent::ToolCall(call)) => {
+            vec![Ok(Event::default()
+                .event("response.function_call_arguments.done")
+                .data(
+                    serde_json::json!({
+                        "type": "response.function_call_arguments.done",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "arguments": call.arguments_json,
+                    })
+                    .to_string(),
+                ))]
+        }
+        StreamPhase::Completed(output) => {
+            let usage = Usage::from(output.usage);
+            vec![
+                Ok(Event::default().event("response.output_text.done").data(
+                    serde_json::json!({
+                        "type": "response.output_text.done",
+                        "item_id": id,
+                        "output_index": 0,
+                        "text": output.text,
+                    })
+                    .to_string(),
+                )),
+                Ok(Event::default().event("response.completed").data(
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": id,
+                            "object": "response",
+                            "created_at": created,
+                            "status": "completed",
+                            "model": CANONICAL_MODEL_ID,
+                            "output_text": output.text,
+                            "finish_reason": output.finish_reason,
+                            "usage": {
+                                "input_tokens": usage.prompt_tokens,
+                                "output_tokens": usage.completion_tokens,
+                                "total_tokens": usage.total_tokens,
+                            },
+                        },
+                    })
+                    .to_string(),
+                )),
+            ]
+        }
+        StreamPhase::Failed => vec![Ok(Event::default().event("error").data(
             serde_json::json!({
-                "type": "response.created",
-                "response": {"id": "resp-tqf-local", "status": "in_progress"},
+                "type": "error",
+                "error": {"message": "generation unavailable", "code": "model_not_ready"},
             })
             .to_string(),
-        ));
-        if sender.send(created).await.is_err() {
-            cancellation.cancel();
-            return;
-        }
-        tokio::select! {
-            output = stub::generate_with_session(&state, &request, session) => {
-                let events = match output {
-                    Ok(output) => response_events(output),
-                    Err(_) => vec![Ok(Event::default().event("error").data(
-                        serde_json::json!({
-                            "type": "error",
-                            "error": {"message": "generation unavailable", "code": "model_not_ready"},
-                        }).to_string(),
-                    ))],
-                };
-                for event in events {
-                    if sender.send(event).await.is_err() {
-                        cancellation.cancel();
-                        break;
-                    }
-                }
-            }
-            _ = sender.closed() => cancellation.cancel(),
-        }
-    });
-    Sse::new(CancelOnDropStream {
-        inner: ReceiverStream::new(receiver),
-        cancellation: cancellation_on_drop,
+        ))],
     })
-    .keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    )
 }
 
 pub fn routes() -> Router<AppState> {

@@ -11,6 +11,7 @@ use axum::Json;
 use serde::Serialize;
 use tokio_stream::Stream;
 
+use crate::runtime::stream_decoder::StreamEvent;
 use crate::runtime::{GeneratedOutput, NormalizedRequest, Session};
 use crate::server::AppState;
 
@@ -80,6 +81,49 @@ pub async fn generate_with_session(
             request.stream,
         )),
     }
+}
+
+/// Streaming twin of [`generate_with_session`].
+///
+/// It repeats the same admission checks rather than sharing a helper on
+/// purpose: the single generation slot must be held for the whole
+/// streamed generation, so the permit has to live in this function's body
+/// until the generator returns.
+pub async fn generate_streaming_with_session(
+    state: &AppState,
+    request: &NormalizedRequest,
+    session: Session,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> std::result::Result<GeneratedOutput, Response> {
+    tracing::debug!(
+        session_id = %session.id,
+        protocol = ?request.protocol,
+        "queued streaming generation"
+    );
+
+    let Some(_permit) = state.generation_slot.acquire(&session.cancellation).await else {
+        return Err(not_ready_body(
+            "request cancelled before it reached the generation slot",
+            request.stream,
+        ));
+    };
+
+    if !state.model_installed {
+        return Err(not_ready_body(
+            "no model installed yet; run `tqf` to complete first-run setup",
+            request.stream,
+        ));
+    }
+    let Some(generator) = &state.generator else {
+        return Err(not_ready_body(
+            "model receipt exists but its Qwen runtime is not loaded",
+            request.stream,
+        ));
+    };
+    generator
+        .generate_streaming(request.clone(), session.cancellation.clone(), events)
+        .await
+        .map_err(|error| not_ready_body(&format!("generation failed: {error}"), request.stream))
 }
 
 fn not_ready_body(message: &str, stream: bool) -> Response {

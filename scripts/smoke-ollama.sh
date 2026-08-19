@@ -16,9 +16,11 @@ trap 'rm -rf "$TMP"' EXIT
 
 pass=0
 fail=0
+skipped=0
 
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$1"; pass=$((pass + 1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
+skip() { printf '  \033[33mskip\033[0m %s\n' "$1"; skipped=$((skipped + 1)); }
 note() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # check <description> <command...>
@@ -27,8 +29,34 @@ check() {
     if "$@" >/dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi
 }
 
-body()   { curl -fsS --max-time 120 "$@" 2>/dev/null; }
-status() { curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$@"; }
+# -H is required: `curl -d` defaults to form encoding, which the server
+# correctly rejects with 415. Real clients always send JSON.
+JSON=(-H 'Content-Type: application/json')
+body()   { curl -fsS --max-time 120 "${JSON[@]}" "$@" 2>/dev/null; }
+status() { curl -s -o /dev/null -w '%{http_code}' --max-time 30 "${JSON[@]}" "$@"; }
+
+# The dev server (`just serve`) runs with no checkpoint, so generation
+# endpoints answer 503 by design. That is a pass for "the endpoint exists
+# and is wired correctly" and a skip for "generation works" — conflating
+# the two would either hide real 404s or cry wolf on every dev run.
+MODEL_INSTALLED="$(curl -fsS --max-time 10 "$BASE/health" 2>/dev/null \
+    | grep -o '"model_installed":[a-z]*' | cut -d: -f2)"
+if [ "$MODEL_INSTALLED" != "true" ]; then
+    printf '\033[33mnote\033[0m no model installed: generation checks verify wiring (503), not output\n'
+fi
+
+# generation_status <description> <path> <payload>
+generation_status() {
+    local desc="$1" path="$2" payload="$3" code
+    code="$(status "$BASE$path" -d "$payload")"
+    if [ "$code" = "200" ]; then
+        ok "$desc"
+    elif [ "$code" = "503" ] && [ "$MODEL_INSTALLED" != "true" ]; then
+        skip "$desc (503: no model installed)"
+    else
+        bad "$desc (got $code)"
+    fi
+}
 
 printf '\033[1msmoke-ollama\033[0m against %s\n' "$BASE"
 
@@ -82,7 +110,7 @@ fi
 
 note 'generation: NDJSON streaming — the framing Ollama clients parse'
 HDR="$TMP/headers.txt"; ND="$TMP/stream.ndjson"
-curl -fsS -N --max-time 300 -D "$HDR" "$BASE/api/chat" -d '{
+curl -fsS -N --max-time 300 "${JSON[@]}" -D "$HDR" "$BASE/api/chat" -d '{
   "model":"qwen3.6:35b",
   "messages":[{"role":"user","content":"Count to five."}],
   "options":{"temperature":0,"num_predict":32}}' > "$ND" 2>/dev/null
@@ -133,5 +161,5 @@ code="$(status "$BASE/api/chat" -d '{"model":"qwen3.6:35b","stream":false,"messa
 [ "$code" = "200" ] && ok "temperature 0.8 / top_p 0.9 / top_k 40 accepted (got $code)" \
                     || bad "temperature 0.8 / top_p 0.9 / top_k 40 accepted (got $code)"
 
-printf '\n\033[1m%d passed, %d failed\033[0m\n' "$pass" "$fail"
+printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
