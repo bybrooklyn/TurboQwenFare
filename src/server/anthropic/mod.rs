@@ -251,6 +251,12 @@ async fn messages(State(state): State<AppState>, Json(req): Json<MessagesRequest
         Ok(normalized) => normalized,
         Err(message) => return invalid(message),
     };
+    // Checked before the stream branch: once bytes are out the status is
+    // spent, and a 200 followed by an in-band error is a success the
+    // client's error path never sees (see `stub::pre_stream_not_ready`).
+    if let Some(message) = stub::readiness_error(&state) {
+        return stub::pre_stream_not_ready(normalized.protocol, message);
+    }
     if normalized.stream {
         return stream_messages(state, normalized).into_response();
     }

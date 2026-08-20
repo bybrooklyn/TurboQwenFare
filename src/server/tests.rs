@@ -372,8 +372,23 @@ async fn chat_completions_reports_no_model_installed() {
     assert!(response.contains("no model installed"));
 }
 
+/// A streaming request to a server with no model gets OpenAI's error
+/// envelope under a 503 — not an SSE stream.
+///
+/// This test previously asserted the opposite (`200`, `event: error`,
+/// `data: [DONE]`), which is what the code did and is why the defect
+/// survived: the assertion was derived from the behavior instead of from
+/// what a client needs, so it could not fail. A 200 tells every OpenAI
+/// SDK the call succeeded, and it then hands the error to its stream
+/// parser rather than raising.
+///
+/// SSE framing itself is covered where it can actually be observed —
+/// against a real generator, by
+/// `chat_completion_streaming_formats_generator_output_and_done_marker`
+/// and the incremental-delta tests below it. There is no stream to frame
+/// when no model is loaded.
 #[tokio::test]
-async fn chat_completions_streaming_returns_valid_sse_framing() {
+async fn a_streaming_request_to_an_unready_server_fails_with_a_status() {
     let addr = spawn_test_server(false).await;
     let response = http_request(
         addr,
@@ -384,13 +399,16 @@ async fn chat_completions_streaming_returns_valid_sse_framing() {
     )
     .await;
     assert!(
-        response.starts_with("HTTP/1.1 200"),
+        response.starts_with("HTTP/1.1 503"),
         "unexpected response: {response}"
     );
     let lower = response.to_ascii_lowercase();
-    assert!(lower.contains("content-type: text/event-stream"));
-    assert!(response.contains("event: error"));
-    assert!(response.contains("data: [DONE]"));
+    assert!(
+        lower.contains("content-type: application/json"),
+        "an SDK's error path parses JSON, not SSE: {response}"
+    );
+    assert!(response.contains("no model installed"));
+    assert!(response.contains("model_not_ready"));
 }
 
 #[tokio::test]
@@ -1342,4 +1360,39 @@ async fn an_empty_search_query_is_rejected() {
     let addr = spawn_router(router_with_indexes(indexed_state())).await;
     let response = http_request(addr, &post_json("/tqf/index/search", r#"{"query":"   "}"#)).await;
     assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+}
+
+/// The same defect the Ollama suite covers, checked across every
+/// streaming surface at once: a request that was never going to run must
+/// fail with a *status*, not with a 200 stream carrying an error object.
+///
+/// All three adapters had it, because all three chose to stream before
+/// asking whether a model was loaded. Grouped here rather than split
+/// across three suites so a fourth adapter is measured against the same
+/// bar.
+#[tokio::test]
+async fn no_streaming_surface_reports_unreadiness_as_a_success() {
+    let addr = spawn_test_server_with(false, None).await;
+
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        ),
+        (
+            "/v1/messages",
+            r#"{"model":"qwen3.6-35b-a3b","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        ),
+        (
+            "/api/chat",
+            r#"{"model":"qwen3.6:35b","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        ),
+    ] {
+        let response = http_request(addr, &post_json(path, body)).await;
+        assert!(
+            response.starts_with("HTTP/1.1 503"),
+            "{path} answered a streaming request from an unready server with a non-503 \
+             status: {response}"
+        );
+    }
 }

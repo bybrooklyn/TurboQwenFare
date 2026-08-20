@@ -464,3 +464,132 @@ async fn embeddings_report_the_missing_checkpoint_pin_honestly() {
         );
     }
 }
+
+// -------------------------------------------------------- body decoding
+
+/// Ollama's own README documents every endpoint as a bare
+/// `curl http://localhost:11434/api/generate -d '{...}'`, and `curl -d`
+/// sends `Content-Type: application/x-www-form-urlencoded`. Real Ollama
+/// parses the body anyway; `axum::Json` would 415 it.
+///
+/// This is the exact class of bug this module exists to prevent — a
+/// complete, correct endpoint list that every documented invocation
+/// bounces off — so it is tested at the wire, with the header real curl
+/// actually sends rather than with no header at all.
+#[tokio::test]
+async fn documented_curl_bodies_are_accepted_without_a_json_content_type() {
+    let addr =
+        spawn_test_server_with(true, Some(Arc::new(IncrementalFixtureGenerator::new()))).await;
+
+    for (path, body) in [
+        (
+            "/api/chat",
+            r#"{"model":"qwen3.6:35b","messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+        ),
+        (
+            "/api/generate",
+            r#"{"model":"qwen3.6:35b","prompt":"hi","stream":false}"#,
+        ),
+    ] {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
+             application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = http_request(addr, &request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "{path} must accept the body real curl sends: {response}"
+        );
+    }
+
+    // `/api/show` takes the same tolerant body, but this fixture server
+    // has no receipt, so the *correct* answer is a 404 for an unknown
+    // model. What matters here is that it got far enough to look: a 415
+    // would mean the body was never parsed.
+    let body = r#"{"model":"qwen3.6:35b"}"#;
+    let show = http_request(
+        addr,
+        &format!(
+            "POST /api/show HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
+             application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert!(
+        !show.starts_with("HTTP/1.1 415"),
+        "the body must be parsed regardless of content type: {show}"
+    );
+    assert!(json_body(&show)["error"].is_string(), "{show}");
+}
+
+/// A body that genuinely is not JSON must still be refused — and refused
+/// in Ollama's own flat `{"error": "..."}` envelope (spec §212), not
+/// axum's plain-text rejection, because that is the shape a client's
+/// error path parses.
+#[tokio::test]
+async fn a_malformed_body_is_refused_in_ollamas_error_envelope() {
+    let addr = spawn_test_server_with(true, None).await;
+
+    for body in ["not json at all", ""] {
+        let request = format!(
+            "POST /api/chat HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = http_request(addr, &request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "{body:?} must be a 400: {response}"
+        );
+        let error = json_body(&response);
+        assert!(
+            error["error"].is_string(),
+            "expected Ollama's flat error envelope, got {error}"
+        );
+    }
+}
+
+/// A streaming response commits to its status code with the first byte,
+/// so readiness has to be checked *before* the adapter decides to stream.
+/// It wasn't: `/api/chat` with no model installed answered
+/// `200 OK`, then wrote `{"error": ...}` as the first NDJSON line — a
+/// success status followed by an object with no `message` and no `done`.
+/// A client's error path never fires, its message parser gets something
+/// it cannot read, and because clients stop on `done: true` it then waits
+/// on a connection that will never produce another line.
+#[tokio::test]
+async fn an_unready_server_fails_with_a_status_not_a_success_stream() {
+    let addr = spawn_test_server_with(false, None).await;
+
+    for (path, body) in [
+        (
+            "/api/chat",
+            r#"{"model":"qwen3.6:35b","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/api/generate", r#"{"model":"qwen3.6:35b","prompt":"hi"}"#),
+    ] {
+        // No "stream" key: streaming is Ollama's default, which is the
+        // shape that regressed.
+        let response = http_request(addr, &post_json(path, body)).await;
+        assert!(
+            response.starts_with("HTTP/1.1 503"),
+            "{path} must report unreadiness as a status: {response}"
+        );
+
+        // And the body must still terminate a client that got far enough
+        // to read it.
+        let line = ndjson_lines(&response)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("expected one NDJSON line: {response}"));
+        assert!(line["error"].is_string(), "{line}");
+        assert_eq!(
+            line["done"], true,
+            "clients stop on `done`; without it they hang: {line}"
+        );
+    }
+}

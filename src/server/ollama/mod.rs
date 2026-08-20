@@ -308,6 +308,55 @@ fn bad_request(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+// --------------------------------------------------------- body decoding
+
+/// Ollama's JSON body extractor.
+///
+/// Deliberately *not* `axum::Json`, which rejects any request whose
+/// `Content-Type` is not `application/json` with a 415 and a plain-text
+/// body. Real Ollama parses the body regardless — its own README documents
+/// every endpoint as
+///
+/// ```text
+/// curl http://localhost:11434/api/generate -d '{"model": "...", ...}'
+/// ```
+///
+/// with no `Content-Type` at all, and `curl -d` sends
+/// `application/x-www-form-urlencoded`. Anyone following Ollama's
+/// documentation against tqf would get a 415 from a server that had
+/// otherwise implemented the endpoint correctly, which is exactly the
+/// failure mode this whole module exists to prevent: the framing is wrong
+/// while the endpoint list looks complete.
+///
+/// Rejections use Ollama's own flat `{"error": "..."}` envelope (spec
+/// §212), not axum's plain text, so a client's error path sees the shape
+/// it parses.
+pub struct OllamaJson<T>(pub T);
+
+#[async_trait::async_trait]
+impl<S, T> axum::extract::FromRequest<S> for OllamaJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = Bytes::from_request(req, state)
+            .await
+            .map_err(|e| bad_request(format!("could not read request body: {e}")))?;
+        // An empty body is worth naming specifically: it is what a client
+        // sends when it builds a request but forgets the payload, and
+        // "EOF while parsing a value" does not say that.
+        if bytes.is_empty() {
+            return Err(bad_request("request body is empty; expected a JSON object"));
+        }
+        serde_json::from_slice(&bytes)
+            .map(OllamaJson)
+            .map_err(|e| bad_request(format!("invalid JSON body: {e}")))
+    }
+}
+
 // ------------------------------------------------------- response shapes
 
 /// The nanosecond timings every Ollama client reads to display tok/s.
@@ -453,8 +502,15 @@ fn final_line(model: &str, shape: Shape, output: &GeneratedOutput, streaming: bo
     object
 }
 
+/// A failure that happens *after* the stream opened, where the status is
+/// already spent.
+///
+/// It carries `done: true` as well as the error: clients stop on `done`,
+/// not on stream close (see this module's header), so an error object
+/// without it leaves ollama-python and ollama-js waiting on a connection
+/// that will never produce another line.
 fn error_line(message: &str) -> Value {
-    serde_json::json!({ "error": message })
+    serde_json::json!({ "error": message, "done": true, "done_reason": "error" })
 }
 
 /// Recovers the human-readable reason from the response `stub` built, so
@@ -571,7 +627,7 @@ fn stream_ndjson(
 
 // ------------------------------------------------------------- handlers
 
-async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
+async fn chat(State(state): State<AppState>, OllamaJson(req): OllamaJson<ChatRequest>) -> Response {
     if let Err(message) = model_id::resolve(req.model.as_deref()) {
         return bad_request(message);
     }
@@ -627,7 +683,10 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
     respond(state, normalized, echoed, Shape::Chat).await
 }
 
-async fn generate(State(state): State<AppState>, Json(req): Json<GenerateRequest>) -> Response {
+async fn generate(
+    State(state): State<AppState>,
+    OllamaJson(req): OllamaJson<GenerateRequest>,
+) -> Response {
     if let Err(message) = model_id::resolve(req.model.as_deref()) {
         return bad_request(message);
     }
@@ -715,6 +774,15 @@ async fn respond(
     model: String,
     shape: Shape,
 ) -> Response {
+    // Before choosing to stream, not after. Streaming commits to 200 with
+    // the first byte, so a readiness failure discovered inside the stream
+    // can only be reported as an in-band `{"error": ...}` object under a
+    // 200 — and an Ollama client stops on `"done": true`, which such an
+    // object does not carry. The client sees a success status, then a
+    // message it cannot parse, then silence.
+    if let Some(message) = stub::readiness_error(&state) {
+        return stub::pre_stream_not_ready(ProtocolFlavor::Ollama, message);
+    }
     if normalized.stream {
         return stream_ndjson(state, normalized, model, shape);
     }
@@ -724,7 +792,7 @@ async fn respond(
     }
 }
 
-async fn embed(State(_state): State<AppState>, Json(_req): Json<Value>) -> Response {
+async fn embed(State(_state): State<AppState>, OllamaJson(_req): OllamaJson<Value>) -> Response {
     // Honest about *why*, not just that: the embedding runtime exists and
     // is oracle-validated (Phase 37), but `source::pinned` names no
     // pplx-embed artifact, so this build has no way to acquire the
@@ -764,7 +832,7 @@ async fn tags(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn show(State(state): State<AppState>, Json(req): Json<Value>) -> Response {
+async fn show(State(state): State<AppState>, OllamaJson(req): OllamaJson<Value>) -> Response {
     let requested = req
         .get("model")
         .or_else(|| req.get("name"))

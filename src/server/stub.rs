@@ -126,6 +126,76 @@ pub async fn generate_streaming_with_session(
         .map_err(|error| not_ready_body(&format!("generation failed: {error}"), request))
 }
 
+/// Whether a generation could even be attempted, checked without
+/// acquiring the generation slot.
+///
+/// Streaming responses commit to a status code the moment the first byte
+/// leaves, so a protocol adapter that branches into streaming *before*
+/// asking this can only report a later failure as an in-band error object
+/// under a 200 — which tells a client "success" and then hands it
+/// something its message parser does not understand. Adapters call this
+/// first so a request that was never going to run gets a real status.
+///
+/// Deliberately not slot-aware: these are static properties of the loaded
+/// process, so checking them early cannot race, while "is the slot free"
+/// can and must stay where it is.
+pub fn readiness_error(state: &AppState) -> Option<&'static str> {
+    if !state.model_installed {
+        return Some("no model installed yet; run `tqf` to complete first-run setup");
+    }
+    if state.generator.is_none() {
+        return Some("model receipt exists but its Qwen runtime is not loaded");
+    }
+    None
+}
+
+/// The 503 an adapter returns when `readiness_error` said no, *before* it
+/// opened a stream.
+///
+/// Deliberately separate from the in-stream error path below: once bytes
+/// are out the status is spent and a failure can only be an in-band
+/// object, but that is a fallback, not the shape to use when the failure
+/// is known up front. Every real provider answers an unavailable model
+/// with a status, so a client's error handling fires instead of its
+/// message parser.
+///
+/// Ollama gets one NDJSON line rather than a bare object because its
+/// clients are already line-parsing, and it carries `done: true` so a
+/// client that reads the body still terminates.
+pub fn pre_stream_not_ready(protocol: ProtocolFlavor, message: &str) -> Response {
+    match protocol {
+        ProtocolFlavor::Ollama => {
+            let body =
+                serde_json::json!({ "error": message, "done": true, "done_reason": "error" });
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+                format!("{body}\n"),
+            )
+                .into_response()
+        }
+        ProtocolFlavor::Anthropic => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": message},
+            })),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: ErrorDetail {
+                    message: message.to_string(),
+                    r#type: "service_unavailable",
+                    code: "model_not_ready",
+                },
+            }),
+        )
+            .into_response(),
+    }
+}
+
 /// Translates an unavailable state into the error envelope the *calling
 /// protocol* uses (spec §212: OpenAI surfaces return OpenAI-like errors,
 /// Ollama surfaces return Ollama-like ones, all mapped from one internal
