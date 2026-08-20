@@ -83,6 +83,25 @@ fn walk(
         }
     };
 
+    // `read_dir` yields entries in whatever order the filesystem stores
+    // them — ext4 hash order, APFS insertion order, and neither is
+    // promised. Chunk ids are assigned positionally from this walk, so an
+    // unsorted scan makes the persisted index depend on which machine
+    // built it: the same tree indexes to different chunk ids on two
+    // filesystems, and the ids shift whenever an unrelated file is added
+    // to a directory.
+    //
+    // Sorting by name makes the walk a function of the tree alone. Same
+    // reasoning as the tie-break in `retrieval::hybrid` (spec §193): a
+    // deterministic order is worth one sort per directory.
+    let mut entries: Vec<_> = entries.collect();
+    entries.sort_by_key(|entry| {
+        entry
+            .as_ref()
+            .map(|entry| entry.file_name())
+            .unwrap_or_default()
+    });
+
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -390,5 +409,53 @@ mod tests {
             .all(|f| f.relative_path != "escaped/secret.rs"));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    /// Chunk ids are assigned positionally from this walk, so the walk
+    /// order decides what the persisted index contains. `read_dir` order
+    /// is the filesystem's, not the tree's — the same repository indexed
+    /// on ext4 and APFS produced different chunk ids, and adding one
+    /// unrelated file could shift every id in its directory.
+    #[test]
+    fn the_walk_visits_files_in_a_defined_order_not_the_filesystems() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("tqf-scan-order-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("zeta")).unwrap();
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+
+        // Created in an order that is deliberately not the sorted one, so
+        // a filesystem preserving insertion order would fail this.
+        for name in ["m.rs", "z.rs", "a.rs"] {
+            std::fs::write(root.join(name), "fn main() {}\n").unwrap();
+        }
+        std::fs::write(root.join("zeta/one.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(root.join("alpha/two.rs"), "fn two() {}\n").unwrap();
+
+        let report = super::scan_root(&root).unwrap();
+        let paths: Vec<&str> = report
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+
+        // The contract is depth-first in name order, which is not the
+        // same as sorting the final path list: a directory `foo` and a
+        // file `foo.rs` compare as "foo" < "foo.rs" by name, so `foo`'s
+        // contents are emitted first even though "foo.rs" < "foo/bar.rs"
+        // as paths. Asserting the exact sequence pins what the walk
+        // actually promises rather than a stronger property it does not.
+        assert_eq!(
+            paths,
+            vec!["a.rs", "alpha/two.rs", "m.rs", "z.rs", "zeta/one.rs"],
+            "the walk must follow the tree, not the filesystem's storage order"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
