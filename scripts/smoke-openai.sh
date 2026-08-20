@@ -77,19 +77,36 @@ generation_status 'model "qwen3.6:35b"' /v1/chat/completions \
 
 note 'SSE streaming'
 S="$TMP/stream.sse"
-curl -fsS -N --max-time 300 "${JSON[@]}" "$BASE/v1/chat/completions" -d '{
+# No -f: an unready server answers this with a 503 and a JSON error body,
+# which is the correct behavior (a streaming request that cannot run must
+# fail with a status, not a 200 stream carrying an error event). -f would
+# discard that body and report it as a missing response.
+STREAM_CODE="$(curl -sS -N --max-time 300 -o "$S" -w '%{http_code}' \
+  "${JSON[@]}" "$BASE/v1/chat/completions" -d '{
   "model":"qwen3.6-35b-a3b",
   "messages":[{"role":"user","content":"Count to five."}],
-  "stream":true,"max_tokens":32}' > "$S" 2>/dev/null
-chunks=$(grep -c '^data: ' "$S" 2>/dev/null || echo 0)
+  "stream":true,"max_tokens":32}' 2>/dev/null)"
+
 if [ "$MODEL_INSTALLED" != "true" ]; then
-    skip "incremental delta count (no model installed; saw $chunks chunks)"
-elif [ "$chunks" -gt 3 ]; then
-    ok "streamed $chunks SSE chunks (incremental)"
+    # There is no stream to inspect the framing of. What matters is that
+    # the failure arrived as a status an SDK's error path can see: a 200
+    # here would tell every OpenAI client the call succeeded and hand the
+    # error to its stream parser instead.
+    if [ "$STREAM_CODE" = "503" ]; then
+        ok "streaming with no model returns 503 (got $STREAM_CODE)"
+    else
+        bad "streaming with no model returns 503 (got $STREAM_CODE)"
+    fi
+    skip 'SSE framing (no model installed)'
 else
-    bad "streamed $chunks SSE chunks — generation is not incremental"
+    chunks=$(grep -c '^data: ' "$S" 2>/dev/null || echo 0)
+    if [ "$chunks" -gt 3 ]; then
+        ok "streamed $chunks SSE chunks (incremental)"
+    else
+        bad "streamed $chunks SSE chunks — generation is not incremental"
+    fi
+    grep -q '\[DONE\]' "$S" && ok 'terminated with [DONE]' || bad 'terminated with [DONE]'
 fi
-grep -q '\[DONE\]' "$S" && ok 'terminated with [DONE]' || bad 'terminated with [DONE]'
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
