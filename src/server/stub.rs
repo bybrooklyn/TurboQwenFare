@@ -11,7 +11,8 @@ use axum::Json;
 use serde::Serialize;
 use tokio_stream::Stream;
 
-use crate::runtime::{GeneratedOutput, NormalizedRequest, Session};
+use crate::runtime::stream_decoder::StreamEvent;
+use crate::runtime::{GeneratedOutput, NormalizedRequest, ProtocolFlavor, Session};
 use crate::server::AppState;
 
 #[derive(Serialize)]
@@ -54,20 +55,20 @@ pub async fn generate_with_session(
     let Some(_permit) = state.generation_slot.acquire(&session.cancellation).await else {
         return Err(not_ready_body(
             "request cancelled before it reached the generation slot",
-            request.stream,
+            request,
         ));
     };
 
     if !state.model_installed {
         return Err(not_ready_body(
             "no model installed yet; run `tqf` to complete first-run setup",
-            request.stream,
+            request,
         ));
     }
     let Some(generator) = &state.generator else {
         return Err(not_ready_body(
             "model receipt exists but its Qwen runtime is not loaded",
-            request.stream,
+            request,
         ));
     };
     match generator
@@ -77,16 +78,111 @@ pub async fn generate_with_session(
         Ok(output) => Ok(output),
         Err(error) => Err(not_ready_body(
             &format!("generation failed: {error}"),
-            request.stream,
+            request,
         )),
     }
 }
 
-fn not_ready_body(message: &str, stream: bool) -> Response {
-    if stream {
-        sse_error(message).into_response()
-    } else {
-        (
+/// Streaming twin of [`generate_with_session`].
+///
+/// It repeats the same admission checks rather than sharing a helper on
+/// purpose: the single generation slot must be held for the whole
+/// streamed generation, so the permit has to live in this function's body
+/// until the generator returns.
+pub async fn generate_streaming_with_session(
+    state: &AppState,
+    request: &NormalizedRequest,
+    session: Session,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> std::result::Result<GeneratedOutput, Response> {
+    tracing::debug!(
+        session_id = %session.id,
+        protocol = ?request.protocol,
+        "queued streaming generation"
+    );
+
+    let Some(_permit) = state.generation_slot.acquire(&session.cancellation).await else {
+        return Err(not_ready_body(
+            "request cancelled before it reached the generation slot",
+            request,
+        ));
+    };
+
+    if !state.model_installed {
+        return Err(not_ready_body(
+            "no model installed yet; run `tqf` to complete first-run setup",
+            request,
+        ));
+    }
+    let Some(generator) = &state.generator else {
+        return Err(not_ready_body(
+            "model receipt exists but its Qwen runtime is not loaded",
+            request,
+        ));
+    };
+    generator
+        .generate_streaming(request.clone(), session.cancellation.clone(), events)
+        .await
+        .map_err(|error| not_ready_body(&format!("generation failed: {error}"), request))
+}
+
+/// Whether a generation could even be attempted, checked without
+/// acquiring the generation slot.
+///
+/// Streaming responses commit to a status code the moment the first byte
+/// leaves, so a protocol adapter that branches into streaming *before*
+/// asking this can only report a later failure as an in-band error object
+/// under a 200 — which tells a client "success" and then hands it
+/// something its message parser does not understand. Adapters call this
+/// first so a request that was never going to run gets a real status.
+///
+/// Deliberately not slot-aware: these are static properties of the loaded
+/// process, so checking them early cannot race, while "is the slot free"
+/// can and must stay where it is.
+pub fn readiness_error(state: &AppState) -> Option<&'static str> {
+    if !state.model_installed {
+        return Some("no model installed yet; run `tqf` to complete first-run setup");
+    }
+    if state.generator.is_none() {
+        return Some("model receipt exists but its Qwen runtime is not loaded");
+    }
+    None
+}
+
+/// The 503 an adapter returns when `readiness_error` said no, *before* it
+/// opened a stream.
+///
+/// Deliberately separate from the in-stream error path below: once bytes
+/// are out the status is spent and a failure can only be an in-band
+/// object, but that is a fallback, not the shape to use when the failure
+/// is known up front. Every real provider answers an unavailable model
+/// with a status, so a client's error handling fires instead of its
+/// message parser.
+///
+/// Ollama gets one NDJSON line rather than a bare object because its
+/// clients are already line-parsing, and it carries `done: true` so a
+/// client that reads the body still terminates.
+pub fn pre_stream_not_ready(protocol: ProtocolFlavor, message: &str) -> Response {
+    match protocol {
+        ProtocolFlavor::Ollama => {
+            let body =
+                serde_json::json!({ "error": message, "done": true, "done_reason": "error" });
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+                format!("{body}\n"),
+            )
+                .into_response()
+        }
+        ProtocolFlavor::Anthropic => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": message},
+            })),
+        )
+            .into_response(),
+        _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
                 error: ErrorDetail {
@@ -96,8 +192,70 @@ fn not_ready_body(message: &str, stream: bool) -> Response {
                 },
             }),
         )
-            .into_response()
+            .into_response(),
     }
+}
+
+/// Translates an unavailable state into the error envelope the *calling
+/// protocol* uses (spec §212: OpenAI surfaces return OpenAI-like errors,
+/// Ollama surfaces return Ollama-like ones, all mapped from one internal
+/// taxonomy).
+///
+/// Before this was protocol-aware, an Ollama client asking a server with
+/// no model installed got OpenAI's nested `{"error": {"message": ...}}`
+/// on an `/api/*` route, which Ollama clients do not parse.
+fn not_ready_body(message: &str, request: &NormalizedRequest) -> Response {
+    match request.protocol {
+        ProtocolFlavor::Ollama => ollama_not_ready(message, request.stream),
+        ProtocolFlavor::Anthropic => anthropic_not_ready(message, request.stream),
+        _ if request.stream => sse_error(message).into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: ErrorDetail {
+                    message: message.to_string(),
+                    r#type: "service_unavailable",
+                    code: "model_not_ready",
+                },
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Anthropic's `{"type": "error", "error": {...}}` envelope. A streaming
+/// request receives it as an SSE `error` event, which is how Anthropic's
+/// own stream reports a mid-flight failure.
+fn anthropic_not_ready(message: &str, stream: bool) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": message},
+    });
+    if stream {
+        return Sse::new(tokio_stream::iter(vec![Ok::<_, Infallible>(
+            Event::default().event("error").data(body.to_string()),
+        )]))
+        .into_response();
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
+/// Ollama's flat `{"error": "..."}` envelope. A streaming request gets it
+/// as a single NDJSON line, since the client is already parsing that
+/// framing and an abrupt close would look like a network fault.
+fn ollama_not_ready(message: &str, stream: bool) -> Response {
+    let body = serde_json::json!({ "error": message });
+    if stream {
+        let mut line = body.to_string();
+        line.push('\n');
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+            line,
+        )
+            .into_response();
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
 fn sse_error(message: &str) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {

@@ -27,6 +27,10 @@ cuda = []
 gui = []
 
 [dependencies]
+# Already in the tree via `regex`; taken as a direct dependency so the
+# content classifier can find every language marker in one pass instead
+# of rescanning each file once per marker.
+aho-corasick = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
@@ -44,10 +48,6 @@ blake3 = "1"
 async-trait = "0.1"
 bytes = "1"
 tokenizers = "0.23.1"
-# Renamed from the crate's real name "metal" to keep it distinct from this
-# manifest's own `metal` compute-backend feature (spec §49: "mature
-# Objective-C/Metal bindings for device/queue/resource management").
-metal-sys = { package = "metal", version = "0.33", optional = true }
 libc = "0.2.189"
 # IEEE-754 binary16 conversions for TQKV per-page quantization scales (spec
 # §157-159 store scales as FP16, not BF16 like the reference attention cache).
@@ -57,6 +57,19 @@ half = "2"
 # watcher events are hints, not a source of truth we'd want to
 # re-derive kqueue/FSEvents bindings for ourselves.
 notify = "6"
+
+# Renamed from the crate's real name "metal" to keep it distinct from this
+# manifest's own `metal` compute-backend feature (spec §49: "mature
+# Objective-C/Metal bindings for device/queue/resource management").
+#
+# Target-gated so a plain `cargo build`/`cargo test` works on every
+# platform: the `metal` feature is in `default`, but on a non-Apple target
+# this dependency is not in the graph at all, so `dep:metal-sys` activates
+# nothing and the crate compiles against `backend::reference`. Before this
+# gate, a Linux `cargo build` failed inside `core-graphics-types` with
+# `error[E0455]: link kind \`framework\` is only supported on Apple targets`.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal-sys = { package = "metal", version = "0.33", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
@@ -72,3 +85,27 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = 0
+
+# Lint policy. Everything not listed here is denied by `just lint`
+# (`cargo clippy --all-targets -- -D warnings`), so each allow below is a
+# deliberate, reasoned exception rather than accumulated drift.
+[lints.clippy]
+# The quant/SIMD/attention kernels walk several parallel arrays with one
+# counter (weight bytes, per-group scales, per-lane partial sums). Index
+# arithmetic is what makes those loops checkable line-by-line against the
+# reference math and the GGML block layout they must reproduce exactly;
+# zip/iterator chains obscure precisely the relationship that matters.
+# Sites: src/simd/mod.rs, src/model/qwen36/{weights,gdn}.rs,
+# src/context/tqattn/mod.rs.
+needless_range_loop = "allow"
+# The `.tqf` writer/reader and the attention kernel take many genuinely
+# independent scalars (byte offsets, lengths, checksums, head geometry).
+# Bundling them into parameter structs to satisfy a count would hide what
+# each call site actually passes, which is the property `format/tqf`'s
+# bounds-validation invariants (spec §115 items 2-3) depend on.
+too_many_arguments = "allow"
+# `BoundMoe` and `QwenRuntimeInstance` dispatch the decode path between a
+# resident and a streaming runtime. Boxing the large variant to equalize
+# them would add a pointer chase per layer per token on the one loop the
+# whole project's tok/s floor is measured on.
+large_enum_variant = "allow"

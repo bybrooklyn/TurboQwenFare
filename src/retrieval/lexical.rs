@@ -29,13 +29,31 @@ struct ChunkEntry {
 /// lowercased for lexical matching. Case is preserved separately for the
 /// exact-identifier lane.
 fn tokenize(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    for raw in split_raw_tokens(text) {
+    tokenize_raw(&split_raw_tokens(text))
+}
+
+/// The tokenizing half, over raw tokens a caller has already split.
+///
+/// Separated so `build` can split each document once and feed both the
+/// BM25 lane (lowercased, plus identifier subtokens) and the exact lane
+/// (the same tokens, case preserved) from one pass.
+fn tokenize_raw(raw_tokens: &[&str]) -> Vec<String> {
+    let mut tokens = Vec::with_capacity(raw_tokens.len());
+    for raw in raw_tokens {
         if raw.is_empty() {
             continue;
         }
         tokens.push(raw.to_ascii_lowercase());
-        let subtokens = split_identifier(&raw);
+        // `split_identifier` allocates a `Vec<char>`, a `Vec<String>`,
+        // and a `String` per part — for every token, including the
+        // majority that have no boundary to split on and whose single
+        // part is discarded by the `len() > 1` check below. A token with
+        // no underscore, no uppercase, and no digit cannot produce more
+        // than one part, so the scan below decides it without allocating.
+        if !may_split(raw) {
+            continue;
+        }
+        let subtokens = split_identifier(raw);
         if subtokens.len() > 1 {
             for sub in subtokens {
                 tokens.push(sub.to_ascii_lowercase());
@@ -43,6 +61,17 @@ fn tokenize(text: &str) -> Vec<String> {
         }
     }
     tokens
+}
+
+/// Whether `split_identifier` could return more than one part.
+///
+/// Every boundary it recognizes needs an underscore, an uppercase
+/// character, or a digit: the camel/Pascal and acronym rules both require
+/// `curr_is_upper`, and the digit rule requires a digit on one side. A
+/// token with none of the three is returned whole.
+fn may_split(raw: &str) -> bool {
+    raw.chars()
+        .any(|c| c == '_' || c.is_uppercase() || c.is_ascii_digit())
 }
 
 /// Splits on anything that isn't alphanumeric or `_` — the raw
@@ -91,6 +120,20 @@ fn split_identifier(raw: &str) -> Vec<String> {
     parts
 }
 
+/// The persistable form of a lexical index (spec §185): postings sorted
+/// by chunk id, the exact identifier lane, per-chunk token counts for
+/// BM25 length normalization, and the chunk paths those counts belong to.
+///
+/// Named rather than returned as a bare 4-tuple so `export` and
+/// `from_parts` describe the same thing and callers destructure against a
+/// documented order.
+pub type PersistedLexical = (
+    std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+    std::collections::BTreeMap<String, Vec<u32>>,
+    Vec<u32>,
+    Vec<String>,
+);
+
 pub struct LexicalIndex {
     postings: HashMap<String, Vec<(u32, u32)>>, // term -> [(chunk_id, term_frequency)]
     chunks: Vec<ChunkEntry>,
@@ -115,25 +158,41 @@ impl LexicalIndex {
 
         for (chunk_id, (path, content)) in documents.iter().enumerate() {
             let chunk_id = chunk_id as u32;
-            let tokens = tokenize(content);
+            // Split once and serve both lanes from it. BM25 wants the
+            // lowercased tokens plus identifier subtokens; the exact lane
+            // wants the same raw tokens case-preserved, and used to
+            // re-split the whole document to get them.
+            let raw_tokens = split_raw_tokens(content);
+            let tokens = tokenize_raw(&raw_tokens);
             total_tokens += tokens.len() as u64;
             chunks.push(ChunkEntry {
                 path: path.clone(),
                 token_count: tokens.len() as u32,
             });
 
+            // `tokens` is consumed rather than borrowed: every entry is
+            // already an owned String, so cloning each one to key the
+            // per-document tally allocated once per token *occurrence*.
             let mut term_frequency: HashMap<String, u32> = HashMap::new();
-            for token in &tokens {
-                *term_frequency.entry(token.clone()).or_insert(0) += 1;
+            for token in tokens {
+                *term_frequency.entry(token).or_insert(0) += 1;
             }
             for (term, tf) in term_frequency {
                 postings.entry(term).or_default().push((chunk_id, tf));
             }
 
-            for raw in split_raw_tokens(content) {
-                let entry = exact.entry(raw.to_string()).or_default();
-                if entry.last() != Some(&chunk_id) {
-                    entry.push(chunk_id);
+            for raw in raw_tokens {
+                // Only allocate for an identifier this chunk has not
+                // already recorded; the common case is a repeat.
+                match exact.get_mut(raw) {
+                    Some(entry) => {
+                        if entry.last() != Some(&chunk_id) {
+                            entry.push(chunk_id);
+                        }
+                    }
+                    None => {
+                        exact.insert(raw.to_string(), vec![chunk_id]);
+                    }
                 }
             }
         }
@@ -150,6 +209,79 @@ impl LexicalIndex {
             avg_doc_len,
             exact,
         }
+    }
+
+    /// The index in the form `.tqi` persists (spec §185): postings
+    /// sorted by chunk id, the exact identifier lane, and per-chunk token
+    /// counts, which BM25 needs for length normalization.
+    ///
+    /// Returned rather than serialized here so `retrieval::tqi` owns the
+    /// on-disk layout and this module stays about scoring.
+    pub fn export(&self) -> PersistedLexical {
+        let mut postings: std::collections::BTreeMap<String, Vec<(u32, u32)>> =
+            std::collections::BTreeMap::new();
+        for (term, list) in &self.postings {
+            let mut list = list.clone();
+            // Spec §185: postings are sorted by chunk id. The in-memory
+            // build appends in document order, which is the same thing
+            // today, but persisting relies on it so it is made explicit.
+            list.sort_unstable_by_key(|(chunk, _)| *chunk);
+            postings.insert(term.clone(), list);
+        }
+
+        let mut exact: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for (identifier, list) in &self.exact {
+            let mut list = list.clone();
+            list.sort_unstable();
+            exact.insert(identifier.clone(), list);
+        }
+
+        (
+            postings,
+            exact,
+            self.chunks.iter().map(|c| c.token_count).collect(),
+            self.chunks.iter().map(|c| c.path.clone()).collect(),
+        )
+    }
+
+    /// Rebuilds a searchable index from persisted parts, without
+    /// re-reading or re-tokenizing any source file — which is the whole
+    /// point of persisting it.
+    pub fn from_parts(
+        postings: std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+        exact: std::collections::BTreeMap<String, Vec<u32>>,
+        chunk_lengths: &[u32],
+        paths: &[String],
+    ) -> Self {
+        let chunks: Vec<ChunkEntry> = paths
+            .iter()
+            .zip(chunk_lengths.iter())
+            .map(|(path, token_count)| ChunkEntry {
+                path: path.clone(),
+                token_count: *token_count,
+            })
+            .collect();
+        let total: u64 = chunks.iter().map(|c| c.token_count as u64).sum();
+        let avg_doc_len = if chunks.is_empty() {
+            0.0
+        } else {
+            total as f32 / chunks.len() as f32
+        };
+
+        Self {
+            postings: postings.into_iter().collect(),
+            chunks,
+            avg_doc_len,
+            exact: exact.into_iter().collect(),
+        }
+    }
+
+    /// Distinct BM25 terms across the whole index — a cheap measure of
+    /// how much vocabulary a scan actually produced, which is what
+    /// `tqf sync` reports to show the index is real rather than empty.
+    pub fn term_count(&self) -> usize {
+        self.postings.len()
     }
 
     pub fn document_count(&self) -> usize {
@@ -347,6 +479,380 @@ mod tests {
             exact_hits.len(),
             bm25_hits.first(),
             ignore_hits.first(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    fn corpus() -> Vec<(String, String)> {
+        vec![
+            (
+                "src/memory/mod.rs".to_string(),
+                "pub struct MemoryBroker { budget: u64 } impl MemoryBroker { pub fn reserve() {} }"
+                    .to_string(),
+            ),
+            (
+                "src/experts/mod.rs".to_string(),
+                "pub struct WholeExpertLfuCache { capacity: usize } fn evict_least_frequent() {}"
+                    .to_string(),
+            ),
+            (
+                "README.md".to_string(),
+                "TurboQwenFare streams experts from SSD through a memory broker.".to_string(),
+            ),
+        ]
+    }
+
+    /// Persisting is only worth anything if what comes back searches the
+    /// same. Compares ranked results, not internal structure.
+    #[test]
+    fn an_exported_index_rebuilds_into_one_that_searches_identically() {
+        let original = LexicalIndex::build(&corpus());
+        let (postings, exact, lengths, paths) = original.export();
+        let rebuilt = LexicalIndex::from_parts(postings, exact, &lengths, &paths);
+
+        assert_eq!(rebuilt.document_count(), original.document_count());
+        assert_eq!(rebuilt.term_count(), original.term_count());
+
+        for query in [
+            "memory broker",
+            "expert cache eviction",
+            "streams experts from ssd",
+            "capacity",
+        ] {
+            let before = original.search(query, 5);
+            let after = rebuilt.search(query, 5);
+            assert_eq!(
+                before.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                after.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+                "ranking changed for {query:?}"
+            );
+            for ((_, a), (_, b)) in before.iter().zip(after.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "score changed for {query:?}: {a} vs {b}"
+                );
+            }
+        }
+
+        // The exact lane must survive too — it is case-preserved and
+        // bypasses BM25 entirely.
+        assert_eq!(
+            rebuilt.exact_lookup("MemoryBroker"),
+            original.exact_lookup("MemoryBroker")
+        );
+    }
+
+    /// Spec §185: postings are sorted by chunk id. The persisted form
+    /// relies on it, so the export makes it explicit rather than assuming
+    /// build order.
+    #[test]
+    fn exported_postings_are_sorted_by_chunk_id() {
+        let (postings, exact, _, _) = LexicalIndex::build(&corpus()).export();
+        for (term, list) in &postings {
+            let ids: Vec<u32> = list.iter().map(|(chunk, _)| *chunk).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            assert_eq!(ids, sorted, "postings for {term:?} are not sorted");
+        }
+        for (identifier, list) in &exact {
+            let mut sorted = list.clone();
+            sorted.sort_unstable();
+            assert_eq!(*list, sorted, "exact list for {identifier:?} is not sorted");
+        }
+    }
+
+    #[test]
+    fn an_empty_index_exports_and_rebuilds() {
+        let original = LexicalIndex::build(&[]);
+        let (postings, exact, lengths, paths) = original.export();
+        let rebuilt = LexicalIndex::from_parts(postings, exact, &lengths, &paths);
+        assert_eq!(rebuilt.document_count(), 0);
+        assert!(rebuilt.search("anything", 5).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod build_cost_probe {
+    /// Measurement, not a correctness check. Points at a directory via
+    /// `TQF_BENCH_TREE` so it can run against a large synthetic tree as
+    /// well as this repository:
+    /// `TQF_BENCH_TREE=/path cargo test --release -- --ignored --nocapture build_cost_split`
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn build_cost_split() {
+        let root = std::env::var("TQF_BENCH_TREE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+        let report = crate::retrieval::scan::scan_root(&root).unwrap();
+        let documents: Vec<(String, String)> = report
+            .files
+            .iter()
+            .filter(|f| f.classification.language == Some("Rust"))
+            .filter_map(|f| {
+                std::fs::read_to_string(root.join(&f.relative_path))
+                    .ok()
+                    .map(|text| (f.relative_path.clone(), text))
+            })
+            .collect();
+        let bytes: usize = documents.iter().map(|(_, t)| t.len()).sum();
+
+        let started = std::time::Instant::now();
+        let index = super::LexicalIndex::build(&documents);
+        let whole = started.elapsed();
+
+        // Raw splitting alone.
+        let started = std::time::Instant::now();
+        let mut raw_count = 0usize;
+        for (_, text) in &documents {
+            raw_count += std::hint::black_box(super::split_raw_tokens(text)).len();
+        }
+        let split_only = started.elapsed();
+
+        // Splitting plus the lowercase/subtoken pass.
+        let started = std::time::Instant::now();
+        let mut token_count = 0usize;
+        for (_, text) in &documents {
+            let raw = super::split_raw_tokens(text);
+            token_count += std::hint::black_box(super::tokenize_raw(&raw)).len();
+        }
+        let tokenize_only = started.elapsed();
+
+        println!(
+            "\ndocs {}  bytes {:.1} MiB  raw tokens {raw_count}  tokens {token_count}  terms              {}\n  whole build   {:>8.1} ms\n  split only    {:>8.1} ms\n  split+tokenize              {:>7.1} ms\n  remainder     {:>8.1} ms",
+            documents.len(),
+            bytes as f64 / (1024.0 * 1024.0),
+            index.term_count(),
+            whole.as_secs_f64() * 1000.0,
+            split_only.as_secs_f64() * 1000.0,
+            tokenize_only.as_secs_f64() * 1000.0,
+            (whole.as_secs_f64() - tokenize_only.as_secs_f64()) * 1000.0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tokenize_equivalence {
+    use super::*;
+
+    /// Tokenization with no fast path: `split_identifier` is called for
+    /// every token, unconditionally. An independent oracle — the
+    /// `build_equivalence` tests below compare two builds that both go
+    /// through `tokenize_raw`, so they could not catch a change inside
+    /// it.
+    fn tokenize_raw_always_splitting(raw_tokens: &[&str]) -> Vec<String> {
+        let mut tokens = Vec::new();
+        for raw in raw_tokens {
+            if raw.is_empty() {
+                continue;
+            }
+            tokens.push(raw.to_ascii_lowercase());
+            let subtokens = split_identifier(raw);
+            if subtokens.len() > 1 {
+                for sub in subtokens {
+                    tokens.push(sub.to_ascii_lowercase());
+                }
+            }
+        }
+        tokens
+    }
+
+    #[test]
+    fn the_fast_path_tokenizes_this_repository_identically() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = crate::retrieval::scan::scan_root(root).unwrap();
+        let mut compared = 0usize;
+        for file in &report.files {
+            let Ok(text) = std::fs::read_to_string(root.join(&file.relative_path)) else {
+                continue;
+            };
+            let raw = split_raw_tokens(&text);
+            assert_eq!(
+                tokenize_raw(&raw),
+                tokenize_raw_always_splitting(&raw),
+                "{}",
+                file.relative_path
+            );
+            compared += 1;
+        }
+        assert!(
+            compared > 100,
+            "expected a real corpus, compared {compared}"
+        );
+    }
+
+    /// The shapes the fast path has to get right, stated directly: a
+    /// token is skipped only when it cannot split, and every kind of
+    /// boundary `split_identifier` recognizes must defeat the skip.
+    #[test]
+    fn every_boundary_kind_still_reaches_the_splitter() {
+        for raw in [
+            // No boundary — the case the fast path exists for.
+            "count",
+            "input",
+            "fn",
+            "x",
+            "",
+            // Underscore, camel, Pascal, acronym, digit boundaries.
+            "memory_broker",
+            "memoryBroker",
+            "MemoryBroker",
+            "HTTPServer",
+            "utf8",
+            "q4k",
+            "SCREAMING_CASE",
+            "mixed_Case9x",
+            // Non-ASCII: lowercase accented letters must not be treated
+            // as a boundary, uppercase ones must.
+            "café",
+            "Café",
+        ] {
+            let raw_tokens = vec![raw];
+            assert_eq!(
+                tokenize_raw(&raw_tokens),
+                tokenize_raw_always_splitting(&raw_tokens),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// `may_split` must never say "no" to something that would split —
+    /// a false negative silently drops subtokens from the index, which
+    /// no search result would obviously reveal.
+    #[test]
+    fn may_split_never_skips_a_token_that_would_split() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = crate::retrieval::scan::scan_root(root).unwrap();
+        for file in &report.files {
+            let Ok(text) = std::fs::read_to_string(root.join(&file.relative_path)) else {
+                continue;
+            };
+            for raw in split_raw_tokens(&text) {
+                if !may_split(raw) {
+                    assert_eq!(
+                        split_identifier(raw).len(),
+                        1,
+                        "{raw:?} was skipped but splits into {:?}",
+                        split_identifier(raw)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod build_equivalence {
+    use super::*;
+
+    /// The build loop as it stood before the split-once / no-clone
+    /// change, kept as the oracle. Both changes are optimizations, so the
+    /// bar is an identical index, not a similar one.
+    fn build_by_resplitting(documents: &[(String, String)]) -> LexicalIndex {
+        let mut postings: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+        let mut chunks = Vec::with_capacity(documents.len());
+        let mut exact: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut total_tokens = 0u64;
+
+        for (chunk_id, (path, content)) in documents.iter().enumerate() {
+            let chunk_id = chunk_id as u32;
+            let tokens = tokenize(content);
+            total_tokens += tokens.len() as u64;
+            chunks.push(ChunkEntry {
+                path: path.clone(),
+                token_count: tokens.len() as u32,
+            });
+
+            let mut term_frequency: HashMap<String, u32> = HashMap::new();
+            for token in &tokens {
+                *term_frequency.entry(token.clone()).or_insert(0) += 1;
+            }
+            for (term, tf) in term_frequency {
+                postings.entry(term).or_default().push((chunk_id, tf));
+            }
+
+            for raw in split_raw_tokens(content) {
+                let entry = exact.entry(raw.to_string()).or_default();
+                if entry.last() != Some(&chunk_id) {
+                    entry.push(chunk_id);
+                }
+            }
+        }
+
+        let avg_doc_len = if chunks.is_empty() {
+            0.0
+        } else {
+            total_tokens as f32 / chunks.len() as f32
+        };
+        LexicalIndex {
+            postings,
+            chunks,
+            avg_doc_len,
+            exact,
+        }
+    }
+
+    fn real_documents() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = crate::retrieval::scan::scan_root(root).unwrap();
+        report
+            .files
+            .iter()
+            .filter(|f| f.classification.language == Some("Rust"))
+            .filter_map(|f| {
+                std::fs::read_to_string(root.join(&f.relative_path))
+                    .ok()
+                    .map(|text| (f.relative_path.clone(), text))
+            })
+            .collect()
+    }
+
+    /// Compared through `export`, which is what actually reaches disk:
+    /// postings, the exact lane, per-chunk token counts, and paths.
+    #[test]
+    fn splitting_once_builds_the_same_index_as_resplitting() {
+        let documents = real_documents();
+        assert!(documents.len() > 100, "expected a real corpus");
+
+        let fast = LexicalIndex::build(&documents);
+        let slow = build_by_resplitting(&documents);
+
+        assert_eq!(fast.export(), slow.export());
+        assert_eq!(fast.document_count(), slow.document_count());
+        assert_eq!(fast.term_count(), slow.term_count());
+        assert!((fast.avg_doc_len - slow.avg_doc_len).abs() < 1e-6);
+    }
+
+    /// And the scores it serves, not just the bytes it stores — a
+    /// difference in `avg_doc_len` alone would leave `export` identical
+    /// while every ranking shifted.
+    #[test]
+    fn splitting_once_serves_the_same_rankings() {
+        let documents = real_documents();
+        let fast = LexicalIndex::build(&documents);
+        let slow = build_by_resplitting(&documents);
+
+        for query in [
+            "whole expert lfu cache eviction",
+            "memory broker reservation",
+            "gitignore glob pattern matching",
+            "streaming ndjson terminal object",
+        ] {
+            let a = fast.search(query, 10);
+            let b = slow.search(query, 10);
+            assert_eq!(a.len(), b.len(), "{query}");
+            for ((path_a, score_a), (path_b, score_b)) in a.iter().zip(b.iter()) {
+                assert_eq!(path_a, path_b, "{query}");
+                assert!((score_a - score_b).abs() < 1e-6, "{query}");
+            }
+        }
+        assert_eq!(
+            fast.exact_lookup("MemoryBroker"),
+            slow.exact_lookup("MemoryBroker")
         );
     }
 }

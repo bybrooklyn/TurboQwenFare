@@ -11,6 +11,3 @@ pub mod tools;
 
 #[cfg(test)]
 mod tests;
-
-pub use server::handle_request;
-pub use tools::IndexState;

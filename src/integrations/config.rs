@@ -16,6 +16,18 @@
 
 use std::path::PathBuf;
 
+/// Stands in for the ephemeral config directory in an env var value,
+/// substituted for the real absolute path by
+/// `launch::build_launch_command`.
+///
+/// The directory does not exist yet when a config is built, so its path
+/// cannot be written here. This used to be spelled `"."`, which worked
+/// only because the launcher moved the client's working directory into
+/// the config directory — and that broke the client, whose whole job is
+/// to operate on the project the user is in. A placeholder no path could
+/// be confused with keeps the substitution explicit.
+pub const CONFIG_DIR: &str = "<tqf-ephemeral-config-dir>";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKind {
     OpenCode,
@@ -140,7 +152,7 @@ args = [{}]
             );
             EphemeralConfig {
                 env_vars: vec![
-                    ("CODEX_HOME".to_string(), ".".to_string()),
+                    ("CODEX_HOME".to_string(), CONFIG_DIR.to_string()),
                     ("TQF_API_KEY".to_string(), "tqf-local".to_string()),
                 ],
                 files: vec![(PathBuf::from("config.toml"), config)],

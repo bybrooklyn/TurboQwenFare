@@ -65,14 +65,69 @@ fn sample_native() -> Option<(u64, u64, u64)> {
 
 #[cfg(target_os = "linux")]
 fn sample_native() -> Option<(u64, u64, u64)> {
-    // /proc/self/statm: size resident shared text lib data dt - pages,
-    // resident is the model-relevant number; virtual = size.
+    // `/proc/self/status` is preferred over `/proc/self/statm` because it
+    // is the only one of the two that reports a *peak* resident set
+    // (`VmHWM`). Phase 24's whole point is that a configuration is not
+    // "4G certified" because steady-state decode is 3.9G if admission
+    // spiked to 4.7G — a sampler that reports peak as 0 cannot make that
+    // judgement, and the macOS branch above (`resident_size_max`) does.
+    // Values are in kB per the kernel's own formatting.
+    if let Some(sample) = sample_proc_status() {
+        return Some(sample);
+    }
+    // `/proc/self/statm` fallback for kernels/sandboxes without a status
+    // file. Peak is genuinely unavailable here, so it is reported as the
+    // current resident set rather than 0: peak is by definition at least
+    // the current value, and 0 would understate it in a way callers
+    // (`assert_footprint_within`) treat as real evidence.
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let mut fields = statm.split_whitespace();
     let pages = fields.next()?.parse::<u64>().ok()?;
     let resident_pages = fields.next()?.parse::<u64>().ok()?;
-    let page = 4096u64;
-    Some((resident_pages * page, pages * page, 0))
+    let page = page_size();
+    let resident = resident_pages * page;
+    Some((resident, pages * page, resident))
+}
+
+/// Parses `VmRSS`, `VmSize`, and `VmHWM` (peak resident) out of
+/// `/proc/self/status`. Returns `None` if the file is unreadable or any
+/// of the three fields is absent, so the caller can fall back rather
+/// than report a partially-zero sample.
+#[cfg(target_os = "linux")]
+fn sample_proc_status() -> Option<(u64, u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut resident = None;
+    let mut virtual_bytes = None;
+    let mut peak = None;
+    for line in status.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let target = match key {
+            "VmRSS" => &mut resident,
+            "VmSize" => &mut virtual_bytes,
+            "VmHWM" => &mut peak,
+            _ => continue,
+        };
+        // "VmRSS:\t   12345 kB"
+        let kilobytes = value.split_whitespace().next()?.parse::<u64>().ok()?;
+        *target = Some(kilobytes.saturating_mul(1024));
+    }
+    Some((resident?, virtual_bytes?, peak?))
+}
+
+/// The real OS page size rather than an assumed 4096: aarch64 Linux and
+/// several distributions ship 16K/64K pages, which would silently scale
+/// every `/proc/self/statm` reading by 4x or 16x.
+#[cfg(target_os = "linux")]
+fn page_size() -> u64 {
+    // SAFETY: `sysconf` is thread-safe and takes no pointers.
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if raw > 0 {
+        raw as u64
+    } else {
+        4096
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -150,7 +205,7 @@ mod tests {
 
     #[test]
     fn sampler_reports_a_plausible_footprint_above_broker_reservation() {
-        let broker = MemoryBroker::new(Bytes(1 * 1024 * 1024 * 1024));
+        let broker = MemoryBroker::new(Bytes(1024 * 1024 * 1024));
         let lease = broker
             .reserve(
                 MemoryOwner::Scratch,
@@ -166,7 +221,7 @@ mod tests {
         let sample = sample_os_footprint(&broker).unwrap();
         assert!(sample.resident_bytes > 0, "resident set must be nonzero");
         assert!(
-            sample.resident_bytes >= 1 * 1024 * 1024,
+            sample.resident_bytes >= 1024 * 1024,
             "touched pages must be resident (got {})",
             sample.resident_bytes
         );
@@ -177,9 +232,43 @@ mod tests {
         assert_eq!(broker.snapshot().reserved, Bytes(0));
     }
 
+    /// The Linux branch previously read `/proc/self/statm`, which has no
+    /// peak field at all, and reported peak as a hardcoded 0 — so the
+    /// `resident_peak_bytes >= resident_bytes` invariant every caller
+    /// relies on was false on every Linux run. This pins the real
+    /// `/proc/self/status` reader instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_status_reports_a_real_peak_at_or_above_the_current_resident_set() {
+        let (resident, virtual_bytes, peak) =
+            sample_proc_status().expect("/proc/self/status must be readable on Linux");
+        assert!(resident > 0, "VmRSS must be nonzero for a live process");
+        assert!(
+            virtual_bytes >= resident,
+            "VmSize ({virtual_bytes}) must be at least VmRSS ({resident})"
+        );
+        assert!(
+            peak >= resident,
+            "VmHWM ({peak}) must be at least VmRSS ({resident})"
+        );
+    }
+
+    /// The page size must come from the OS, not a hardcoded 4096: a
+    /// 16K-page kernel would otherwise scale every `statm` reading by 4x.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn page_size_is_a_real_power_of_two_from_the_os() {
+        let page = page_size();
+        assert!(page >= 4096, "implausible page size {page}");
+        assert!(
+            page.is_power_of_two(),
+            "page size {page} is not a power of two"
+        );
+    }
+
     #[test]
     fn sampler_tracks_broker_peak_across_churn() {
-        let broker = MemoryBroker::new(Bytes(1 * 1024 * 1024 * 1024));
+        let broker = MemoryBroker::new(Bytes(1024 * 1024 * 1024));
         let first = broker
             .reserve(
                 MemoryOwner::IoStaging,

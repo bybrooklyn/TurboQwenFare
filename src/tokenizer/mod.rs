@@ -27,6 +27,16 @@ pub struct TqfTokenizer {
     pub eos_token_id: Option<u32>,
 }
 
+/// Per-generation state for [`TqfTokenizer::decode_step`]. One of these
+/// belongs to each in-flight generation; sharing one across requests would
+/// splice their outputs together.
+#[derive(Debug, Default)]
+pub struct DecodeStreamState {
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
+
 impl TqfTokenizer {
     pub fn from_gguf(file: &GgufFile) -> Result<Self> {
         gguf::build_from_gguf(file)
@@ -69,6 +79,33 @@ impl TqfTokenizer {
         self.inner
             .decode(ids, skip_special_tokens)
             .map_err(|e| ModelError::TokenizerBuild(e.to_string()).into())
+    }
+
+    /// Feeds one newly generated token to an incremental decode and
+    /// returns whatever complete text that token completed, or `None` if
+    /// it only added part of a multi-byte codepoint.
+    ///
+    /// Spec §71 calls out UTF-8 boundaries as a real streaming bug class:
+    /// a naive per-token `decode` emits U+FFFD replacement characters
+    /// whenever a codepoint spans tokens, which for CJK and emoji is
+    /// routine rather than exotic. This defers to `tokenizers`' own
+    /// `step_decode_stream`, which re-decodes and withholds any result
+    /// ending in a replacement character — the same primitive the
+    /// upstream library's streaming API uses.
+    ///
+    /// It takes the state by reference rather than borrowing the
+    /// tokenizer (as `DecodeStream` would), so callers can keep the
+    /// tokenizer behind its `Mutex`.
+    pub fn decode_step(&self, state: &mut DecodeStreamState, token: u32) -> Result<Option<String>> {
+        tokenizers::tokenizer::step_decode_stream(
+            &self.inner,
+            vec![token],
+            /* skip_special_tokens */ false,
+            &mut state.ids,
+            &mut state.prefix,
+            &mut state.prefix_index,
+        )
+        .map_err(|e| ModelError::TokenizerBuild(e.to_string()).into())
     }
 
     pub fn token_to_id(&self, token: &str) -> Option<u32> {

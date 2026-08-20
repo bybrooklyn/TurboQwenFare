@@ -215,7 +215,6 @@ impl GpuResidentExpert {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::metal::kernels::load_reference_kernel_library;
     use crate::backend::reference;
     use crate::format::quant::dequant::Q4_K_BLOCK_ELEMENTS;
     use crate::format::quant::GgmlType;
@@ -355,7 +354,7 @@ mod tests {
 
     #[test]
     fn stored_bytes_equals_the_uploaded_payload_size() {
-        let Some(mut state) = state_or_skip() else {
+        let Some(state) = state_or_skip() else {
             return;
         };
         let (expert_width, hidden) = (256, 256);

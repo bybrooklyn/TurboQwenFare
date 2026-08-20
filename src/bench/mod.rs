@@ -6,5 +6,5 @@
 //! buffers, pipeline cache, dispatch, timing) works end to end, wired to
 //! `tqf optimize` rather than a second binary.
 
-#[cfg(feature = "metal")]
+#[cfg(tqf_metal)]
 pub mod metal_synthetic;

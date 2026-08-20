@@ -16,5 +16,3 @@ pub mod weights;
 
 #[cfg(test)]
 mod tests;
-
-pub use runtime::GteRerankerRuntime;

@@ -16,6 +16,7 @@ use crate::ids::{Bytes, LayerId, LayerKind};
 use crate::memory::MemoryBroker;
 use crate::runtime::decode::top_logit_candidates;
 use crate::runtime::{DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, RouterTrace};
+use crate::sampling::Sampler;
 
 use super::attention::{split_query_gate_accounted, FullAttentionLayer};
 use super::gdn::{
@@ -236,6 +237,17 @@ impl Qwen36ReferenceRuntime {
         })
     }
 
+    /// The broker governing this runtime's residency.
+    ///
+    /// `MemoryBroker` is an `Arc` handle, so this shares the accounting
+    /// rather than copying it — a second holder reserving against it is
+    /// charged to the same `--memory` budget, which is the whole point
+    /// (spec §115 invariant 4: every large allocation is registered with
+    /// the broker *before* it happens).
+    pub fn broker(&self) -> MemoryBroker {
+        self.broker.clone()
+    }
+
     pub fn expert_cache_stats(&self) -> Option<crate::experts::ExpertCacheStats> {
         self.expert_cache.as_ref().map(WholeExpertLfuCache::stats)
     }
@@ -359,11 +371,24 @@ impl Qwen36ReferenceRuntime {
         }
     }
 
+    /// Greedy decode: the signature and behavior every qualification
+    /// harness in `docs/research/qualification/` was recorded against.
+    /// It delegates to `decode_step` with `Sampler::Greedy`, which returns
+    /// the argmax verbatim, so parity records stay valid by construction.
+    pub fn decode_greedy(&mut self, input_token: u32) -> Result<DecodeToken> {
+        self.decode_step(input_token, &mut Sampler::Greedy, &[])
+    }
+
     /// Runs one actual checkpoint token through embedding, all forty
-    /// attention/GDN+MoE layers, final norm, Q6_K LM head, and greedy
+    /// attention/GDN+MoE layers, final norm, Q6_K LM head, and token
     /// selection.  The returned diagnostics are the Phase-15 qualification
     /// artifacts; no generic callback or protocol code enters this loop.
-    pub fn decode_greedy(&mut self, input_token: u32) -> Result<DecodeToken> {
+    pub fn decode_step(
+        &mut self,
+        input_token: u32,
+        sampler: &mut Sampler,
+        history: &[u32],
+    ) -> Result<DecodeToken> {
         if input_token as usize >= Qwen36Geometry::VOCAB_SIZE {
             return Err(ModelError::Shape {
                 tensor: "Qwen input token",
@@ -410,8 +435,12 @@ impl Qwen36ReferenceRuntime {
         let logits = self.lm_head.matvec(&self.broker, &hidden.values)?;
         timings.lm_head = start.elapsed();
         let start = Instant::now();
+        // `top_logits` stays unconditional: it is a diagnostics artifact
+        // the qualification harnesses read, and it is also the exact argmax
+        // `Sampler::Greedy` returns — so the greedy path's arithmetic is
+        // unchanged, not merely equivalent.
         let top_logits = top_logit_candidates(&logits.values);
-        let token = top_logits[0].token;
+        let token = sampler.select(&logits.values, history, top_logits[0].token);
         timings.sampling = start.elapsed();
         self.decode_index = self.decode_index.saturating_add(1);
         Ok(DecodeToken {
@@ -508,6 +537,11 @@ impl Qwen36BoundedReferenceRuntime {
         })
     }
 
+    /// See `Qwen36ReferenceRuntime::broker`.
+    pub fn broker(&self) -> MemoryBroker {
+        self.broker.clone()
+    }
+
     pub fn expert_cache_stats(&self) -> crate::experts::ExpertCacheStats {
         self.expert_cache.stats()
     }
@@ -520,7 +554,20 @@ impl Qwen36BoundedReferenceRuntime {
         self.expert_cache.set_gpu_enabled(enabled);
     }
 
+    /// Greedy decode: the signature and behavior every qualification
+    /// harness in `docs/research/qualification/` was recorded against.
+    /// It delegates to `decode_step` with `Sampler::Greedy`, which returns
+    /// the argmax verbatim, so parity records stay valid by construction.
     pub fn decode_greedy(&mut self, input_token: u32) -> Result<DecodeToken> {
+        self.decode_step(input_token, &mut Sampler::Greedy, &[])
+    }
+
+    pub fn decode_step(
+        &mut self,
+        input_token: u32,
+        sampler: &mut Sampler,
+        history: &[u32],
+    ) -> Result<DecodeToken> {
         if input_token as usize >= Qwen36Geometry::VOCAB_SIZE {
             return Err(ModelError::Shape {
                 tensor: "Qwen input token",
@@ -571,8 +618,12 @@ impl Qwen36BoundedReferenceRuntime {
         };
         timings.lm_head = start.elapsed();
         let start = Instant::now();
+        // `top_logits` stays unconditional: it is a diagnostics artifact
+        // the qualification harnesses read, and it is also the exact argmax
+        // `Sampler::Greedy` returns — so the greedy path's arithmetic is
+        // unchanged, not merely equivalent.
         let top_logits = top_logit_candidates(&logits.values);
-        let token = top_logits[0].token;
+        let token = sampler.select(&logits.values, history, top_logits[0].token);
         timings.sampling = start.elapsed();
         self.decode_index = self.decode_index.saturating_add(1);
         Ok(DecodeToken {

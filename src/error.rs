@@ -64,18 +64,37 @@ pub enum ConfigError {
     InvalidSize(String),
     #[error("invalid --host value {0:?}: expected an IP address")]
     InvalidHost(String),
+    #[error("--model {0:?} does not exist")]
+    ModelPathMissing(String),
+    #[error("--model {0:?} is a directory; point it at a .gguf checkpoint file")]
+    ModelPathNotAFile(String),
+    #[error(
+        "--memory {given} is below the {floor} experimental floor; \
+         use 2G for the experimental profile or 4G for the supported default (spec §4, §40)"
+    )]
+    MemoryBudgetTooSmall { given: String, floor: String },
     #[error("environment error: {0}")]
     Environment(String),
     #[error("failed to serialize config: {0}")]
     Serialize(String),
+    #[error("invalid --open value {0:?}: expected one of opencode, claude, codex")]
+    InvalidClient(String),
 }
 
 #[derive(Debug, Error)]
 pub enum SetupError {
     #[error("model setup declined")]
     Declined,
-    #[error("no model installed and no interactive terminal to confirm setup (use --yes)")]
+    #[error(
+        "no model installed and no interactive terminal to confirm setup; \
+         re-run with --yes to proceed non-interactively, or run `tqf` in a terminal"
+    )]
     NonInteractiveConfirmationRequired,
+    /// A coding client could not be prepared or launched (spec §99-100).
+    /// Distinct from `ConfigError::InvalidClient`, which is a bad flag
+    /// value rather than a failure to run a valid one.
+    #[error("could not launch the coding client: {0}")]
+    ClientLaunch(String),
 }
 
 #[derive(Debug, Error)]
@@ -278,6 +297,42 @@ pub enum ContextError {
 pub enum RetrievalError {
     #[error("retrieval error: {0}")]
     Failed(String),
+
+    // `.tqi` container faults (spec §174-§177). Distinct from
+    // `ContainerError`, whose messages all name `.tqf`: reporting "not a
+    // .tqf container" for an index file would send a reader looking at
+    // the wrong format entirely.
+    #[error("not a .tqi index: bad magic")]
+    IndexBadMagic,
+    #[error("`tqf sync {0:?}`: no such directory")]
+    SyncPathMissing(String),
+    #[error("`tqf sync {0:?}`: not a directory — sync indexes a project directory, not a file")]
+    SyncPathNotADirectory(String),
+    #[error("unsupported .tqi format major version {0}")]
+    IndexUnsupportedMajorVersion(u16),
+    #[error("malformed .tqi {what}: expected at least {expected} bytes, found {actual}")]
+    IndexTruncated {
+        what: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("malformed .tqi {0}")]
+    IndexMalformed(&'static str),
+    #[error("integer overflow validating .tqi table bounds")]
+    IndexIntegerOverflow,
+    #[error(".tqi {name} range [{offset}, {offset}+{len}) exceeds file length {file_len}")]
+    IndexOutOfBounds {
+        name: &'static str,
+        offset: u64,
+        len: u64,
+        file_len: u64,
+    },
+    #[error(".tqi {segment} checksum mismatch: expected {expected}, computed {computed}")]
+    IndexChecksumMismatch {
+        segment: &'static str,
+        expected: String,
+        computed: String,
+    },
 }
 
 #[derive(Debug, Error)]

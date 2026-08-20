@@ -49,8 +49,8 @@ impl Session {
     pub fn new() -> Self {
         Self {
             id: SessionId::next(),
-            token_history: TokenStore::default(),
-            context: ContextState::default(),
+            token_history: TokenStore,
+            context: ContextState,
             prefix: None,
             cancellation: CancellationToken::new(),
         }

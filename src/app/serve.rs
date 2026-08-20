@@ -19,7 +19,7 @@ use crate::runtime::{GenerationSlot, Qwen36Generator, Qwen36ResidentReferenceGen
 use crate::server::{self, bind, AppState};
 use crate::setup::flow::{self, SetupOutcome};
 use crate::setup::hardware::{self, HardwareProfile};
-use crate::setup::receipt;
+use crate::setup::receipt::{self, ModelReceipt};
 use crate::source::{self, local::LocalFileSource, manifest::FetchedArtifact, ModelSource};
 
 /// Diagnostic-only escape hatch so the server skeleton can be started and
@@ -36,13 +36,44 @@ const DEV_RESIDENT_STREAMING_ENV: &str = "TQF_DEV_RESIDENT_STREAMING";
 /// developer qualification profile explicit in startup output.
 const DEV_STREAMING_REFERENCE_ENV: &str = "TQF_DEV_STREAMING_REFERENCE";
 
+/// Starts the server, blocking until it shuts down.
+///
+/// `bound_addr` receives the address the server actually bound. Callers
+/// that launch something against this server need the *real* address:
+/// under port fallback it differs from the default, and handing a client
+/// the default would point it at whatever else holds that port.
 pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
+    start_reporting(cli, cli_config, None)
+}
+
+pub fn start_reporting(
+    cli: &Cli,
+    cli_config: Config,
+    bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
+) -> Result<()> {
     let config_path = paths::config_path()?;
     let mut persisted = PersistedConfig::load(&config_path)?;
     apply_cli_overrides(&mut persisted, &cli_config);
     let config = effective_config(cli_config, &persisted);
     let memory_budget = Bytes(config.memory_budget_bytes.unwrap_or(4 * 1024 * 1024 * 1024));
     let setup_broker = MemoryBroker::new(memory_budget);
+
+    // The diagnostic skip has to short-circuit the *whole* setup flow, not
+    // just the later "is a model installed" branch. Running `flow::run`
+    // first would either return
+    // `NonInteractiveConfirmationRequired` (making the escape hatch
+    // useless in exactly the non-interactive contexts it exists for) or,
+    // with `--yes`, start a 20 GB download before the skip was ever
+    // consulted.
+    if std::env::var(DEV_SKIP_MODEL_CHECK_ENV).as_deref() == Ok("1") {
+        tracing::warn!(
+            "{DEV_SKIP_MODEL_CHECK_ENV}=1: starting the server with no model install \
+             flow. Every protocol endpoint is served; generation answers with an honest \
+             503. Diagnostic use only."
+        );
+        let runtime = tokio::runtime::Runtime::new()?;
+        return runtime.block_on(run_server(cli, config, false, None, None, bound_addr));
+    }
 
     let first_run = flow::run(cli.yes, &setup_broker)?;
     let mut hardware = first_run.hardware;
@@ -59,10 +90,9 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
         SetupOutcome::NonInteractiveConfirmationRequired => {
             // Deliberately not persisted as "completed": nothing was
             // actually decided, so a later run should ask again.
-            println!(
-                "tqf: no model installed and no interactive terminal to confirm setup.\n\
-                 Re-run with --yes to proceed non-interactively, or run `tqf` in a terminal."
-            );
+            // The error carries the whole message; printing it here too
+            // reported the same condition twice, once on stdout and
+            // once on stderr, in two slightly different wordings.
             return Err(SetupError::NonInteractiveConfirmationRequired.into());
         }
         SetupOutcome::ProceedInstall => {
@@ -121,7 +151,14 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 "tqf: starting the developer whole-expert streaming reference server over the \
                  bounded runtime."
             );
-            return runtime.block_on(run_server(cli, config, true, Some(generator)));
+            return runtime.block_on(run_server(
+                cli,
+                config,
+                true,
+                Some(generator),
+                Some(receipt),
+                bound_addr,
+            ));
         }
         if std::env::var(DEV_RESIDENT_STREAMING_ENV).as_deref() == Ok("1") {
             let receipts_dir = paths::receipts_dir()?;
@@ -144,7 +181,14 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                     Bytes(budget / 4),
                 )?);
             println!("tqf: starting the Phase 25 resident-core streaming reference server.");
-            return runtime.block_on(run_server(cli, config, true, Some(generator)));
+            return runtime.block_on(run_server(
+                cli,
+                config,
+                true,
+                Some(generator),
+                Some(receipt),
+                bound_addr,
+            ));
         }
         if std::env::var(DEV_RESIDENT_REFERENCE_ENV).as_deref() == Ok("1") {
             let receipts_dir = paths::receipts_dir()?;
@@ -168,7 +212,14 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 "tqf: starting the high-memory resident reference server; this is a developer \
                  parity profile, not the normal bounded-memory runtime."
             );
-            return runtime.block_on(run_server(cli, config, true, Some(generator)));
+            return runtime.block_on(run_server(
+                cli,
+                config,
+                true,
+                Some(generator),
+                Some(receipt),
+                bound_addr,
+            ));
         }
         let receipts_dir = paths::receipts_dir()?;
         let receipt =
@@ -189,19 +240,25 @@ pub fn start(cli: &Cli, cli_config: Config) -> Result<()> {
                 Bytes(budget / 4),
             )?);
         println!("tqf: starting bounded Qwen3.6 server.");
-        return runtime.block_on(run_server(cli, config, true, Some(generator)));
+        return runtime.block_on(run_server(
+            cli,
+            config,
+            true,
+            Some(generator),
+            Some(receipt),
+            bound_addr,
+        ));
     }
-    if std::env::var(DEV_SKIP_MODEL_CHECK_ENV).as_deref() != Ok("1") {
-        return Ok(());
-    }
-    if !model_installed {
-        tracing::warn!(
-            "{DEV_SKIP_MODEL_CHECK_ENV}=1: starting the server skeleton with no model \
-             installed. Diagnostic use only."
-        );
-    }
-
-    runtime.block_on(run_server(cli, config, model_installed, None))
+    // Reaching here means setup ran but produced no installed model, and
+    // the diagnostic skip above was not set. Say what to do next rather
+    // than exiting silently, which reads as a crash.
+    println!(
+        "tqf: no model is installed, so there is nothing to serve.\n     \
+         Run `tqf` in a terminal to install the pinned checkpoint, `tqf --yes` to accept \
+         non-interactively,\n     or `tqf --model ./your-qwen36-q4.gguf` to import one you \
+         already have."
+    );
+    Ok(())
 }
 
 /// Drives source verification and canonical GGUF conversion through the
@@ -307,6 +364,9 @@ fn apply_cli_overrides(persisted: &mut PersistedConfig, cli_config: &Config) {
     if let Some(host) = &cli_config.host {
         persisted.host = Some(host.clone());
     }
+    if let Some(port) = cli_config.port {
+        persisted.port = Some(port);
+    }
 }
 
 /// CLI flags win when present; otherwise fall back to what a previous run
@@ -321,6 +381,7 @@ fn effective_config(cli_config: Config, persisted: &PersistedConfig) -> Config {
             .or(persisted.context_limit_tokens),
         enable_vision: cli_config.enable_vision || persisted.enable_vision,
         host: cli_config.host.or_else(|| persisted.host.clone()),
+        port: cli_config.port.or(persisted.port),
     }
 }
 
@@ -329,16 +390,37 @@ async fn run_server(
     config: Config,
     model_installed: bool,
     generator: Option<Arc<dyn Qwen36Generator>>,
+    receipt: Option<ModelReceipt>,
+    bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 ) -> Result<()> {
-    let bound = bind::resolve_and_bind(config.host.as_deref(), cli.insecure).await?;
+    // `--port` on this run is explicit; a port that only came from the
+    // persisted config is a preference that may still fall back.
+    let port_request = match (cli.port, config.port) {
+        (Some(explicit), _) => bind::PortRequest::Explicit(explicit),
+        (None, Some(remembered)) => bind::PortRequest::Preferred(remembered),
+        (None, None) => bind::PortRequest::Default,
+    };
+    let bound = bind::resolve_and_bind(config.host.as_deref(), port_request, cli.insecure).await?;
     tracing::info!(addr = %bound.addr, "tqf listening");
     println!("tqf listening on http://{}", bound.addr);
+    if let Some(reporter) = bound_addr {
+        // A closed receiver just means the caller stopped caring.
+        let _ = reporter.send(bound.addr);
+    }
 
     let state = AppState {
         config: Arc::new(config),
         model_installed,
         generation_slot: GenerationSlot::new(),
         generator,
+        // The Ollama and OpenAI inventory endpoints describe the installed
+        // model from its real trusted receipt (size, digest, source
+        // revision) rather than inventing plausible-looking values.
+        model_receipt: receipt.map(Arc::new),
+        // Loaded once at startup rather than per request: rebuilding from
+        // the persisted postings costs a file read, but re-reading it on
+        // every query would not.
+        indexes: Arc::new(crate::retrieval::tqi::loaded::load_registered()),
         started_at: Instant::now(),
         api_key: bound.api_key.map(|k| Arc::from(k.as_str())),
     };

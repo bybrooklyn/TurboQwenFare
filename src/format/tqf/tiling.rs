@@ -102,7 +102,9 @@ pub fn layout_is_divisible(
     }
     let gateup = gateup_tile_bytes(width.gateup_row_width());
     let down = down_tile_bytes(width.down_col_width());
-    gate_bytes % gateup == 0 && up_bytes % gateup == 0 && down_bytes % down == 0
+    gate_bytes.is_multiple_of(gateup)
+        && up_bytes.is_multiple_of(gateup)
+        && down_bytes.is_multiple_of(down)
 }
 
 /// Number of tiles a layout emits for one expert's superextent.

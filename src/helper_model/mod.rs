@@ -23,5 +23,4 @@ pub mod weights;
 #[cfg(test)]
 mod tests;
 
-pub use gte_reranker::GteRerankerRuntime;
-pub use runtime::{PplxEmbedRuntime, PplxEmbedding};
+pub use runtime::PplxEmbedRuntime;

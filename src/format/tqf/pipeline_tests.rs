@@ -98,7 +98,11 @@ fn gguf_repack_conversion_reader_round_trip() {
         BeginOutcome::AlreadyInstalled => panic!("unexpected"),
     };
 
-    let plan: [(&str, u32, Option<LayerId>, TqfSectionKind, &[u64]); 2] = [
+    /// One planned tensor extent: name, element count, owning layer,
+    /// section, and its dimensions.
+    type PlannedExtent<'a> = (&'a str, u32, Option<LayerId>, TqfSectionKind, &'a [u64]);
+
+    let plan: [PlannedExtent; 2] = [
         (
             "token_embedding",
             1,

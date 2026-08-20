@@ -17,6 +17,44 @@ The spec uses a decision-status vocabulary that controls how much latitude an im
 - **RESEARCH CANDIDATE** — deliberately experimental; failure is an acceptable, recordable outcome.
 - **BENCHMARK-SELECTED** — multiple valid implementations exist; the benchmark winner becomes default.
 
+### Read this before reporting a phase complete
+
+The spec's phase list (§272-324) had five holes, and all five survived every one of the
+fifty-three phases being reported done. Nothing untrue was written: each phase delivered a
+real, measured library and honestly noted what remained unwired. Nobody summed the caveats.
+The result was a server that listened on Ollama's port and answered 404 on every Ollama
+route, while the ledger said the phases were complete.
+
+The spec now closes that:
+
+- **§335 — a phase is not done until its surface is reachable.** A capability is complete
+  when a CLI command, HTTP route, or documented flag reaches it — or when the phase record
+  says in one sentence that it is not reachable and names the phase that will fix it. Prefer
+  an honest `501` naming the missing artifact over a module that compiles and is unreachable.
+  The check is a request or an invocation, never a file listing: `pub mod ollama;` looks like
+  coverage and answers nothing.
+- **§288's table** names every protocol surface and its owning phase, so "streaming adapters"
+  can no longer mean "the OpenAI one".
+- **§289's exit gate** measures "useful build" against an unmodified third-party client, not
+  against this project's own tests.
+- **§329-334** retrofit the phases nothing owned: **2a** CI lanes, **2b** conformance
+  fixtures, **15a** sampling, **16a** Ollama, **16b** Anthropic.
+- **§331** — conformance fixtures are written from the spec, never from the code. A test
+  derived from current behavior cannot fail. The pre-existing suite had one asserting
+  `temperature: 0.7` returns 400; it passed, and it encoded a limitation as the requirement.
+
+Practical consequences for routine work here: run `just ci` before claiming anything builds
+or passes; run `just smoke-ollama` against a live server before claiming an endpoint works;
+and do not batch phases into one commit, because six exit gates checked as one is how the
+protocol surface went missing in the first place.
+
+One platform-specific trap worth stating outright: **never run `cargo clippy --fix` in this
+crate.** A fix is derived from the code the compiler can currently see, so running it on
+Linux rewrites `#[cfg(tqf_metal)]` code as though the Metal branch did not exist. It has
+already renamed a parameter that branch actually uses to `_broker`, breaking the macOS build
+while Linux stayed green. Apply clippy findings by hand and let CI's macOS lane confirm
+them.
+
 Implementation coverage now extends through the Phase 18 reference/bounded baseline: BF16 virtual-GQA
 full attention, exact MoE routing/shared/routed computation, a 40-layer decode graph, normalized
 OpenAI streaming adapters, canonical download/conversion/receipt startup, and a whole-expert cache
@@ -529,7 +567,12 @@ Phases 27-28 land the first long-context (TQKV) work:
 ## Commands
 
 ```sh
-cargo build                 # debug build (Metal backend by default on macOS)
+just                        # list every task recipe (install: cargo install just)
+just ci                     # fmt --check + clippy -D warnings + the full fast suite
+just serve                  # dev server with no checkpoint required
+just smoke-ollama           # curl the Ollama surface against a running server
+
+cargo build                 # debug build; works on every platform
 cargo build --release       # release profile: LTO, codegen-units=1, panics unwind (not abort)
 cargo run -- --headless     # run the server without launching the SwiftUI GUI
 cargo test                  # run the full test suite
@@ -539,18 +582,27 @@ cargo clippy
 cargo fmt
 ```
 
-Feature flags select the compute backend at compile time (exactly one is expected per build):
-`--features metal` (default) or `--features cuda`. There is no generic/CPU-only inference backend.
+Feature flags select the compute backend at compile time: `--features metal` (default) or
+`--features cuda`. `metal` is in `default` but resolves to a no-op off macOS, because
+`metal-sys` is declared in a `[target.'cfg(target_os = "macos")'.dependencies]` table and is
+absent from the dependency graph elsewhere. `build.rs` emits a single `tqf_metal` cfg meaning
+"the feature is on *and* this target can use it", which is what the backend-conditional sites
+test; `scripts/check-platform-backends.sh` guards the wiring and runs in `just ci`.
 
-There is no CI workflow configured yet (`.github/workflows` does not exist) despite the spec defining
-one (section 262, "CI lane design", Lanes A–E) — don't assume CI enforces anything today.
+Off macOS the crate compiles against `backend::reference`, a portable scalar path. That is not
+a shipping inference backend — CUDA (§322-323) is unimplemented — but it is what makes
+`cargo build` and `cargo test` work everywhere.
+
+`.github/workflows/ci.yml` runs Lane A (§262) on Linux and macOS: `just ci`, plus the
+platform-backend guard. Lanes B–E need real hardware or the checkpoint and are driven locally
+by `just build-gui` and `just qual-*`.
 
 ## Architecture
 
 ### Single crate, module boundaries as a dependency firewall
 
 This is deliberately **one Cargo crate, not a workspace** (spec §23, "One-crate source tree" —
-LOCKED). Do not propose splitting it into internal crates. Logical boundaries are enforced by module
+LOCKED). Do not propose splitting it into internal crates, unless it would genuinely help. Logical boundaries are enforced by module
 structure and a dependency firewall (spec §24) instead:
 
 | From | May depend on | Must not depend on |
@@ -661,7 +713,7 @@ this pattern rather than passing around bare `u64`/`usize`.
 
 ```
 tqf | tqf --headless | tqf --memory 8G | tqf --context 1M | tqf --enable-vision
-tqf --host 0.0.0.0 | tqf --model ./compatible-qwen36-q4.gguf
+tqf --host 0.0.0.0 | tqf --port 11434 | tqf --model ./compatible-qwen36-q4.gguf
 tqf sync . | tqf unsync . | tqf --open {opencode,claude,codex}
 tqf status | tqf doctor | tqf optimize
 ```

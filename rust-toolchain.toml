@@ -1,0 +1,7 @@
+# Pinned so `just ci` means the same thing on every machine and in CI —
+# this crate's lint policy (Cargo.toml `[lints.clippy]`) and the
+# `cargo::rustc-check-cfg` build-script directives both depend on a
+# recent, predictable toolchain.
+[toolchain]
+channel = "1.94"
+components = ["rustfmt", "clippy"]

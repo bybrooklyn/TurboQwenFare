@@ -1,34 +1,109 @@
 //! Top-level app orchestration: CLI dispatch and the first-run → server
 //! lifecycle (spec Part V section 28).
 
+mod doctor;
+mod open;
 mod serve;
+mod status;
+mod sync;
 
 use crate::cli::{Cli, Command};
 use crate::error::Result;
 
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> Result<std::process::ExitCode> {
     tracing::debug!(?cli, "tqf starting");
+
+    // Speaking MCP means this process is a subprocess of a coding client
+    // with a JSON-RPC transport on stdout. It has to short-circuit
+    // everything else — including config parsing side effects and any
+    // `println!` — before another code path can write to stdout and
+    // corrupt the transport.
+    if cli.mcp_stdio {
+        return run_mcp_stdio().map(|()| std::process::ExitCode::SUCCESS);
+    }
+
     let config = cli.build_config()?;
 
     match &cli.command {
-        Some(Command::Sync { path }) => {
-            tracing::warn!(?path, "tqf sync: not yet implemented (phase 42)");
-            Ok(())
+        Some(Command::Sync { path }) => sync::run_sync(path).map(|()| ok()),
+        Some(Command::Unsync { path }) => sync::run_unsync(path).map(|()| ok()),
+        Some(Command::Status) => status::run(&config).map(|()| ok()),
+        Some(Command::Doctor) => doctor::run(&config),
+        Some(Command::Optimize) => run_optimize().map(|()| ok()),
+        None => run_server_or_gui(cli, config).map(|()| ok()),
+    }
+}
+
+fn ok() -> std::process::ExitCode {
+    std::process::ExitCode::SUCCESS
+}
+
+/// Serves the Model Context Protocol over stdio (spec §95, §228).
+///
+/// A coding client spawns this as a subprocess inside the project it is
+/// working on, so the working directory — not a flag, and not "every
+/// registered root" — is what identifies which index to serve. Serving
+/// all of them would leak one project's file list into another's tool
+/// results.
+///
+/// A missing or unreadable index is not an error here. Spec §44 says the
+/// server works normally without an index; the tools then return ordinary
+/// informative results naming `tqf sync` instead of protocol errors, and
+/// the client keeps working. Failures are logged, never written to
+/// stdout, which belongs exclusively to the JSON-RPC transport.
+fn run_mcp_stdio() -> Result<()> {
+    use std::io::{stdin, stdout, BufReader};
+    let state = mcp_index_for_cwd();
+    crate::mcp::stdio::run_stdio_loop(
+        state.as_ref(),
+        BufReader::new(stdin().lock()),
+        stdout().lock(),
+    )?;
+    Ok(())
+}
+
+/// Finds the registered root containing the working directory and loads
+/// its index.
+///
+/// The deepest containing root wins, so a synced subproject inside a
+/// synced monorepo serves the subproject's own index rather than the
+/// parent's.
+fn mcp_index_for_cwd() -> Option<crate::mcp::tools::IndexState> {
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    let mut containing: Vec<std::path::PathBuf> = crate::retrieval::tqi::registry::resolve()
+        .live
+        .into_iter()
+        .filter(|root| {
+            root.canonicalize()
+                .map(|root| cwd.starts_with(root))
+                .unwrap_or(false)
+        })
+        .collect();
+    // Deepest first: more path components means a more specific root.
+    containing.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+
+    let root = containing.first()?;
+    match crate::retrieval::tqi::loaded::load_root(root) {
+        Ok(loaded) => {
+            tracing::info!(
+                root = %loaded.root.display(),
+                files = loaded.file_count,
+                "serving MCP from a persisted index"
+            );
+            Some(crate::mcp::tools::IndexState {
+                root: loaded.root,
+                lexical: loaded.lexical,
+                // The MCP server never loads the embedder to answer a
+                // lexical query (spec §85), and no persisted semantic
+                // lane exists yet regardless.
+                semantic: None,
+                paths: loaded.paths,
+            })
         }
-        Some(Command::Unsync { path }) => {
-            tracing::warn!(?path, "tqf unsync: not yet implemented (phase 42)");
-            Ok(())
+        Err(error) => {
+            tracing::warn!(root = %root.display(), %error, "failed to load index for MCP");
+            None
         }
-        Some(Command::Status) => {
-            println!("tqf status: not yet implemented (phase 2 server skeleton)");
-            Ok(())
-        }
-        Some(Command::Doctor) => {
-            println!("tqf doctor: not yet implemented (phase 36 receipt/index hardening)");
-            Ok(())
-        }
-        Some(Command::Optimize) => run_optimize(),
-        None => run_server_or_gui(cli, config),
     }
 }
 
@@ -40,6 +115,14 @@ pub fn run(cli: Cli) -> Result<()> {
 /// handed to the compiled-in SwiftUI app, per spec §98's "transfer the
 /// main thread to a C-callable Swift entrypoint."
 fn run_server_or_gui(cli: Cli, config: crate::config::Config) -> Result<()> {
+    // `--open` needs the server up *and* its real bound address before it
+    // can write a client config, so it runs the server on a background
+    // thread and waits for the address rather than assuming the default
+    // port.
+    if let Some(client) = cli.open.clone() {
+        let kind = open::parse_client(&client)?;
+        return run_with_client(cli, config, kind);
+    }
     if cli.headless {
         return serve::start(&cli, config);
     }
@@ -77,12 +160,59 @@ fn run_with_gui(cli: Cli, config: crate::config::Config) -> Result<()> {
     Ok(())
 }
 
+/// Runs the server on a background thread, waits until it actually
+/// answers, then launches the coding client against its real address. The
+/// process exits when the client does, matching spec §224's "server exits
+/// with the tqf process".
+fn run_with_client(
+    cli: Cli,
+    config: crate::config::Config,
+    kind: crate::integrations::config::ClientKind,
+) -> Result<()> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let server_cli = cli.clone();
+    let server =
+        std::thread::spawn(move || serve::start_reporting(&server_cli, config, Some(sender)));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let addr = runtime.block_on(async move {
+        match receiver.await {
+            Ok(addr) if open::wait_until_ready(addr).await => Some(addr),
+            Ok(addr) => {
+                tracing::error!(%addr, "the server bound but never became ready");
+                None
+            }
+            // The sender was dropped: the server thread failed before
+            // binding, and its own error is the useful one.
+            Err(_) => None,
+        }
+    });
+
+    let Some(addr) = addr else {
+        return match server.join() {
+            Ok(result) => result,
+            Err(_) => Err(crate::error::SetupError::ClientLaunch(
+                "the server thread panicked before binding".to_string(),
+            )
+            .into()),
+        };
+    };
+
+    let result = open::launch(&cli, kind, addr);
+    // The server thread has no shutdown handle here; the process exiting
+    // is what stops it, which is the documented behavior.
+    drop(server);
+    result
+}
+
 /// `tqf optimize` (spec §3): today this is phase 10's exit-criteria
 /// deliverable — a synthetic Metal bandwidth/GEMV microbenchmark proving
 /// the backend device/queue/buffer/pipeline/timing plumbing works end to
 /// end. The full hardware autotune (persisted machine profile, multiple
 /// kernel specializations per spec §51/§77) is a later phase.
-#[cfg(feature = "metal")]
+#[cfg(tqf_metal)]
 fn run_optimize() -> Result<()> {
     println!("tqf optimize: running synthetic Metal bandwidth/GEMV harness (phase 10 baseline)...");
     let report = crate::bench::metal_synthetic::run_synthetic_bandwidth_gemv()?;
@@ -108,7 +238,7 @@ fn run_optimize() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(tqf_metal))]
 fn run_optimize() -> Result<()> {
     println!("tqf optimize: not yet implemented for this backend (phase 10 baseline is Metal-only so far)");
     Ok(())

@@ -83,6 +83,25 @@ fn walk(
         }
     };
 
+    // `read_dir` yields entries in whatever order the filesystem stores
+    // them — ext4 hash order, APFS insertion order, and neither is
+    // promised. Chunk ids are assigned positionally from this walk, so an
+    // unsorted scan makes the persisted index depend on which machine
+    // built it: the same tree indexes to different chunk ids on two
+    // filesystems, and the ids shift whenever an unrelated file is added
+    // to a directory.
+    //
+    // Sorting by name makes the walk a function of the tree alone. Same
+    // reasoning as the tie-break in `retrieval::hybrid` (spec §193): a
+    // deterministic order is worth one sort per directory.
+    let mut entries: Vec<_> = entries.collect();
+    entries.sort_by_key(|entry| {
+        entry
+            .as_ref()
+            .map(|entry| entry.file_name())
+            .unwrap_or_default()
+    });
+
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -96,11 +115,16 @@ fn walk(
         };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // `.git` is never indexable content (VCS internals, not a
-        // repository's actual files) — skipped unconditionally, the same
-        // way every real code-search tool treats it, rather than relying
-        // on the target repo's own `.gitignore` to say so.
-        if name == ".git" {
+        // Neither `.git` nor `.tqf` is indexable content — VCS internals
+        // and TQF's own index directory, not the repository's files.
+        // Skipped unconditionally, the same way every real code-search
+        // tool treats `.git`, rather than relying on the target repo's own
+        // `.gitignore` to say so.
+        //
+        // `.tqf` matters for a second reason: the index lives there, so
+        // without this a sync reads its own multi-megabyte output back on
+        // every subsequent run and counts it as a scanned file.
+        if name == ".git" || name == ".tqf" {
             continue;
         }
 
@@ -285,6 +309,29 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The index lives in `<root>/.tqf/`, so a scan that walked into it
+    /// would read its own output back on every subsequent run — and
+    /// report a file count that does not correspond to any source file.
+    /// Caught by running a real `tqf sync` twice and noticing it scanned
+    /// four files in a three-file tree.
+    #[test]
+    fn the_index_directory_is_never_scanned() {
+        let root = temp_dir("skips-tqf-dir");
+        write_file(&root.join("src/main.rs"), b"pub fn main() {}\n");
+        write_file(&root.join(".tqf/index.tqi"), b"TQFINDEX\x00\x00binary");
+        write_file(&root.join(".git/config"), b"[core]\n");
+
+        let report = scan_root(&root).unwrap();
+        let paths: Vec<&str> = report
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+
+        assert_eq!(paths, vec!["src/main.rs"], "scanned: {paths:?}");
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn gitignore_excludes_matching_files_and_directories() {
         let root = temp_dir("ignore");
@@ -362,5 +409,105 @@ mod tests {
             .all(|f| f.relative_path != "escaped/secret.rs"));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
+    }
+}
+
+#[cfg(test)]
+mod cost_probe {
+    /// Not a correctness test — a one-off measurement kept `#[ignore]`d so
+    /// the sync-cost claims in the qualification doc can be re-derived
+    /// rather than trusted. Run with:
+    /// `cargo test --release -- --ignored --nocapture scan_cost_split`
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn scan_cost_split() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let started = std::time::Instant::now();
+        let report = super::scan_root(root).unwrap();
+        let whole_scan = started.elapsed();
+
+        // Read every file the scan read, and nothing else.
+        let started = std::time::Instant::now();
+        let mut bytes = 0u64;
+        let mut buffers = Vec::new();
+        for file in &report.files {
+            if let Ok(data) = std::fs::read(root.join(&file.relative_path)) {
+                bytes += data.len() as u64;
+                buffers.push((file.relative_path.clone(), data));
+            }
+        }
+        let read_only = started.elapsed();
+
+        // Classify what was just read, and nothing else.
+        let started = std::time::Instant::now();
+        for (path, data) in &buffers {
+            std::hint::black_box(super::super::classify::classify(data, path));
+        }
+        let classify_only = started.elapsed();
+
+        let started = std::time::Instant::now();
+        for (_, data) in &buffers {
+            std::hint::black_box(blake3::hash(data));
+        }
+        let hash_only = started.elapsed();
+
+        println!(
+            "\nfiles {}  bytes {:.1} MiB\n  whole scan   {:>8.1} ms\n  read only                 {:>8.1} ms\n  classify     {:>8.1} ms\n  blake3       {:>8.1} ms",
+            report.files.len(),
+            bytes as f64 / (1024.0 * 1024.0),
+            whole_scan.as_secs_f64() * 1000.0,
+            read_only.as_secs_f64() * 1000.0,
+            classify_only.as_secs_f64() * 1000.0,
+            hash_only.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    /// Chunk ids are assigned positionally from this walk, so the walk
+    /// order decides what the persisted index contains. `read_dir` order
+    /// is the filesystem's, not the tree's — the same repository indexed
+    /// on ext4 and APFS produced different chunk ids, and adding one
+    /// unrelated file could shift every id in its directory.
+    #[test]
+    fn the_walk_visits_files_in_a_defined_order_not_the_filesystems() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let root =
+            std::env::temp_dir().join(format!("tqf-scan-order-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("zeta")).unwrap();
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+
+        // Created in an order that is deliberately not the sorted one, so
+        // a filesystem preserving insertion order would fail this.
+        for name in ["m.rs", "z.rs", "a.rs"] {
+            std::fs::write(root.join(name), "fn main() {}\n").unwrap();
+        }
+        std::fs::write(root.join("zeta/one.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(root.join("alpha/two.rs"), "fn two() {}\n").unwrap();
+
+        let report = super::scan_root(&root).unwrap();
+        let paths: Vec<&str> = report
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
+
+        // The contract is depth-first in name order, which is not the
+        // same as sorting the final path list: a directory `foo` and a
+        // file `foo.rs` compare as "foo" < "foo.rs" by name, so `foo`'s
+        // contents are emitted first even though "foo.rs" < "foo/bar.rs"
+        // as paths. Asserting the exact sequence pins what the walk
+        // actually promises rather than a stronger property it does not.
+        assert_eq!(
+            paths,
+            vec!["a.rs", "alpha/two.rs", "m.rs", "z.rs", "zeta/one.rs"],
+            "the walk must follow the tree, not the filesystem's storage order"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

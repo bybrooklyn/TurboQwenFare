@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::protocol::JsonRpcRequest;
@@ -14,20 +13,18 @@ fn real_index_state() -> IndexState {
         "src/retrieval/ignore.rs",
         "src/experts/policy.rs",
     ];
-    let mut file_contents = HashMap::new();
-    for path in relative_paths {
-        let contents = std::fs::read_to_string(root.join(path)).unwrap();
-        file_contents.insert(path.to_string(), contents);
-    }
-    let documents: Vec<(String, String)> = file_contents
+    let documents: Vec<(String, String)> = relative_paths
         .iter()
-        .map(|(p, c)| (p.clone(), c.clone()))
+        .map(|path| {
+            let contents = std::fs::read_to_string(root.join(path)).unwrap();
+            (path.to_string(), contents)
+        })
         .collect();
     IndexState {
         root: PathBuf::from(root),
         lexical: LexicalIndex::build(&documents),
         semantic: None,
-        file_contents,
+        paths: relative_paths.iter().map(|p| p.to_string()).collect(),
     }
 }
 
@@ -185,10 +182,11 @@ fn real_index_tools_return_correct_real_answers() {
     .unwrap()
     .result
     .unwrap();
-    assert_eq!(
-        file["content"][0]["text"],
-        state.file_contents["src/experts/policy.rs"].as_str()
-    );
+    let on_disk = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/experts/policy.rs"),
+    )
+    .unwrap();
+    assert_eq!(file["content"][0]["text"], on_disk.as_str());
 
     let repo_map = handle_request(
         Some(&state),
@@ -263,4 +261,42 @@ fn stdio_transport_handles_a_real_session() {
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
     let call: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
     assert_eq!(call["result"]["content"][0]["text"], "src/memory/mod.rs");
+}
+
+/// `tqf_file` is a read-only tool over an *indexed* root (spec §95). A
+/// path the index does not contain must not be readable through it, and
+/// neither must a traversal out of the root — otherwise the MCP surface
+/// is an arbitrary-file-read primitive handed to whatever produced the
+/// tool arguments.
+#[test]
+fn the_file_tool_refuses_paths_outside_the_index() {
+    let state = real_index_state();
+
+    // A real file in this very repository, but not one this index holds.
+    let unindexed = state.read_indexed_file("Cargo.toml");
+    assert!(
+        unindexed.is_err(),
+        "an unindexed file must not be readable: {unindexed:?}"
+    );
+
+    for escape in ["../../../etc/passwd", "src/../../etc/passwd", "/etc/passwd"] {
+        let result = state.read_indexed_file(escape);
+        assert!(result.is_err(), "{escape} must be refused: {result:?}");
+    }
+
+    // The guard is not simply "refuse everything": an indexed file reads.
+    assert!(state.read_indexed_file("src/memory/mod.rs").is_ok());
+}
+
+/// The tool reports the file as it is on disk now, not a copy frozen at
+/// index time — the reason `IndexState` holds paths rather than contents.
+#[test]
+fn the_file_tool_reads_current_disk_contents() {
+    let state = real_index_state();
+    let served = state.read_indexed_file("src/memory/mod.rs").unwrap();
+    let on_disk = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/memory/mod.rs"),
+    )
+    .unwrap();
+    assert_eq!(served, on_disk);
 }

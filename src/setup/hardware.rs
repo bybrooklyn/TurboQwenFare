@@ -55,7 +55,7 @@ impl HardwareProfile {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(tqf_metal)]
 pub fn run_short_autotune(profile: &mut HardwareProfile) -> crate::error::Result<()> {
     let report = crate::bench::metal_synthetic::run_synthetic_bandwidth_gemv()?;
     profile.quick_tune = Some(QuickTuneProfile {
@@ -70,18 +70,23 @@ pub fn run_short_autotune(profile: &mut HardwareProfile) -> crate::error::Result
     Ok(())
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(tqf_metal))]
 pub fn run_short_autotune(_profile: &mut HardwareProfile) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Which compute backend this binary can actually reach on this target.
+/// `reference` is not a shipping inference backend (spec §48 expects one
+/// of Metal/CUDA per build) — it is the portable scalar path the crate
+/// is validated against, and reporting it honestly is what lets
+/// `tqf doctor` say "this build has no GPU backend" instead of "none".
 fn compiled_backend() -> &'static str {
-    if cfg!(feature = "metal") {
+    if cfg!(tqf_metal) {
         "metal"
-    } else if cfg!(feature = "cuda") {
+    } else if cfg!(tqf_cuda) {
         "cuda"
     } else {
-        "none"
+        "reference"
     }
 }
 

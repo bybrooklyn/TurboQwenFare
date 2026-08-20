@@ -26,7 +26,7 @@ use crate::helper_model::PplxEmbedRuntime;
 
 use super::flat::l2_normalize;
 use super::lexical::LexicalIndex;
-use super::scan::scan_root;
+use super::scan::{scan_root, ScanReport};
 
 #[derive(Debug, Clone)]
 pub struct FileRecord {
@@ -63,6 +63,20 @@ pub fn full_correctness_walk(
     table: &FileTable,
 ) -> Result<(SyncPlan, HashMap<String, String>)> {
     let report = scan_root(root)?;
+    full_correctness_walk_of(root, table, &report)
+}
+
+/// The same walk against a scan a caller already has.
+///
+/// `scan_root` reads every file in the tree to classify it by content, so
+/// a caller that scans for its own reasons and then calls
+/// `full_correctness_walk` pays for the whole tree twice. `tqf sync` did
+/// exactly that.
+pub fn full_correctness_walk_of(
+    root: &Path,
+    table: &FileTable,
+    report: &ScanReport,
+) -> Result<(SyncPlan, HashMap<String, String>)> {
     let mut seen = HashSet::new();
     let mut plan = SyncPlan::default();
     let mut contents = HashMap::new();
@@ -318,6 +332,58 @@ impl LiveWatcher {
 
 #[cfg(test)]
 mod tests {
+    /// `tqf sync` scanned the tree, then called `full_correctness_walk`,
+    /// which scanned it again — and `scan_root` reads every file to
+    /// classify it by content, so the whole repository was read twice.
+    /// Taking the scan as a parameter fixes that, and this pins the two
+    /// entry points to the same answer so the caller that passes its own
+    /// scan cannot drift from the one that makes its own.
+    #[test]
+    fn passing_a_scan_in_gives_the_same_walk_as_making_one() {
+        // Same isolation idiom the other tests here use: a counter as
+        // well as the pid, because `cargo test` runs these in parallel
+        // and a pid-only name collided.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "tqf-walk-equivalence-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/broker.rs"),
+            "pub struct MemoryBroker { budget: u64 }\nimpl MemoryBroker { fn reserve() {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/cache.rs"),
+            "pub struct WholeExpertLfuCache;\nfn evict_least_frequently_used() {}\n",
+        )
+        .unwrap();
+        // A non-Rust file, so the language filter is exercised rather
+        // than trivially satisfied.
+        std::fs::write(root.join("README.md"), "# notes\n").unwrap();
+
+        let table = super::FileTable::default();
+        let (own_plan, own_contents) = super::full_correctness_walk(&root, &table).unwrap();
+
+        let scan = super::scan_root(&root).unwrap();
+        let (given_plan, given_contents) =
+            super::full_correctness_walk_of(&root, &table, &scan).unwrap();
+
+        assert_eq!(own_plan.new, given_plan.new);
+        assert_eq!(own_plan.changed, given_plan.changed);
+        assert_eq!(own_plan.unchanged, given_plan.unchanged);
+        assert_eq!(own_plan.deleted, given_plan.deleted);
+        assert_eq!(own_contents, given_contents);
+        // And it really found the Rust files, so an equality of two
+        // empty walks cannot pass this.
+        assert_eq!(own_plan.new.len(), 2, "{:?}", own_plan.new);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     use super::*;
 
     #[test]

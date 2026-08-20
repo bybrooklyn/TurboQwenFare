@@ -5,10 +5,14 @@
 pub mod anthropic;
 pub mod auth;
 pub mod bind;
+#[cfg(test)]
+mod conformance;
+pub mod model_id;
 pub mod ollama;
 pub mod openai;
 #[cfg(test)]
 mod security_tests;
+pub mod stream;
 pub mod stub;
 #[cfg(test)]
 mod tests;
@@ -36,6 +40,16 @@ pub struct AppState {
     /// `None` until a trusted converted Qwen3.6 model has loaded. The
     /// protocol layer never fabricates output when this is absent.
     pub generator: Option<Arc<dyn Qwen36Generator>>,
+    /// The validated receipt for the installed model, when there is one.
+    /// Inventory endpoints (`/api/tags`, `/api/show`, `/v1/models`) report
+    /// size, digest, and source revision from this rather than
+    /// synthesizing values that merely look right.
+    pub model_receipt: Option<Arc<crate::setup::receipt::ModelReceipt>>,
+    /// Indexes for every registered root, loaded once at startup
+    /// (spec §218). Empty when nothing is synced, which is the ordinary
+    /// case and not an error — spec §44: the server works normally
+    /// without an index.
+    pub indexes: Arc<crate::retrieval::tqi::loaded::LoadedIndexes>,
     pub started_at: Instant,
     /// `Some` only for non-loopback binds without `--insecure` (spec Part
     /// IX section 74); enforced by the `auth` middleware on the protected
@@ -43,17 +57,42 @@ pub struct AppState {
     pub api_key: Option<Arc<str>>,
 }
 
+/// Assembles the whole HTTP surface.
+///
+/// The split between the two tiers is security-critical, not stylistic.
+/// Everything that can generate, embed, or enumerate what is installed
+/// goes inside `protected`, so a `0.0.0.0` bind requires the API key
+/// tqf mints for it (spec §74). The unauthenticated tier is limited to
+/// fixed-content liveness probes that clients call *before* they have
+/// anywhere to put a credential:
+///
+/// - `/health` — also what `bind::probe_health` uses to recognize another
+///   tqf on a busy port, so it must answer without a key.
+/// - `/v1/tqf/metrics` — process uptime and memory, no model data.
+/// - `GET`/`HEAD /` and `/api/version` — Ollama's liveness handshake.
+///
+/// Merging the Ollama routes at this top level is the path of least
+/// resistance and would silently expose generation with no auth.
 pub fn build_router(state: AppState) -> Router {
-    let protected =
-        Router::new()
-            .merge(openai::routes())
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                auth::require_api_key,
-            ));
-
-    Router::new()
+    // Everything that generates, embeds, or describes what is installed.
+    // The native `/tqf/*` diagnostics belong here too: `/tqf/status`
+    // reports the container path and source revision, which §211 says
+    // must not reach a non-loopback client unauthenticated.
+    let protected = Router::new()
+        .merge(openai::routes())
+        .merge(ollama::routes())
+        .merge(anthropic::routes())
         .merge(tqf_api::routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_api_key,
+        ));
+
+    // Pre-credential liveness probes only. Each leaks a fixed string or a
+    // version number and nothing about the model or the machine.
+    Router::new()
+        .merge(tqf_api::public_routes())
+        .merge(ollama::unauthenticated_routes())
         .merge(protected)
         .with_state(state)
 }

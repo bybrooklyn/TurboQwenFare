@@ -15,6 +15,7 @@ pub mod journal;
 pub mod local;
 pub mod manifest;
 pub mod ollama;
+pub mod pin_capture;
 pub mod pinned;
 pub mod retry;
 #[cfg(test)]

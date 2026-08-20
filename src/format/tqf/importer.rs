@@ -296,7 +296,7 @@ fn validate_routed_tensor(
 }
 
 fn expert_plane_bytes(bytes: &[u8], layer: LayerId, matrix: &'static str) -> Result<usize> {
-    if bytes.len() % Qwen36Geometry::NUM_EXPERTS != 0 {
+    if !bytes.len().is_multiple_of(Qwen36Geometry::NUM_EXPERTS) {
         return Err(ContainerError::MalformedRecord {
             table: "routed expert plane byte alignment",
         }

@@ -15,7 +15,3 @@ mod weights;
 
 #[cfg(test)]
 mod tests;
-
-pub use convert::{convert_vision_gguf, VisionConversionReport};
-pub use geometry::VisionGeometry;
-pub use runtime::VisionRuntime;

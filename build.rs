@@ -4,6 +4,38 @@ use std::process::Command;
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
 
+    emit_backend_cfgs();
+    build_swift_gui();
+}
+
+/// Collapses "the backend feature is enabled" and "this target can
+/// actually use it" into one cfg each, so the ~30 backend-conditional
+/// sites across the crate test a single, honest condition instead of
+/// repeating `all(feature = "...", target_os = "...")`.
+///
+/// This is what lets `default = ["metal"]` stay in `Cargo.toml` while a
+/// plain `cargo build`/`cargo test` still works on Linux: the feature is
+/// on, but `metal-sys` is target-gated out of the dependency graph, so
+/// `tqf_metal` is not set and the crate compiles against
+/// `backend::reference`.
+fn emit_backend_cfgs() {
+    println!("cargo::rustc-check-cfg=cfg(tqf_metal)");
+    println!("cargo::rustc-check-cfg=cfg(tqf_cuda)");
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    if std::env::var("CARGO_FEATURE_METAL").is_ok() && target_os == "macos" {
+        println!("cargo::rustc-cfg=tqf_metal");
+    }
+    // CUDA is Linux/Windows-only; it is also still a stub (spec phases 50
+    // and 51 are not implemented), so this only keeps the condition
+    // honest for when it is.
+    if std::env::var("CARGO_FEATURE_CUDA").is_ok() && target_os != "macos" {
+        println!("cargo::rustc-cfg=tqf_cuda");
+    }
+}
+
+fn build_swift_gui() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }

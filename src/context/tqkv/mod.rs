@@ -919,6 +919,20 @@ pub fn tqkv_precision() -> TqkvPrecision {
     )
 }
 
+/// The KV backend and precision this process is actually configured to
+/// use, for `/tqf/context` to report. Returning what is *live* rather
+/// than what is available matters: TQKV is opt-in, so a caller reading
+/// "tqkv" when BF16 is running would be misled about its own memory.
+pub fn configured_backend_description() -> (&'static str, &'static str) {
+    if !tqkv_enabled() {
+        return ("bf16", "bf16");
+    }
+    match tqkv_precision() {
+        TqkvPrecision::Q4 => ("tqkv", "q4"),
+        TqkvPrecision::Q8 => ("tqkv", "q8"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

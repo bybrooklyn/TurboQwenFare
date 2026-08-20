@@ -6,18 +6,17 @@
 pub mod decode;
 pub mod generation;
 pub mod mtp;
+pub mod profile;
 pub mod request;
 pub mod session;
+pub mod stream_decoder;
 
 pub use decode::{
-    decode_greedy, DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, LayerStep,
-    LogitCandidate, RouterTrace,
+    DecodeDiagnostics, DecodeTimings, DecodeToken, LayerHash, LogitCandidate, RouterTrace,
 };
-pub use generation::{
-    GeneratedOutput, GeneratedToolCall, Qwen36Generator, Qwen36ResidentReferenceGenerator,
-};
+pub use generation::{GeneratedOutput, Qwen36Generator, Qwen36ResidentReferenceGenerator};
 pub use request::{
-    Message, MessageToolCall, NormalizedRequest, ProtocolFlavor, RetrievalPolicy, Role,
-    SamplingParams, ToolDefinition, VisionInput,
+    Message, MessageToolCall, NormalizedRequest, ProtocolFlavor, Role, SamplingParams,
+    ToolDefinition,
 };
-pub use session::{GenerationSlot, Session, SessionId};
+pub use session::{GenerationSlot, Session};
