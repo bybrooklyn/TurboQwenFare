@@ -602,7 +602,7 @@ by `just build-gui` and `just qual-*`.
 ### Single crate, module boundaries as a dependency firewall
 
 This is deliberately **one Cargo crate, not a workspace** (spec §23, "One-crate source tree" —
-LOCKED). Do not propose splitting it into internal crates, unless it would genuinely help. Logical boundaries are enforced by module
+LOCKED). Do not propose splitting it into internal crates. Logical boundaries are enforced by module
 structure and a dependency firewall (spec §24) instead:
 
 | From | May depend on | Must not depend on |
