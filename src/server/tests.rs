@@ -55,6 +55,7 @@ pub(super) async fn spawn_test_server_installed(generator: Arc<dyn Qwen36Generat
         generation_slot: GenerationSlot::new(),
         generator: Some(generator),
         model_receipt: Some(Arc::new(fixture_receipt())),
+        indexes: Arc::new(Default::default()),
         started_at: Instant::now(),
         api_key: None,
     };
@@ -107,6 +108,7 @@ fn test_router(
         generation_slot: GenerationSlot::new(),
         generator,
         model_receipt: None,
+        indexes: Arc::new(Default::default()),
         started_at: Instant::now(),
         api_key: api_key.map(Arc::from),
     };
@@ -900,19 +902,19 @@ async fn the_native_context_endpoint_reports_the_live_kv_backend() {
     assert_eq!(body["selective_attention"], false, "{body}");
 }
 
+/// An empty list must still say why — a caller cannot otherwise tell
+/// "indexing is unsupported" from "nothing has been synced yet".
 #[tokio::test]
 async fn the_native_indexes_endpoint_explains_why_it_is_empty() {
     let addr = spawn_test_server(true).await;
-    let response = http_request(addr, &get("/tqf/indexes")).await;
-    let body: serde_json::Value =
-        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap_or("")).expect("JSON body");
+    let body = body_of(&http_request(addr, &get("/tqf/indexes")).await);
 
-    assert_eq!(body["indexes"], serde_json::json!([]));
+    assert_eq!(body["indexes"].as_array().unwrap().len(), 0);
     assert!(
         body["note"]
             .as_str()
             .unwrap_or_default()
-            .contains("not implemented"),
+            .contains("tqf sync"),
         "an empty list must say why: {body}"
     );
 }
@@ -1161,4 +1163,182 @@ async fn tqf_memory_reports_null_reservations_when_nothing_is_loaded() {
 
     assert!(parsed["reserved"].is_null());
     assert!(parsed["observed"]["resident_bytes"].as_u64().unwrap_or(0) > 0);
+}
+
+// ---------------------------------------------------------------------
+// Persisted retrieval over HTTP (spec §211, §218). Before this, the index
+// existed only for the lifetime of the `tqf sync` process.
+// ---------------------------------------------------------------------
+
+fn indexed_state() -> Arc<crate::retrieval::tqi::loaded::LoadedIndexes> {
+    use crate::retrieval::lexical::LexicalIndex;
+    use crate::retrieval::tqi::loaded::{LoadedIndexes, LoadedRoot};
+
+    let lexical = LexicalIndex::build(&[
+        (
+            "src/broker.rs".to_string(),
+            "pub struct MemoryBroker { budget: u64 } impl MemoryBroker { fn reserve() {} }"
+                .to_string(),
+        ),
+        (
+            "src/cache.rs".to_string(),
+            "pub struct WholeExpertLfuCache { capacity: usize } fn evict_least_frequently_used() {}"
+                .to_string(),
+        ),
+    ]);
+
+    Arc::new(LoadedIndexes {
+        roots: vec![LoadedRoot {
+            root: std::path::PathBuf::from("/repo"),
+            index_path: std::path::PathBuf::from("/repo/.tqf/index.tqi"),
+            generation: 4,
+            file_count: 2,
+            term_count: lexical.term_count(),
+            lexical,
+        }],
+        ..Default::default()
+    })
+}
+
+fn router_with_indexes(indexes: Arc<crate::retrieval::tqi::loaded::LoadedIndexes>) -> axum::Router {
+    let state = AppState {
+        config: Arc::new(Config::default()),
+        model_installed: false,
+        generation_slot: GenerationSlot::new(),
+        generator: None,
+        model_receipt: None,
+        indexes,
+        started_at: Instant::now(),
+        api_key: None,
+    };
+    server::build_router(state)
+}
+
+fn body_of(response: &str) -> serde_json::Value {
+    serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap_or("")).expect("JSON body")
+}
+
+#[tokio::test]
+async fn tqf_indexes_reports_each_loaded_root() {
+    let addr = spawn_router(router_with_indexes(indexed_state())).await;
+    let body = body_of(&http_request(addr, &get("/tqf/indexes")).await);
+
+    assert_eq!(body["indexes"][0]["root"], "/repo");
+    assert_eq!(body["indexes"][0]["generation"], 4);
+    assert_eq!(body["indexes"][0]["files"], 2);
+    // The semantic lane genuinely is not in this index; saying which
+    // lanes exist stops a client assuming all three.
+    assert_eq!(body["indexes"][0]["lanes"][0], "lexical");
+    assert_eq!(body["indexes"][0]["lanes"][1], "exact");
+    assert!(body["indexes"][0]["lanes"].get(2).is_none());
+}
+
+/// A registered root whose index failed to load must be visible. Silently
+/// omitting it looks identical to never having synced it.
+#[tokio::test]
+async fn tqf_indexes_reports_failed_and_stale_roots_rather_than_hiding_them() {
+    use crate::retrieval::tqi::loaded::LoadedIndexes;
+
+    let indexes = Arc::new(LoadedIndexes {
+        failed: vec![(
+            std::path::PathBuf::from("/broken"),
+            "checksum mismatch".to_string(),
+        )],
+        stale: vec![std::path::PathBuf::from("/moved")],
+        ..Default::default()
+    });
+    let addr = spawn_router(router_with_indexes(indexes)).await;
+    let body = body_of(&http_request(addr, &get("/tqf/indexes")).await);
+
+    assert_eq!(body["indexes"].as_array().unwrap().len(), 0);
+    assert_eq!(body["failed"][0]["root"], "/broken");
+    assert!(body["failed"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("checksum"));
+    assert_eq!(body["stale"][0], "/moved");
+}
+
+#[tokio::test]
+async fn the_index_search_endpoint_ranks_the_right_file() {
+    let addr = spawn_router(router_with_indexes(indexed_state())).await;
+    let response = http_request(
+        addr,
+        &post_json(
+            "/tqf/index/search",
+            r#"{"query":"expert cache eviction","top_k":3}"#,
+        ),
+    )
+    .await;
+    let body = body_of(&response);
+
+    assert_eq!(body["lane"], "lexical");
+    assert_eq!(
+        body["hits"][0]["path"], "src/cache.rs",
+        "the cache file must outrank the broker for this query: {body}"
+    );
+    assert_eq!(body["hits"][0]["root"], "/repo");
+    assert!(body["hits"][0]["score"].as_f64().unwrap() > 0.0);
+}
+
+/// The exact lane is case-preserving and bypasses BM25 entirely
+/// (spec §83, §182), so it is reported as its own lane rather than
+/// blended into the lexical scores.
+#[tokio::test]
+async fn the_exact_lane_is_served_separately_from_bm25() {
+    let addr = spawn_router(router_with_indexes(indexed_state())).await;
+    let body = body_of(
+        &http_request(
+            addr,
+            &post_json(
+                "/tqf/index/search",
+                r#"{"query":"MemoryBroker","exact":true}"#,
+            ),
+        )
+        .await,
+    );
+
+    assert_eq!(body["lane"], "exact");
+    assert_eq!(body["hits"][0]["path"], "src/broker.rs");
+
+    // A different case must not match the exact lane.
+    let miss = body_of(
+        &http_request(
+            addr,
+            &post_json(
+                "/tqf/index/search",
+                r#"{"query":"memorybroker","exact":true}"#,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(miss["hits"].as_array().unwrap().len(), 0);
+}
+
+/// Spec §44: the server works normally without an index. "Nothing is
+/// indexed" and "nothing matched" are different answers and must look
+/// different to a client.
+#[tokio::test]
+async fn searching_with_no_synced_root_is_an_ordinary_empty_result() {
+    let addr = spawn_test_server(false).await;
+    let body = body_of(
+        &http_request(
+            addr,
+            &post_json("/tqf/index/search", r#"{"query":"anything"}"#),
+        )
+        .await,
+    );
+
+    assert_eq!(body["hits"].as_array().unwrap().len(), 0);
+    assert!(body["note"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("tqf sync"));
+}
+
+#[tokio::test]
+async fn an_empty_search_query_is_rejected() {
+    let addr = spawn_router(router_with_indexes(indexed_state())).await;
+    let response = http_request(addr, &post_json("/tqf/index/search", r#"{"query":"   "}"#)).await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
 }

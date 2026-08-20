@@ -45,6 +45,11 @@ pub struct AppState {
     /// size, digest, and source revision from this rather than
     /// synthesizing values that merely look right.
     pub model_receipt: Option<Arc<crate::setup::receipt::ModelReceipt>>,
+    /// Indexes for every registered root, loaded once at startup
+    /// (spec §218). Empty when nothing is synced, which is the ordinary
+    /// case and not an error — spec §44: the server works normally
+    /// without an index.
+    pub indexes: Arc<crate::retrieval::tqi::loaded::LoadedIndexes>,
     pub started_at: Instant,
     /// `Some` only for non-loopback binds without `--insecure` (spec Part
     /// IX section 74); enforced by the `auth` middleware on the protected

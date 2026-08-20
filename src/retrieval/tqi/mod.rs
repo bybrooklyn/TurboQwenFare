@@ -5,6 +5,8 @@
 //! `<root>/.tqf/index.tqi` beside a `project.toml`.
 
 pub mod codec;
+pub mod loaded;
+pub mod registry;
 pub mod segments;
 pub mod superblock;
 

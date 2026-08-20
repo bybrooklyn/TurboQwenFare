@@ -16,7 +16,7 @@ use std::path::Path;
 use crate::error::Result;
 use crate::retrieval::scan::{scan_root, ScanReport};
 use crate::retrieval::sync::{full_correctness_walk, FileTable, SyncEngine};
-use crate::retrieval::tqi::{self, codec::IndexContents, segments::FileRecord};
+use crate::retrieval::tqi::{self, codec::IndexContents, registry, segments::FileRecord};
 
 /// What one `tqf sync` run observed.
 #[derive(Debug, Default)]
@@ -64,6 +64,8 @@ pub fn run_unsync(path: &Path) -> Result<()> {
     // nothing else — leaving an empty directory behind would make an
     // unsynced root still look synced to anything checking for it.
     std::fs::remove_file(&index_path)?;
+    let _ = std::fs::remove_file(registry::project_file_path(&root));
+    registry::deregister(&root)?;
     if let Some(parent) = index_path.parent() {
         let empty = std::fs::read_dir(parent)
             .map(|mut d| d.next().is_none())
@@ -123,6 +125,26 @@ fn index(path: &Path) -> Result<SyncReport> {
     )?;
 
     let loaded = tqi::codec::read(&index_path)?;
+
+    // Register the root so a server started anywhere can find it, and
+    // write the project file that carries the index identity with the
+    // project (spec §218).
+    registry::write_project_file(
+        &root,
+        &registry::ProjectFile {
+            index_uuid: loaded
+                .superblock
+                .index_uuid
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            root: root.display().to_string(),
+            last_synced_unix: loaded.superblock.last_compacted_unix,
+            generation: loaded.superblock.latest_generation,
+        },
+    )?;
+    registry::register(&root)?;
+
     report.generation = loaded.superblock.latest_generation;
     report.index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
     report.index_path = Some(index_path.display().to_string());

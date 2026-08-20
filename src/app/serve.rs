@@ -418,6 +418,10 @@ async fn run_server(
         // model from its real trusted receipt (size, digest, source
         // revision) rather than inventing plausible-looking values.
         model_receipt: receipt.map(Arc::new),
+        // Loaded once at startup rather than per request: rebuilding from
+        // the persisted postings costs a file read, but re-reading it on
+        // every query would not.
+        indexes: Arc::new(crate::retrieval::tqi::loaded::load_registered()),
         started_at: Instant::now(),
         api_key: bound.api_key.map(|k| Arc::from(k.as_str())),
     };

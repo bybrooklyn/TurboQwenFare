@@ -1,6 +1,8 @@
 //! Native tqf control/status endpoints (spec Part IX section 69).
 
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
@@ -82,6 +84,7 @@ pub fn routes() -> Router<AppState> {
         .route("/tqf/memory", get(memory))
         .route("/tqf/context", get(context))
         .route("/tqf/indexes", get(indexes))
+        .route("/tqf/index/search", axum::routing::post(index_search))
 }
 
 /// What is installed, loaded, and serving. The native counterpart to
@@ -172,11 +175,115 @@ async fn context(State(state): State<AppState>) -> Json<Value> {
 
 /// Spec §211's index listing. Nothing persists an index, so this reports
 /// an empty set and says why rather than omitting the endpoint.
-async fn indexes() -> Json<Value> {
+async fn indexes(State(state): State<AppState>) -> Json<Value> {
+    let loaded: Vec<Value> = state
+        .indexes
+        .roots
+        .iter()
+        .map(|root| {
+            serde_json::json!({
+                "root": root.root.display().to_string(),
+                "index": root.index_path.display().to_string(),
+                "generation": root.generation,
+                "files": root.file_count,
+                "lexical_terms": root.term_count,
+                // Stated per index rather than once, because it is a
+                // property of what this index contains: the semantic lane
+                // needs the helper model, which is not installed.
+                "lanes": ["lexical", "exact"],
+            })
+        })
+        .collect();
+
+    // Registered roots that did not load are reported, not omitted: a
+    // silently missing index looks identical to one that was never
+    // synced.
+    let failed: Vec<Value> = state
+        .indexes
+        .failed
+        .iter()
+        .map(|(root, why)| serde_json::json!({"root": root.display().to_string(), "error": why}))
+        .collect();
+    let stale: Vec<String> = state
+        .indexes
+        .stale
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect();
+
+    let mut body = serde_json::json!({
+        "indexes": loaded,
+        "failed": failed,
+        "stale": stale,
+    });
+    // An empty list with no explanation leaves a caller guessing whether
+    // indexing is unsupported or simply unused.
+    if state.indexes.roots.is_empty()
+        && state.indexes.failed.is_empty()
+        && state.indexes.stale.is_empty()
+    {
+        body["note"] =
+            serde_json::json!("no root is synced; run `tqf sync <path>` to build and register one");
+    }
+    Json(body)
+}
+
+#[derive(serde::Deserialize)]
+struct IndexSearchRequest {
+    query: String,
+    #[serde(default = "default_top_k")]
+    top_k: usize,
+    /// Case-sensitive exact identifier lookup, which bypasses BM25
+    /// entirely (spec §83, §182) rather than being blended into it.
+    #[serde(default)]
+    exact: bool,
+}
+
+fn default_top_k() -> usize {
+    10
+}
+
+/// `POST /tqf/index/search` (spec §211).
+async fn index_search(
+    State(state): State<AppState>,
+    Json(request): Json<IndexSearchRequest>,
+) -> Response {
+    if request.query.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "query must not be empty"})),
+        )
+            .into_response();
+    }
+    // Spec §44: no index is an ordinary state, not an error. Report an
+    // empty result set and say why, so a client can tell "nothing matched"
+    // from "nothing is indexed".
+    if state.indexes.is_empty() {
+        return Json(serde_json::json!({
+            "hits": [],
+            "note": "no root is synced; run `tqf sync <path>`",
+        }))
+        .into_response();
+    }
+
+    let top_k = request.top_k.clamp(1, 100);
+    let hits = if request.exact {
+        state.indexes.exact_lookup(request.query.trim())
+    } else {
+        state.indexes.search(&request.query, top_k)
+    };
+
     Json(serde_json::json!({
-        "indexes": [],
-        "note": "Index persistence (spec §218's project registry and the `.tqi` container) \
-                 is not implemented, so no root can be registered. `tqf sync <path>` builds \
-                 an index in memory and reports what it found.",
+        "hits": hits
+            .iter()
+            .take(top_k)
+            .map(|hit| serde_json::json!({
+                "root": hit.root,
+                "path": hit.path,
+                "score": hit.score,
+            }))
+            .collect::<Vec<_>>(),
+        "lane": if request.exact { "exact" } else { "lexical" },
     }))
+    .into_response()
 }
