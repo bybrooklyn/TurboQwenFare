@@ -40,13 +40,71 @@ fn ok() -> std::process::ExitCode {
 
 /// Serves the Model Context Protocol over stdio (spec §95, §228).
 ///
-/// The index is `None`: nothing persists one yet, and spec §44 explicitly
-/// allows the server to work without an index — its data tools then
-/// return ordinary informative results rather than protocol errors.
+/// A coding client spawns this as a subprocess inside the project it is
+/// working on, so the working directory — not a flag, and not "every
+/// registered root" — is what identifies which index to serve. Serving
+/// all of them would leak one project's file list into another's tool
+/// results.
+///
+/// A missing or unreadable index is not an error here. Spec §44 says the
+/// server works normally without an index; the tools then return ordinary
+/// informative results naming `tqf sync` instead of protocol errors, and
+/// the client keeps working. Failures are logged, never written to
+/// stdout, which belongs exclusively to the JSON-RPC transport.
 fn run_mcp_stdio() -> Result<()> {
     use std::io::{stdin, stdout, BufReader};
-    crate::mcp::stdio::run_stdio_loop(None, BufReader::new(stdin().lock()), stdout().lock())?;
+    let state = mcp_index_for_cwd();
+    crate::mcp::stdio::run_stdio_loop(
+        state.as_ref(),
+        BufReader::new(stdin().lock()),
+        stdout().lock(),
+    )?;
     Ok(())
+}
+
+/// Finds the registered root containing the working directory and loads
+/// its index.
+///
+/// The deepest containing root wins, so a synced subproject inside a
+/// synced monorepo serves the subproject's own index rather than the
+/// parent's.
+fn mcp_index_for_cwd() -> Option<crate::mcp::tools::IndexState> {
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    let mut containing: Vec<std::path::PathBuf> = crate::retrieval::tqi::registry::resolve()
+        .live
+        .into_iter()
+        .filter(|root| {
+            root.canonicalize()
+                .map(|root| cwd.starts_with(root))
+                .unwrap_or(false)
+        })
+        .collect();
+    // Deepest first: more path components means a more specific root.
+    containing.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+
+    let root = containing.first()?;
+    match crate::retrieval::tqi::loaded::load_root(root) {
+        Ok(loaded) => {
+            tracing::info!(
+                root = %loaded.root.display(),
+                files = loaded.file_count,
+                "serving MCP from a persisted index"
+            );
+            Some(crate::mcp::tools::IndexState {
+                root: loaded.root,
+                lexical: loaded.lexical,
+                // The MCP server never loads the embedder to answer a
+                // lexical query (spec §85), and no persisted semantic
+                // lane exists yet regardless.
+                semantic: None,
+                paths: loaded.paths,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(root = %root.display(), %error, "failed to load index for MCP");
+            None
+        }
+    }
 }
 
 /// spec §98: headless mode runs the server exactly as before, blocking

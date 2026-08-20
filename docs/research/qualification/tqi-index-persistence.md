@@ -95,8 +95,49 @@ Recorded rather than left for a reader to discover, per §335.
   file records carry the same BLAKE3 content hash the walk uses for change
   detection, so the next step has what it needs, but nothing yet skips
   unchanged files.
-- **MCP wiring.** Phase 44's tools take an `IndexState`; the server now
-  has real indexes to give them, but they are not connected yet.
+
+## MCP
+
+Phase 44 built the tool surface and qualified it against a hand-built
+`IndexState`; nothing constructed one from a real index, so `--mcp-stdio`
+passed `None` and every data tool answered "no index".
+
+A coding client spawns the MCP server as a subprocess inside the project
+it is working on, so the working directory selects the root — not a flag,
+and not "every registered root", which would leak one project's file list
+into another's tool results. The deepest containing registered root wins,
+so a synced subproject inside a synced monorepo serves its own index.
+
+`IndexState` no longer holds file contents. It held a `HashMap<String,
+String>` of every indexed file's full text, which put the whole repository
+in RAM for the process's life to serve occasional `tqf_file` calls — and
+the persisted index does not store contents anyway, it stores postings.
+It now holds the path list and reads on demand, which also means
+`tqf_file` returns the file as it is now rather than as it was at index
+time.
+
+That made `tqf_file` a disk read driven by a tool argument, so it has two
+independent guards: the path must be one the index contains, and the
+resolved location must still be inside the root after symlink resolution.
+Either would probably do. Spec §95 makes this surface read-only, and a
+read-only surface that can be walked out of its root is not read-only in
+any useful sense.
+
+Measured by invocation, not by inspection (spec §335) — a real
+`tqf --mcp-stdio` subprocess against a real synced index, four JSON-RPC
+messages over stdin:
+
+| Request | Result |
+|---|---|
+| `initialize` | `protocolVersion 2025-06-18` |
+| `tqf_symbol` `MemoryBroker` | 6 real files, `src/model/qwen36/runtime.rs` first |
+| `tqf_search` "whole expert lfu cache eviction" | `src/experts/mod.rs` (rrf 0.0164) |
+| `tqf_file` `../../../etc/passwd` | refused |
+
+The search query appears as that literal string in no file; it resolves
+through identifier-subtoken splitting, the same result Phase 36 measured
+directly against a freshly built index — now reproduced through a
+persisted one, a subprocess boundary, and the JSON-RPC transport.
 
 ## Verification
 
@@ -108,6 +149,10 @@ curl localhost:11434/tqf/indexes
 curl localhost:11434/tqf/index/search -H 'Content-Type: application/json' \
      -d '{"query":"...","top_k":5}'
 tqf unsync <path>             # removes the index and the registration
+
+# MCP, from inside a synced root:
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  | tqf --mcp-stdio
 ```
 
 33 tests cover the container and its wiring, including truncation at every

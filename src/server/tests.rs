@@ -1195,6 +1195,7 @@ fn indexed_state() -> Arc<crate::retrieval::tqi::loaded::LoadedIndexes> {
             file_count: 2,
             term_count: lexical.term_count(),
             lexical,
+            paths: vec!["src/broker.rs".to_string(), "src/cache.rs".to_string()],
         }],
         ..Default::default()
     })

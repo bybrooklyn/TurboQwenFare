@@ -18,6 +18,10 @@ pub struct LoadedRoot {
     pub file_count: usize,
     pub term_count: usize,
     pub lexical: LexicalIndex,
+    /// The indexed file list, relative to `root`. Kept because callers
+    /// that enumerate files (the MCP repo map) or resolve one against
+    /// disk need it, and rebuilding it means re-reading the index.
+    pub paths: Vec<String>,
 }
 
 /// What startup found, including what it could not load — a root whose
@@ -125,6 +129,7 @@ pub fn load_root(root: &Path) -> crate::error::Result<LoadedRoot> {
         file_count: loaded.contents.files.len(),
         term_count: lexical.term_count(),
         lexical,
+        paths,
     })
 }
 

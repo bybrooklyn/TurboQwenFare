@@ -12,8 +12,8 @@
 //! handlers report the real limitation via `isError: true` rather than
 //! fabricating an answer.
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -29,11 +29,55 @@ use super::protocol::{tool_text_result, ToolDefinition};
 /// pplx-embed helper model just to answer a lexical/exact query — spec
 /// §85: "Identifier-like queries should hit exact/lexical/symbol paths
 /// without loading the embedder").
+///
+/// `paths` is the indexed file list, not their contents. Holding every
+/// file's text in memory would put the whole repository in RAM for the
+/// life of the process to serve occasional `tqf_file` calls, and the
+/// persisted index does not store contents anyway — it stores postings.
+/// `tqf_file` reads from disk on demand instead, which also means it
+/// returns the file as it is *now* rather than as it was when the index
+/// was built.
 pub struct IndexState {
     pub root: PathBuf,
     pub lexical: LexicalIndex,
     pub semantic: Option<FlatVectorStore>,
-    pub file_contents: HashMap<String, String>,
+    pub paths: Vec<String>,
+}
+
+impl IndexState {
+    /// Reads one indexed file.
+    ///
+    /// Two independent guards, because the path list is parsed from a
+    /// file on disk and a tool argument is attacker-controlled: the path
+    /// must be one this index actually contains, and the resolved
+    /// location must still be inside the root. Either check alone would
+    /// probably do; spec §95 makes this surface read-only, and a
+    /// read-only surface that can be walked out of its root is not
+    /// read-only in any useful sense.
+    pub fn read_indexed_file(&self, path: &str) -> Result<String, String> {
+        if !self.paths.iter().any(|known| known == path) {
+            return Err(format!("File {path:?} is not in the index."));
+        }
+        let joined = self.root.join(path);
+        let resolved = joined
+            .canonicalize()
+            .map_err(|e| format!("File {path:?} is indexed but unreadable: {e}"))?;
+        if !within(&self.root, &resolved) {
+            return Err(format!("File {path:?} resolves outside the indexed root."));
+        }
+        std::fs::read_to_string(&resolved)
+            .map_err(|e| format!("File {path:?} is indexed but unreadable: {e}"))
+    }
+}
+
+/// Containment after symlink resolution. The root is canonicalized here
+/// rather than at construction so a caller cannot hand us a
+/// pre-resolved-looking root that isn't.
+fn within(root: &Path, resolved: &Path) -> bool {
+    match root.canonicalize() {
+        Ok(root) => resolved.starts_with(root),
+        Err(_) => false,
+    }
 }
 
 pub fn tool_definitions() -> Vec<ToolDefinition> {
@@ -161,9 +205,9 @@ pub fn call_tool(state: Option<&IndexState>, name: &str, params: &Value) -> Resu
             let Some(state) = state else {
                 return Ok(tool_text_result(NO_INDEX_MESSAGE.to_string(), false));
             };
-            match state.file_contents.get(path) {
-                Some(contents) => Ok(tool_text_result(contents.clone(), false)),
-                None => Ok(tool_text_result(format!("File {path:?} is not in the index."), true)),
+            match state.read_indexed_file(path) {
+                Ok(contents) => Ok(tool_text_result(contents, false)),
+                Err(why) => Ok(tool_text_result(why, true)),
             }
         }
         "tqf_repo_map" => {
@@ -171,7 +215,7 @@ pub fn call_tool(state: Option<&IndexState>, name: &str, params: &Value) -> Resu
                 return Ok(tool_text_result(NO_INDEX_MESSAGE.to_string(), false));
             };
             let mut modules: BTreeMap<String, usize> = BTreeMap::new();
-            for path in state.file_contents.keys() {
+            for path in &state.paths {
                 *modules.entry(module_of(path)).or_insert(0) += 1;
             }
             let text = modules
