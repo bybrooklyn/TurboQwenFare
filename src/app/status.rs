@@ -260,12 +260,50 @@ pub fn render(snapshot: &StatusSnapshot) -> String {
         let _ = writeln!(out, "data:      {home}");
     }
 
-    // Honest about the real gap rather than silently omitting the line:
-    // nothing persists an index yet, so there is nothing to list.
-    let _ = writeln!(
-        out,
-        "indexes:   none registered (index persistence is not implemented)"
-    );
+    // Read from the registry rather than from a running server: `tqf
+    // status` has to answer when nothing is listening, which is the case
+    // this whole function is written for.
+    let resolved = crate::retrieval::tqi::registry::resolve();
+    if resolved.live.is_empty() && resolved.stale.is_empty() {
+        let _ = writeln!(out, "indexes:   none registered (run `tqf sync <path>`)");
+    } else {
+        // The label goes on whichever row prints first, live or stale —
+        // a registry holding only stale roots is still a registry.
+        let mut first = true;
+        let mut label = || {
+            let label = if first { "indexes:  " } else { "          " };
+            first = false;
+            label
+        };
+        for root in &resolved.live {
+            // The generation comes from the root's own project file, so a
+            // root whose index was deleted by hand still reports as
+            // registered — which is the truth, and what `tqf unsync`
+            // fixes.
+            match crate::retrieval::tqi::registry::read_project_file(root) {
+                Some(project) => {
+                    let _ = writeln!(
+                        out,
+                        "{} {} (generation {})",
+                        label(),
+                        root.display(),
+                        project.generation
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "{} {} (no project file)", label(), root.display());
+                }
+            }
+        }
+        for root in &resolved.stale {
+            let _ = writeln!(
+                out,
+                "{} {} (registered but gone; `tqf unsync` to forget it)",
+                label(),
+                root.display()
+            );
+        }
+    }
     out
 }
 
@@ -285,6 +323,49 @@ mod tests {
             }),
             ..StatusSnapshot::default()
         }
+    }
+
+    /// `tqf status` reads the registry directly, because it has to
+    /// answer when no server is running — the case the whole command
+    /// exists for.
+    ///
+    /// This line used to read "index persistence is not implemented".
+    /// It stayed convincing for a while after it stopped being true,
+    /// which is the failure this test exists to prevent; both branches
+    /// are pinned so neither can quietly go stale again.
+    #[test]
+    fn the_index_line_reports_the_real_registry() {
+        let home = std::env::temp_dir().join(format!("tqf-status-registry-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: same contract as `config::paths`'s own test — the suite
+        // runs single-threaded (`just test` passes --test-threads=1)
+        // precisely because TQF_HOME is process-global.
+        unsafe {
+            std::env::set_var("TQF_HOME", &home);
+        }
+
+        let empty = render(&StatusSnapshot::default());
+        assert!(
+            empty.contains("none registered (run `tqf sync <path>`)"),
+            "{empty}"
+        );
+
+        std::fs::write(
+            home.join("roots.toml"),
+            "roots = [\"/nonexistent/definitely-gone\"]\n",
+        )
+        .unwrap();
+        let stale = render(&StatusSnapshot::default());
+        assert!(
+            stale.contains("indexes:   /nonexistent/definitely-gone"),
+            "a registry holding only stale roots still gets the label: {stale}"
+        );
+        assert!(stale.contains("`tqf unsync`"), "{stale}");
+
+        unsafe {
+            std::env::remove_var("TQF_HOME");
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// The case that matters most: a user runs `tqf status` precisely

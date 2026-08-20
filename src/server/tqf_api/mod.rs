@@ -173,8 +173,10 @@ async fn context(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-/// Spec §211's index listing. Nothing persists an index, so this reports
-/// an empty set and says why rather than omitting the endpoint.
+/// Spec §211's index listing, reporting the indexes loaded at startup
+/// from the registry (spec §218) — including the roots that failed to
+/// load or went stale, since a silently missing index is
+/// indistinguishable from one that was never synced.
 async fn indexes(State(state): State<AppState>) -> Json<Value> {
     let loaded: Vec<Value> = state
         .indexes
