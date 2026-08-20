@@ -85,7 +85,10 @@ pub enum ConfigError {
 pub enum SetupError {
     #[error("model setup declined")]
     Declined,
-    #[error("no model installed and no interactive terminal to confirm setup (use --yes)")]
+    #[error(
+        "no model installed and no interactive terminal to confirm setup; \
+         re-run with --yes to proceed non-interactively, or run `tqf` in a terminal"
+    )]
     NonInteractiveConfirmationRequired,
     /// A coding client could not be prepared or launched (spec §99-100).
     /// Distinct from `ConfigError::InvalidClient`, which is a bad flag

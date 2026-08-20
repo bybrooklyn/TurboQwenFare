@@ -90,10 +90,9 @@ pub fn start_reporting(
         SetupOutcome::NonInteractiveConfirmationRequired => {
             // Deliberately not persisted as "completed": nothing was
             // actually decided, so a later run should ask again.
-            println!(
-                "tqf: no model installed and no interactive terminal to confirm setup.\n\
-                 Re-run with --yes to proceed non-interactively, or run `tqf` in a terminal."
-            );
+            // The error carries the whole message; printing it here too
+            // reported the same condition twice, once on stdout and
+            // once on stderr, in two slightly different wordings.
             return Err(SetupError::NonInteractiveConfirmationRequired.into());
         }
         SetupOutcome::ProceedInstall => {
