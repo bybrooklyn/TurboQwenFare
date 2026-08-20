@@ -208,7 +208,7 @@ mod tests {
         let observed = fake_bin.join("observed.txt");
         let script = fake_bin.join("codex");
         let body = format!(
-            "#!/bin/sh\n{{ echo \"CODEX_HOME=$CODEX_HOME\"; pwd; ls; }} > {}\nexit 0\n",
+            "#!/bin/sh\n{{ echo \"CODEX_HOME=$CODEX_HOME\"; echo \"CWD=$PWD\"; ls \"$CODEX_HOME\"; }} > {}\nexit 0\n",
             observed.display()
         );
         std::fs::write(&script, body).expect("write fake client");
@@ -256,12 +256,24 @@ mod tests {
             )
         });
         assert!(
-            seen.contains(&config_dir.display().to_string()),
-            "the client must be pointed at the ephemeral config: {seen}"
+            seen.contains(&format!("CODEX_HOME={}", config_dir.display())),
+            "CODEX_HOME must be the real absolute config directory: {seen}"
+        );
+        // Not the config directory: a coding client operates on the
+        // project it was launched from. Pointing it at the ephemeral
+        // config directory would hand it an empty temp folder as its
+        // workspace, and leave the MCP server — which picks its index by
+        // working directory — with no index to serve.
+        assert!(
+            seen.contains(&format!(
+                "CWD={}",
+                std::env::current_dir().unwrap().display()
+            )),
+            "the client must run in the directory tqf was run from: {seen}"
         );
         assert!(
             seen.contains("config.toml"),
-            "the config file must be present in the client's working directory: {seen}"
+            "the config file must be present in the directory CODEX_HOME names: {seen}"
         );
 
         // Spec §99: "remove the temporary environment/config when it

@@ -151,11 +151,18 @@ pub fn build_launch_command(
 ) -> Command {
     let mut command = Command::new(binary);
     for (key, value) in &config.env_vars {
-        // Relative env var values (e.g. `OPENCODE_CONFIG=opencode.json`)
-        // resolve against the written config directory; absolute
-        // values (e.g. `ANTHROPIC_BASE_URL=http://...`) pass through
-        // unchanged.
-        let resolved = if PathBuf::from(value).is_relative()
+        // Three cases. A written config *file* name resolves to its
+        // real path under the config directory
+        // (`OPENCODE_CONFIG=opencode.json`); the config *directory*
+        // placeholder resolves to the directory itself
+        // (`CODEX_HOME`); everything else passes through unchanged
+        // (`ANTHROPIC_BASE_URL=http://...`).
+        //
+        // All three produce absolute values, because the child is not
+        // started in the config directory — see below.
+        let resolved = if value == super::config::CONFIG_DIR {
+            written.dir.to_string_lossy().to_string()
+        } else if PathBuf::from(value).is_relative()
             && config.files.iter().any(|(p, _)| p == Path::new(value))
         {
             written.dir.join(value).to_string_lossy().to_string()
@@ -164,7 +171,17 @@ pub fn build_launch_command(
         };
         command.env(key, resolved);
     }
-    command.current_dir(&written.dir);
+    // Deliberately *not* `current_dir(&written.dir)`. A coding client
+    // works on the directory it was started in, and `tqf --open claude`
+    // is run from inside a project — pointing it at the ephemeral config
+    // directory hands it an empty temp folder as its workspace. The
+    // config directory is where the config file lives, not where work
+    // happens, and the relative-value resolution above already accounts
+    // for it without moving the child.
+    //
+    // It also decides which index the MCP server serves: it selects the
+    // registered root containing its working directory, so a child
+    // rooted in /tmp resolves to no index at all.
     command.args(&config.extra_args);
     command
 }
@@ -258,10 +275,21 @@ mod tests {
         );
 
         let mut command = build_launch_command(&sh, &config, &written);
-        // Real child process: print the env var TQF set, and confirm
-        // the config file is visible from the child's own cwd.
+        // Real child process: print the env var TQF set, confirm the
+        // config is readable through it, and report the child's own
+        // working directory.
+        //
+        // It reads the config via `$OPENCODE_CONFIG`, not via a bare
+        // relative `opencode.json`. The relative form used to work only
+        // because the child was being relocated into the config
+        // directory, which is the bug this test now guards against: a
+        // coding client must start in the user's project.
         command.arg("-c");
-        command.arg("echo \"OPENCODE_CONFIG=$OPENCODE_CONFIG\"; cat opencode.json > /dev/null && echo CONFIG_READABLE");
+        command.arg(
+            "echo \"OPENCODE_CONFIG=$OPENCODE_CONFIG\"; \
+             cat \"$OPENCODE_CONFIG\" > /dev/null && echo CONFIG_READABLE; \
+             echo \"CHILD_CWD=$PWD\"",
+        );
         command.stdout(std::process::Stdio::piped());
         let output = command.output().expect("spawn sh");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -275,6 +303,27 @@ mod tests {
         );
         assert!(stdout.contains(&expected_var), "{stdout}");
         assert!(stdout.contains("CONFIG_READABLE"), "{stdout}");
+
+        // The child inherits this process's working directory. `tqf
+        // --open claude` is run from inside a project, and a client
+        // started in the ephemeral config directory would see an empty
+        // temp folder as its workspace — and, since the MCP server picks
+        // its index by working directory, no index either.
+        let parent_cwd = std::env::current_dir().unwrap();
+        let child_cwd = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("CHILD_CWD="))
+            .unwrap_or_else(|| panic!("{stdout}"));
+        assert_ne!(
+            std::path::Path::new(child_cwd),
+            config_dir,
+            "the client must not be relocated into the config directory: {stdout}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(child_cwd).unwrap(),
+            std::fs::canonicalize(&parent_cwd).unwrap(),
+            "{stdout}"
+        );
 
         drop(written);
         assert!(
