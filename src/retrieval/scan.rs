@@ -410,6 +410,40 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
     }
+
+    /// Audit finding C-02 (2026-08-20). The escape check runs only in the
+    /// directory branch (`resolve_directory_target`); a *file* symlink
+    /// falls straight through to `fs::read`, so a link pointing outside
+    /// the registered root is cataloged under an in-root relative path
+    /// and its content is served by every later sync/MCP read.
+    ///
+    /// Asserts spec §268's boundary: symlinks cannot escape the root
+    /// during indexing. Currently fails.
+    #[test]
+    fn file_symlink_cannot_escape_the_root() {
+        let base = temp_dir("file-symlink-escape");
+        let outside = base.join("outside");
+        let root = base.join("repo");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&root).unwrap();
+
+        let secret = outside.join("private-file");
+        write_file(&secret, b"SECRET-OUTSIDE-THE-ROOT\n");
+        write_file(&root.join("ordinary.rs"), b"fn main() {}\n");
+        std::os::unix::fs::symlink(&secret, root.join("secret.txt")).unwrap();
+
+        let report = scan_root(&root).unwrap();
+
+        assert!(
+            !report.files.iter().any(|f| f.relative_path == "secret.txt"),
+            "a file symlink leaving the root must not be cataloged"
+        );
+        assert_eq!(
+            report.symlinks_escaping_root_skipped, 1,
+            "the escape must be counted, as it is for directories"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
 }
 
 #[cfg(test)]

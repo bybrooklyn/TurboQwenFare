@@ -458,3 +458,79 @@ fn tampered_payload_is_caught_by_extent_checksum_not_root_hash() {
         ))
     ));
 }
+
+/// Audit finding H-01 (2026-08-20). `open_validated_with_broker` checks
+/// file length, table bounds, and the BLAKE3 metadata root, but no record
+/// *semantics*: `rank` is never range-checked, `section_record_bytes` and
+/// `min_reader_capability_bits` are never consulted, and decoded section
+/// kinds never pass through `TqfSectionKind::from_u32`. A container whose
+/// hashes are all correct can therefore carry `rank = 5`, and the
+/// expression every weight loader applies to the result —
+/// `extent.dims[..extent.rank as usize]`, with `dims: [u64; 4]` — panics.
+/// Sites: `model/qwen36/weights.rs:1381`, `helper_model/weights.rs:81`,
+/// `helper_model/gte_reranker/weights.rs:65`, `vision/weights.rs:70`.
+///
+/// The existing `rank_over_four_is_rejected` covers the trusted writer;
+/// this covers a hostile reader input (spec §246/§268). Currently fails.
+#[test]
+fn rank_over_four_is_rejected_when_reading_a_valid_hash_container() {
+    use crate::format::tqf::records::{TensorExtentRecord, TENSOR_EXTENT_RECORD_SIZE};
+    use crate::format::tqf::superblock::{Superblock, SUPERBLOCK_SIZE};
+
+    const ROLE: u32 = 1;
+    let path = fixture_path("hostile-rank5.tqf");
+
+    let mut writer = TqfWriter::create_partial(&path, header()).unwrap();
+    writer
+        .write_extent(
+            ROLE,
+            "token_embedding",
+            Some(LayerId(0)),
+            TqfSectionKind::ResidentCore,
+            &[64, 4],
+            12,
+            12,
+            64,
+            &vec![0x5Au8; 256],
+        )
+        .unwrap();
+    writer.commit().unwrap();
+
+    // Patch rank := 5, then re-root the metadata hash exactly as the
+    // writer does, so every existing open-time check still passes.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let sb_bytes: [u8; SUPERBLOCK_SIZE] = bytes[..SUPERBLOCK_SIZE].try_into().unwrap();
+    let sb = Superblock::decode(&sb_bytes).unwrap();
+    let ext_off = sb.extent_table_offset as usize;
+    let mut record =
+        TensorExtentRecord::decode(&bytes[ext_off..ext_off + TENSOR_EXTENT_RECORD_SIZE]).unwrap();
+    record.rank = 5;
+    bytes[ext_off..ext_off + TENSOR_EXTENT_RECORD_SIZE].copy_from_slice(&record.encode());
+
+    let table = |offset: u64, len: u64| -> Vec<u8> {
+        bytes[offset as usize..(offset + len) as usize].to_vec()
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&table(
+        sb.section_table_offset,
+        sb.section_count as u64 * 64,
+    ));
+    hasher.update(&table(
+        sb.extent_table_offset,
+        sb.extent_count * TENSOR_EXTENT_RECORD_SIZE as u64,
+    ));
+    hasher.update(&table(sb.string_table_offset, sb.string_table_bytes));
+    hasher.update(&table(sb.expert_index_offset, sb.expert_index_bytes));
+    hasher.update(&table(sb.checksum_table_offset, sb.checksum_table_bytes));
+    let mut patched = sb;
+    patched.metadata_root_blake3 = *hasher.finalize().as_bytes();
+    bytes[..SUPERBLOCK_SIZE].copy_from_slice(&patched.encode());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let broker = MemoryBroker::new(Bytes(8 * 1024 * 1024));
+    assert!(
+        TqfReader::open_validated_with_broker(&path, &broker).is_err(),
+        "an extent with rank 5 must be rejected while opening, not handed \
+         to loaders that index dims[..rank]"
+    );
+}

@@ -724,4 +724,115 @@ mod tests {
         assert_eq!(loaded.gdn[0].state.to_bytes(), state.to_bytes());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Audit finding C-04(a) (2026-08-20). `load` reads each blob and
+    /// calls `SealedPage::from_bytes`, which never verifies the page's
+    /// BLAKE3 (only `verify_sealed_pages` does, and the production
+    /// restore caller in `model::qwen36::runtime` does not call it). The
+    /// store is content-addressed, yet `load` never re-hashes the blob to
+    /// check it against the filename it was found by, so a flipped
+    /// payload byte becomes live context.
+    ///
+    /// Asserts spec §156's immutability guarantee at read time.
+    /// Currently fails.
+    #[test]
+    fn a_tampered_blob_is_rejected_on_load() {
+        let dir = temp_dir("tampered-blob");
+        let store = PrefixSnapshotStore::open(&dir, u64::MAX).unwrap();
+        let page = synthetic_sealed_page(1.0);
+        let capture = FullAttentionCapture {
+            layer: LayerId(0),
+            precision: TqkvPrecision::Q8,
+            position: 0,
+            pages: vec![page],
+            tail_keys: vec![],
+            tail_values: vec![],
+        };
+        let tokens = synthetic_tokens(8);
+        store.store(&tokens, &[capture], &[]).unwrap();
+
+        let mut blob = None;
+        for shard in std::fs::read_dir(dir.join("blobs")).unwrap() {
+            for entry in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    blob = Some(path);
+                }
+            }
+        }
+        let blob = blob.expect("one blob");
+        let mut bytes = std::fs::read(&blob).unwrap();
+        bytes[crate::context::tqkv::PAGE_HEADER_BYTES + 4] ^= 0xFF;
+        std::fs::write(&blob, &bytes).unwrap();
+
+        let broker = MemoryBroker::new(Bytes(64 * 1024 * 1024));
+        assert!(
+            store.load(&tokens, &broker).is_err(),
+            "a blob whose content no longer matches its content address \
+             must not be returned as live context"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit finding C-04(b) (2026-08-20). `restore_from_snapshot`
+    /// assigns `self.sealed` wholesale: it checks neither the page
+    /// header's `layer_id`, nor its key/value encodings against the
+    /// cache's configured precision, nor the page count against
+    /// `max_tokens`. Restoring two Q8 pages captured from layer 0 into a
+    /// one-page Q4 cache on layer 7 therefore succeeds, doubles the
+    /// resident token count, and never grows the broker reservation —
+    /// violating locked invariant #4 (register before allocating) from an
+    /// ordinary product path.
+    ///
+    /// Currently fails.
+    #[test]
+    fn restore_must_not_exceed_the_reserved_capacity() {
+        use crate::context::tqkv::PAGE_TOKENS;
+
+        let broker = MemoryBroker::new(Bytes(64 * 1024 * 1024));
+        let mut source = FullAttentionLayer::new_with_backend(
+            &broker,
+            LayerId(0),
+            PAGE_TOKENS * 2,
+            BackendChoice::Tqkv(TqkvPrecision::Q8),
+        )
+        .unwrap();
+        for i in 0..PAGE_TOKENS * 2 {
+            let q = vec![0.0; 16 * 256];
+            let gate = vec![4.0; 16 * 256];
+            let k = vec![i as f32 + 1.0; 512];
+            let v = vec![i as f32 + 1.0; 512];
+            source
+                .decode_projected(q, &gate, k, &v, &vec![1.0; 256], &vec![1.0; 256])
+                .unwrap();
+        }
+        let capture = source.capture_tqkv_for_snapshot(LayerId(0)).unwrap();
+        assert_eq!(capture.pages.len(), 2);
+
+        let before = broker.snapshot().reserved;
+        let mut victim = FullAttentionLayer::new_with_backend(
+            &broker,
+            LayerId(7),
+            PAGE_TOKENS,
+            BackendChoice::Tqkv(TqkvPrecision::Q4),
+        )
+        .unwrap();
+        let reserved_for_one_page = broker.snapshot().reserved.0 - before.0;
+
+        let pages: Vec<_> = capture
+            .pages
+            .iter()
+            .map(|(_, bytes)| crate::context::tqkv::SealedPage::from_bytes(bytes).unwrap())
+            .collect();
+        let restored = victim.restore_tqkv_snapshot(pages, vec![], vec![], 2 * PAGE_TOKENS as u64);
+
+        // Refusing the mismatched restore is correct; accepting it is
+        // only correct if the broker was told about the extra page.
+        if restored.is_ok() {
+            assert!(
+                broker.snapshot().reserved.0 - before.0 > reserved_for_one_page,
+                "twice the reserved tokens are resident with no broker charge"
+            );
+        }
+    }
 }

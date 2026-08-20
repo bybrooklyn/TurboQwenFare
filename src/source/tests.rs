@@ -576,3 +576,58 @@ async fn local_file_source_records_user_owned_and_never_copies() {
     );
     assert!(FetchedArtifact::load(&dest_dir).unwrap().is_some());
 }
+
+/// Audit finding C-01 (2026-08-20). `fetch_verified` reuses a prior
+/// manifest when only the artifact name and file length match, without
+/// re-hashing the bytes or rebinding the manifest to the source's
+/// revision/expected SHA. A length-preserving edit therefore keeps the
+/// pinned SHA, and the converter writes that SHA into the `.tqf` header.
+///
+/// Asserts the required behavior: a reused manifest must describe the
+/// bytes that are on disk now. Currently fails.
+#[tokio::test]
+async fn reused_manifest_must_describe_the_current_bytes() {
+    let dir = test_dir("c01-manifest-rebind");
+    let artifact = dir.join("model.gguf");
+    let pristine = vec![0xAAu8; 4096];
+    std::fs::write(&artifact, &pristine).unwrap();
+
+    let broker = MemoryBroker::new(Bytes(8 * 1024 * 1024));
+    let source = LocalFileSource::open(artifact.clone()).unwrap();
+
+    let first = fetch_verified_with_broker(
+        &source,
+        SourceOwnership::UserOwned,
+        &dir,
+        FetchOptions::default(),
+        &broker,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.sha256, checksum::hex_digest(&pristine));
+
+    // Same length, different bytes.
+    let mut tampered = pristine.clone();
+    tampered[7] ^= 0xFF;
+    std::fs::write(&artifact, &tampered).unwrap();
+    let true_sha = checksum::hex_digest(&tampered);
+
+    let second = fetch_verified_with_broker(
+        &source,
+        SourceOwnership::UserOwned,
+        &dir,
+        FetchOptions::default(),
+        &broker,
+    )
+    .await;
+
+    // Refusing to reuse is correct; so is re-fetching and re-hashing.
+    // Reusing the stale digest is not.
+    if let Ok(artifact) = second {
+        assert_eq!(
+            artifact.sha256, true_sha,
+            "a reused manifest must not label changed bytes with the pinned SHA"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

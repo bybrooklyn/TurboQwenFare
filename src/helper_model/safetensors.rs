@@ -125,3 +125,83 @@ impl SafetensorsFile {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tqf-safetensors-test-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Audit finding H-02 (2026-08-20). `open` validates the header
+    /// length but never the extent directory: offsets are not checked for
+    /// ordering, file bounds, or agreement with `shape * dtype size`.
+    /// `read_f32` then computes `entry.end - entry.start` unchecked,
+    /// which panics in debug and wraps to a ~16 EiB allocation request in
+    /// release. This is a model-file trust boundary (spec §246/§268:
+    /// hostile input must produce a clean typed error).
+    ///
+    /// Asserts a typed error, not a panic. Currently fails.
+    #[test]
+    fn reversed_data_offsets_are_a_typed_error() {
+        let dir = scratch("reversed-offsets");
+        let path = dir.join("reversed.safetensors");
+
+        // end < start: no real safetensors file can say this.
+        let header = br#"{"weight":{"dtype":"F32","shape":[4],"data_offsets":[64,0]}}"#;
+        let mut file = Vec::new();
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(header);
+        file.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&path, &file).unwrap();
+
+        let outcome = std::panic::catch_unwind(|| {
+            let opened = SafetensorsFile::open(&path)?;
+            opened.read_f32("weight")
+        });
+
+        match outcome {
+            Ok(Err(_)) => { /* correct: rejected with a typed error */ }
+            Ok(Ok(values)) => panic!(
+                "a reversed extent must not decode; got {} values",
+                values.len()
+            ),
+            Err(_) => panic!("a reversed extent must not panic the parser"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audit finding H-02, second half: the declared shape and the byte
+    /// range must agree. `[4]` F32 values are 16 bytes; this file claims
+    /// 64. `read_f32` currently returns 16 values for a 4-element tensor.
+    ///
+    /// Currently fails.
+    #[test]
+    fn shape_must_agree_with_the_byte_range() {
+        let dir = scratch("shape-disagreement");
+        let path = dir.join("mismatched.safetensors");
+
+        let header = br#"{"weight":{"dtype":"F32","shape":[4],"data_offsets":[0,64]}}"#;
+        let mut file = Vec::new();
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(header);
+        file.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&path, &file).unwrap();
+
+        let opened = SafetensorsFile::open(&path);
+        match opened.and_then(|file| file.read_f32("weight")) {
+            Ok(values) => panic!(
+                "shape [4] declares 16 bytes, the extent claims 64; got {} values",
+                values.len()
+            ),
+            Err(_) => { /* correct */ }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
