@@ -64,6 +64,10 @@ pub enum ConfigError {
     InvalidSize(String),
     #[error("invalid --host value {0:?}: expected an IP address")]
     InvalidHost(String),
+    #[error("--model {0:?} does not exist")]
+    ModelPathMissing(String),
+    #[error("--model {0:?} is a directory; point it at a .gguf checkpoint file")]
+    ModelPathNotAFile(String),
     #[error(
         "--memory {given} is below the {floor} experimental floor; \
          use 2G for the experimental profile or 4G for the supported default (spec §4, §40)"

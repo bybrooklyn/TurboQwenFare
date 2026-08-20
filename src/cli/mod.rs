@@ -112,6 +112,30 @@ impl Cli {
                 .into());
             }
         }
+        // Both of these used to surface only after the first-run setup
+        // gate, so a typo in a path was reported as "no model installed
+        // and no interactive terminal to confirm setup" — a message
+        // about a different problem entirely. An invalid argument is
+        // knowable before any of that runs.
+        if let Some(path) = &self.model {
+            if !path.exists() {
+                return Err(crate::error::ConfigError::ModelPathMissing(
+                    path.display().to_string(),
+                )
+                .into());
+            }
+            if path.is_dir() {
+                return Err(crate::error::ConfigError::ModelPathNotAFile(
+                    path.display().to_string(),
+                )
+                .into());
+            }
+        }
+        if let Some(host) = &self.host {
+            if host.parse::<std::net::IpAddr>().is_err() {
+                return Err(crate::error::ConfigError::InvalidHost(host.clone()).into());
+            }
+        }
         Ok(Config {
             memory_budget_bytes,
             context_limit_tokens: self
@@ -163,6 +187,43 @@ mod memory_floor_tests {
                 config.memory_budget_bytes.unwrap() >= crate::config::MINIMUM_MEMORY_BUDGET_BYTES
             );
         }
+    }
+
+    /// A bad path or host used to reach the first-run setup gate before
+    /// anything looked at it, so the user was told "no model installed
+    /// and no interactive terminal to confirm setup" — a real message
+    /// about a different problem. Each argument is now refused where it
+    /// was typed, naming the value.
+    #[test]
+    fn invalid_paths_and_hosts_are_named_rather_than_reported_as_setup_failures() {
+        let missing = config_for(&["tqf", "--model", "/nonexistent/typo.gguf"])
+            .expect_err("a nonexistent --model must be refused")
+            .to_string();
+        assert!(missing.contains("typo.gguf"), "{missing}");
+        assert!(missing.contains("does not exist"), "{missing}");
+
+        // A directory is a distinct mistake from a missing file — most
+        // often a user pointing at the folder the checkpoint is in.
+        let dir = std::env::temp_dir();
+        let is_dir = config_for(&["tqf", "--model", dir.to_str().unwrap()])
+            .expect_err("a directory --model must be refused")
+            .to_string();
+        assert!(is_dir.contains(".gguf"), "{is_dir}");
+
+        let host = config_for(&["tqf", "--host", "not-an-ip"])
+            .expect_err("a non-IP --host must be refused")
+            .to_string();
+        assert!(host.contains("not-an-ip"), "{host}");
+
+        // And the valid forms still pass, including the non-loopback
+        // bind that mints an API key.
+        for ok in ["127.0.0.1", "0.0.0.0", "::1"] {
+            config_for(&["tqf", "--host", ok])
+                .unwrap_or_else(|e| panic!("--host {ok} must be accepted: {e}"));
+        }
+        let real_file = std::env::current_dir().unwrap().join("Cargo.toml");
+        config_for(&["tqf", "--model", real_file.to_str().unwrap()])
+            .expect("an existing file must be accepted here; format checks come later");
     }
 
     /// No `--memory` at all still means the 4 GiB default, which the
