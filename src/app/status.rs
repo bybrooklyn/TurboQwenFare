@@ -57,6 +57,11 @@ fn collect(config: &crate::config::Config) -> Result<StatusSnapshot> {
     if let Ok(path) = paths::config_path() {
         snapshot.config = PersistedConfig::load(&path).unwrap_or_default();
     }
+    // Flags win over the persisted file, the same precedence a server
+    // start uses. Without this, `tqf status --memory 8G` reported the
+    // stored 4 GiB — the command whose job is to say what the
+    // configuration *is*, contradicting the flag the user just typed.
+    overlay_flags(&mut snapshot.config, config);
     if let Ok(path) = paths::profile_path() {
         snapshot.hardware = std::fs::read_to_string(path)
             .ok()
@@ -79,6 +84,29 @@ fn collect(config: &crate::config::Config) -> Result<StatusSnapshot> {
 
     snapshot.server = probe_server(config);
     Ok(snapshot)
+}
+
+/// Applies the CLI-provided configuration over the persisted one.
+///
+/// Only values the user actually supplied override: `Config`'s options
+/// are `None` when the flag was absent, so an unset flag leaves the
+/// stored value alone. `enable_vision` is a bool with no "unset" state,
+/// so it can only turn the feature on — `--enable-vision` is opt-in and
+/// there is no flag to turn it off.
+fn overlay_flags(persisted: &mut PersistedConfig, flags: &crate::config::Config) {
+    if let Some(bytes) = flags.memory_budget_bytes {
+        persisted.memory_budget_bytes = Some(bytes);
+    }
+    if let Some(tokens) = flags.context_limit_tokens {
+        persisted.context_limit_tokens = Some(tokens);
+    }
+    if let Some(host) = &flags.host {
+        persisted.host = Some(host.clone());
+    }
+    if let Some(port) = flags.port {
+        persisted.port = Some(port);
+    }
+    persisted.enable_vision |= flags.enable_vision;
 }
 
 /// Tries the configured port first, then the default and its documented
@@ -323,6 +351,39 @@ mod tests {
             }),
             ..StatusSnapshot::default()
         }
+    }
+
+    /// `tqf status --memory 8G` reported 4 GiB, because `render` read
+    /// the persisted config and ignored the flags the user had just
+    /// typed — the one command whose job is to say what the
+    /// configuration is, contradicting the command line.
+    #[test]
+    fn flags_override_the_persisted_configuration() {
+        let mut persisted = PersistedConfig {
+            memory_budget_bytes: Some(4 * 1024 * 1024 * 1024),
+            context_limit_tokens: Some(128 * 1024),
+            port: Some(11434),
+            enable_vision: false,
+            ..PersistedConfig::default()
+        };
+        overlay_flags(
+            &mut persisted,
+            &crate::config::Config {
+                memory_budget_bytes: Some(8 * 1024 * 1024 * 1024),
+                context_limit_tokens: None,
+                enable_vision: true,
+                host: None,
+                port: Some(9999),
+            },
+        );
+
+        assert_eq!(persisted.memory_budget_bytes, Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(persisted.port, Some(9999));
+        assert!(persisted.enable_vision);
+        // An absent flag must leave the stored value alone rather than
+        // overwriting it with None.
+        assert_eq!(persisted.context_limit_tokens, Some(128 * 1024));
+        assert_eq!(persisted.host, None);
     }
 
     /// `tqf status` reads the registry directly, because it has to

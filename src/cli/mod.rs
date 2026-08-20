@@ -94,12 +94,26 @@ pub enum Command {
 
 impl Cli {
     pub fn build_config(&self) -> Result<Config> {
+        let memory_budget_bytes = self
+            .memory
+            .as_deref()
+            .map(parse_human_quantity)
+            .transpose()?;
+        // Caught here rather than at startup: `--memory 1K` parsed
+        // cleanly and the server booted, then failed on whatever
+        // reservation happened to come first — a message about a cache
+        // tile, nowhere near the flag responsible.
+        if let Some(bytes) = memory_budget_bytes {
+            if bytes < crate::config::MINIMUM_MEMORY_BUDGET_BYTES {
+                return Err(crate::error::ConfigError::MemoryBudgetTooSmall {
+                    given: crate::config::human_bytes(bytes),
+                    floor: crate::config::human_bytes(crate::config::MINIMUM_MEMORY_BUDGET_BYTES),
+                }
+                .into());
+            }
+        }
         Ok(Config {
-            memory_budget_bytes: self
-                .memory
-                .as_deref()
-                .map(parse_human_quantity)
-                .transpose()?,
+            memory_budget_bytes,
             context_limit_tokens: self
                 .context
                 .as_deref()
@@ -109,5 +123,56 @@ impl Cli {
             host: self.host.clone(),
             port: self.port,
         })
+    }
+}
+
+#[cfg(test)]
+mod memory_floor_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn config_for(args: &[&str]) -> crate::error::Result<Config> {
+        Cli::try_parse_from(args).unwrap().build_config()
+    }
+
+    /// `--memory 1K` used to parse cleanly and start a server, which then
+    /// failed on whatever reservation came first — a message about a
+    /// cache tile, nowhere near the flag that caused it. Spec §40 defines
+    /// no profile below 2 GiB, so the flag is where it is refused.
+    #[test]
+    fn a_budget_below_the_experimental_floor_is_refused_at_the_flag() {
+        for below in ["1K", "512M", "1G", "2047M"] {
+            let error = config_for(&["tqf", "--memory", below])
+                .expect_err(&format!("--memory {below} must be refused"));
+            let message = error.to_string();
+            assert!(message.contains("experimental floor"), "{message}");
+            // The message has to name the way out, not just the problem.
+            assert!(message.contains("2G"), "{message}");
+            assert!(message.contains("4G"), "{message}");
+        }
+    }
+
+    /// The floor itself is allowed: spec §40 calls 2 GiB experimental,
+    /// not forbidden.
+    #[test]
+    fn the_floor_and_above_are_accepted() {
+        for allowed in ["2G", "4G", "8G", "2048M"] {
+            let config = config_for(&["tqf", "--memory", allowed])
+                .unwrap_or_else(|e| panic!("--memory {allowed} must be accepted: {e}"));
+            assert!(
+                config.memory_budget_bytes.unwrap() >= crate::config::MINIMUM_MEMORY_BUDGET_BYTES
+            );
+        }
+    }
+
+    /// No `--memory` at all still means the 4 GiB default, which the
+    /// floor check must not turn into an error.
+    #[test]
+    fn an_absent_flag_is_not_a_budget_of_zero() {
+        assert_eq!(
+            config_for(&["tqf"]).unwrap().memory_budget_bytes,
+            None,
+            "an unset flag must stay unset, not become 0 and trip the floor"
+        );
     }
 }

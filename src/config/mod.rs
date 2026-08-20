@@ -14,6 +14,23 @@ pub struct Config {
     pub port: Option<u16>,
 }
 
+/// The smallest `--memory` the product defines a profile for: spec §40's
+/// experimental 2 GiB stage. Below this there is no profile at all, and
+/// the failure surfaces as a broker rejection somewhere inside startup
+/// rather than at the flag that caused it.
+pub const MINIMUM_MEMORY_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Formats a byte count the way the CLI's own messages do.
+pub fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    match bytes {
+        b if b as f64 >= GIB => format!("{:.2} GiB", b as f64 / GIB),
+        b if b as f64 >= MIB => format!("{:.0} MiB", b as f64 / MIB),
+        b => format!("{b} bytes"),
+    }
+}
+
 /// Parses a size like "4G", "512M", "128K", or a bare integer, into a count
 /// (bytes for `--memory`, tokens for `--context`). Suffixes are
 /// case-insensitive base-1024 multipliers.

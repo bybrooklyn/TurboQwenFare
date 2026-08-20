@@ -344,7 +344,9 @@ fn check_port(config: &crate::config::Config) -> Check {
 /// length to a reservation without constructing it, so this reports what
 /// it can and is explicit that it is not the full validation.
 fn check_memory_plan(config: &crate::config::Config) -> Check {
-    const MINIMUM_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+    // One definition of the floor, shared with the flag that rejects it,
+    // so `doctor` cannot disagree with `--memory` about what is allowed.
+    const MINIMUM_BUDGET: u64 = crate::config::MINIMUM_MEMORY_BUDGET_BYTES;
     let budget = config.memory_budget_bytes.unwrap_or(4 * 1024 * 1024 * 1024);
     let context = config.context_limit_tokens.unwrap_or(128 * 1024);
 

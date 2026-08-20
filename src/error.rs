@@ -64,6 +64,11 @@ pub enum ConfigError {
     InvalidSize(String),
     #[error("invalid --host value {0:?}: expected an IP address")]
     InvalidHost(String),
+    #[error(
+        "--memory {given} is below the {floor} experimental floor; \
+         use 2G for the experimental profile or 4G for the supported default (spec §4, §40)"
+    )]
+    MemoryBudgetTooSmall { given: String, floor: String },
     #[error("environment error: {0}")]
     Environment(String),
     #[error("failed to serialize config: {0}")]
