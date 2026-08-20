@@ -413,6 +413,58 @@ mod tests {
 }
 
 #[cfg(test)]
+mod cost_probe {
+    /// Not a correctness test — a one-off measurement kept `#[ignore]`d so
+    /// the sync-cost claims in the qualification doc can be re-derived
+    /// rather than trusted. Run with:
+    /// `cargo test --release -- --ignored --nocapture scan_cost_split`
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn scan_cost_split() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let started = std::time::Instant::now();
+        let report = super::scan_root(root).unwrap();
+        let whole_scan = started.elapsed();
+
+        // Read every file the scan read, and nothing else.
+        let started = std::time::Instant::now();
+        let mut bytes = 0u64;
+        let mut buffers = Vec::new();
+        for file in &report.files {
+            if let Ok(data) = std::fs::read(root.join(&file.relative_path)) {
+                bytes += data.len() as u64;
+                buffers.push((file.relative_path.clone(), data));
+            }
+        }
+        let read_only = started.elapsed();
+
+        // Classify what was just read, and nothing else.
+        let started = std::time::Instant::now();
+        for (path, data) in &buffers {
+            std::hint::black_box(super::super::classify::classify(data, path));
+        }
+        let classify_only = started.elapsed();
+
+        let started = std::time::Instant::now();
+        for (_, data) in &buffers {
+            std::hint::black_box(blake3::hash(data));
+        }
+        let hash_only = started.elapsed();
+
+        println!(
+            "\nfiles {}  bytes {:.1} MiB\n  whole scan   {:>8.1} ms\n  read only                 {:>8.1} ms\n  classify     {:>8.1} ms\n  blake3       {:>8.1} ms",
+            report.files.len(),
+            bytes as f64 / (1024.0 * 1024.0),
+            whole_scan.as_secs_f64() * 1000.0,
+            read_only.as_secs_f64() * 1000.0,
+            classify_only.as_secs_f64() * 1000.0,
+            hash_only.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+#[cfg(test)]
 mod ordering_tests {
     /// Chunk ids are assigned positionally from this walk, so the walk
     /// order decides what the persisted index contains. `read_dir` order

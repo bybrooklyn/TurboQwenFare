@@ -27,6 +27,10 @@ cuda = []
 gui = []
 
 [dependencies]
+# Already in the tree via `regex`; taken as a direct dependency so the
+# content classifier can find every language marker in one pass instead
+# of rescanning each file once per marker.
+aho-corasick = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"

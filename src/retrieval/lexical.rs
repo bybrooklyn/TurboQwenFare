@@ -29,8 +29,17 @@ struct ChunkEntry {
 /// lowercased for lexical matching. Case is preserved separately for the
 /// exact-identifier lane.
 fn tokenize(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    for raw in split_raw_tokens(text) {
+    tokenize_raw(&split_raw_tokens(text))
+}
+
+/// The tokenizing half, over raw tokens a caller has already split.
+///
+/// Separated so `build` can split each document once and feed both the
+/// BM25 lane (lowercased, plus identifier subtokens) and the exact lane
+/// (the same tokens, case preserved) from one pass.
+fn tokenize_raw(raw_tokens: &[&str]) -> Vec<String> {
+    let mut tokens = Vec::with_capacity(raw_tokens.len());
+    for raw in raw_tokens {
         if raw.is_empty() {
             continue;
         }
@@ -129,25 +138,41 @@ impl LexicalIndex {
 
         for (chunk_id, (path, content)) in documents.iter().enumerate() {
             let chunk_id = chunk_id as u32;
-            let tokens = tokenize(content);
+            // Split once and serve both lanes from it. BM25 wants the
+            // lowercased tokens plus identifier subtokens; the exact lane
+            // wants the same raw tokens case-preserved, and used to
+            // re-split the whole document to get them.
+            let raw_tokens = split_raw_tokens(content);
+            let tokens = tokenize_raw(&raw_tokens);
             total_tokens += tokens.len() as u64;
             chunks.push(ChunkEntry {
                 path: path.clone(),
                 token_count: tokens.len() as u32,
             });
 
+            // `tokens` is consumed rather than borrowed: every entry is
+            // already an owned String, so cloning each one to key the
+            // per-document tally allocated once per token *occurrence*.
             let mut term_frequency: HashMap<String, u32> = HashMap::new();
-            for token in &tokens {
-                *term_frequency.entry(token.clone()).or_insert(0) += 1;
+            for token in tokens {
+                *term_frequency.entry(token).or_insert(0) += 1;
             }
             for (term, tf) in term_frequency {
                 postings.entry(term).or_default().push((chunk_id, tf));
             }
 
-            for raw in split_raw_tokens(content) {
-                let entry = exact.entry(raw.to_string()).or_default();
-                if entry.last() != Some(&chunk_id) {
-                    entry.push(chunk_id);
+            for raw in raw_tokens {
+                // Only allocate for an identifier this chunk has not
+                // already recorded; the common case is a repeat.
+                match exact.get_mut(raw) {
+                    Some(entry) => {
+                        if entry.last() != Some(&chunk_id) {
+                            entry.push(chunk_id);
+                        }
+                    }
+                    None => {
+                        exact.insert(raw.to_string(), vec![chunk_id]);
+                    }
                 }
             }
         }
@@ -527,5 +552,117 @@ mod persistence_tests {
         let rebuilt = LexicalIndex::from_parts(postings, exact, &lengths, &paths);
         assert_eq!(rebuilt.document_count(), 0);
         assert!(rebuilt.search("anything", 5).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod build_equivalence {
+    use super::*;
+
+    /// The build loop as it stood before the split-once / no-clone
+    /// change, kept as the oracle. Both changes are optimizations, so the
+    /// bar is an identical index, not a similar one.
+    fn build_by_resplitting(documents: &[(String, String)]) -> LexicalIndex {
+        let mut postings: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+        let mut chunks = Vec::with_capacity(documents.len());
+        let mut exact: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut total_tokens = 0u64;
+
+        for (chunk_id, (path, content)) in documents.iter().enumerate() {
+            let chunk_id = chunk_id as u32;
+            let tokens = tokenize(content);
+            total_tokens += tokens.len() as u64;
+            chunks.push(ChunkEntry {
+                path: path.clone(),
+                token_count: tokens.len() as u32,
+            });
+
+            let mut term_frequency: HashMap<String, u32> = HashMap::new();
+            for token in &tokens {
+                *term_frequency.entry(token.clone()).or_insert(0) += 1;
+            }
+            for (term, tf) in term_frequency {
+                postings.entry(term).or_default().push((chunk_id, tf));
+            }
+
+            for raw in split_raw_tokens(content) {
+                let entry = exact.entry(raw.to_string()).or_default();
+                if entry.last() != Some(&chunk_id) {
+                    entry.push(chunk_id);
+                }
+            }
+        }
+
+        let avg_doc_len = if chunks.is_empty() {
+            0.0
+        } else {
+            total_tokens as f32 / chunks.len() as f32
+        };
+        LexicalIndex {
+            postings,
+            chunks,
+            avg_doc_len,
+            exact,
+        }
+    }
+
+    fn real_documents() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = crate::retrieval::scan::scan_root(root).unwrap();
+        report
+            .files
+            .iter()
+            .filter(|f| f.classification.language == Some("Rust"))
+            .filter_map(|f| {
+                std::fs::read_to_string(root.join(&f.relative_path))
+                    .ok()
+                    .map(|text| (f.relative_path.clone(), text))
+            })
+            .collect()
+    }
+
+    /// Compared through `export`, which is what actually reaches disk:
+    /// postings, the exact lane, per-chunk token counts, and paths.
+    #[test]
+    fn splitting_once_builds_the_same_index_as_resplitting() {
+        let documents = real_documents();
+        assert!(documents.len() > 100, "expected a real corpus");
+
+        let fast = LexicalIndex::build(&documents);
+        let slow = build_by_resplitting(&documents);
+
+        assert_eq!(fast.export(), slow.export());
+        assert_eq!(fast.document_count(), slow.document_count());
+        assert_eq!(fast.term_count(), slow.term_count());
+        assert!((fast.avg_doc_len - slow.avg_doc_len).abs() < 1e-6);
+    }
+
+    /// And the scores it serves, not just the bytes it stores — a
+    /// difference in `avg_doc_len` alone would leave `export` identical
+    /// while every ranking shifted.
+    #[test]
+    fn splitting_once_serves_the_same_rankings() {
+        let documents = real_documents();
+        let fast = LexicalIndex::build(&documents);
+        let slow = build_by_resplitting(&documents);
+
+        for query in [
+            "whole expert lfu cache eviction",
+            "memory broker reservation",
+            "gitignore glob pattern matching",
+            "streaming ndjson terminal object",
+        ] {
+            let a = fast.search(query, 10);
+            let b = slow.search(query, 10);
+            assert_eq!(a.len(), b.len(), "{query}");
+            for ((path_a, score_a), (path_b, score_b)) in a.iter().zip(b.iter()) {
+                assert_eq!(path_a, path_b, "{query}");
+                assert!((score_a - score_b).abs() < 1e-6, "{query}");
+            }
+        }
+        assert_eq!(
+            fast.exact_lookup("MemoryBroker"),
+            slow.exact_lookup("MemoryBroker")
+        );
     }
 }

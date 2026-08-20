@@ -316,19 +316,74 @@ fn shebang_hint(text: &str) -> Option<&'static str> {
 /// through to the extension/shebang priors instead — see `classify`).
 const MIN_RAW_SCORE: f32 = 1.0;
 
-fn best_fingerprint(text: &str) -> Option<(&'static str, ContentKind, f32)> {
-    let mut scores: HashMap<&'static str, (ContentKind, f32)> = HashMap::new();
-    for fp in FINGERPRINTS {
-        let mut raw_score = 0f32;
-        for (marker, weight) in fp.markers {
-            let count = text.matches(marker).count();
-            if count > 0 {
-                // Diminishing returns per repeated marker so one very
-                // common short token (e.g. "->") can't dominate alone.
-                raw_score += weight * (1.0 + (count as f32).ln());
+/// Every marker across every fingerprint, flattened once, plus the
+/// automaton that finds them all in a single pass.
+///
+/// The obvious loop — `text.matches(marker)` for each marker of each
+/// language — rescans the sample once per marker. With twelve languages
+/// and a 64 KiB sample that is several megabytes of scanning per file,
+/// and it measured as 94% of the entire scan phase (155 ms of 165 ms over
+/// this repository's 259 files). One pass finds the same occurrences.
+struct MarkerSet {
+    /// `(fingerprint index, weight)` parallel to the automaton's pattern
+    /// ids.
+    owners: Vec<(usize, f32)>,
+    automaton: aho_corasick::AhoCorasick,
+}
+
+fn marker_set() -> &'static MarkerSet {
+    static SET: std::sync::OnceLock<MarkerSet> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let mut patterns = Vec::new();
+        let mut owners = Vec::new();
+        for (index, fp) in FINGERPRINTS.iter().enumerate() {
+            for (marker, weight) in fp.markers {
+                patterns.push(*marker);
+                owners.push((index, *weight));
             }
         }
-        scores.insert(fp.name, (fp.kind, raw_score));
+        MarkerSet {
+            automaton: aho_corasick::AhoCorasick::new(&patterns)
+                .expect("the marker table is a fixed, valid pattern set"),
+            owners,
+        }
+    })
+}
+
+fn best_fingerprint(text: &str) -> Option<(&'static str, ContentKind, f32)> {
+    let set = marker_set();
+
+    // `str::matches` is leftmost and non-overlapping *per pattern*: two
+    // different markers may cover the same bytes, but one marker's own
+    // matches never overlap each other. Overlapping search plus a
+    // per-pattern end cursor reproduces that exactly — plain
+    // `find_iter` would not, because a match of one pattern would
+    // suppress a different pattern's match on the same bytes.
+    let mut counts = vec![0u32; set.owners.len()];
+    let mut last_end = vec![0usize; set.owners.len()];
+    let mut started = vec![false; set.owners.len()];
+    for m in set.automaton.find_overlapping_iter(text) {
+        let id = m.pattern().as_usize();
+        if !started[id] || m.start() >= last_end[id] {
+            counts[id] += 1;
+            last_end[id] = m.end();
+            started[id] = true;
+        }
+    }
+
+    let mut raw_scores = vec![0f32; FINGERPRINTS.len()];
+    for (id, count) in counts.iter().enumerate() {
+        if *count > 0 {
+            let (fingerprint, weight) = set.owners[id];
+            // Diminishing returns per repeated marker so one very
+            // common short token (e.g. "->") can't dominate alone.
+            raw_scores[fingerprint] += weight * (1.0 + (*count as f32).ln());
+        }
+    }
+
+    let mut scores: HashMap<&'static str, (ContentKind, f32)> = HashMap::new();
+    for (index, fp) in FINGERPRINTS.iter().enumerate() {
+        scores.insert(fp.name, (fp.kind, raw_scores[index]));
     }
     // The winner is decided by raw score, not a per-language-normalized
     // one: normalizing by each language's own total marker weight would
@@ -493,6 +548,112 @@ fn vendor_probability(path_hint: &str) -> f32 {
         0.9
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_equivalence {
+    use super::*;
+
+    /// The implementation `best_fingerprint` replaced, kept verbatim as
+    /// the oracle. The one-pass version is an optimization, so the bar is
+    /// identical output, not merely plausible output.
+    fn best_fingerprint_by_rescanning(text: &str) -> Option<(&'static str, ContentKind, f32)> {
+        let mut scores: HashMap<&'static str, (ContentKind, f32)> = HashMap::new();
+        for fp in FINGERPRINTS {
+            let mut raw_score = 0f32;
+            for (marker, weight) in fp.markers {
+                let count = text.matches(marker).count();
+                if count > 0 {
+                    raw_score += weight * (1.0 + (count as f32).ln());
+                }
+            }
+            scores.insert(fp.name, (fp.kind, raw_score));
+        }
+        let winner = scores
+            .iter()
+            .filter(|(_, (_, raw_score))| *raw_score >= MIN_RAW_SCORE)
+            .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
+            .map(|(&name, &(kind, raw_score))| (name, kind, raw_score))?;
+        let own_total: f32 = FINGERPRINTS
+            .iter()
+            .find(|fp| fp.name == winner.0)
+            .map(|fp| fp.markers.iter().map(|(_, w)| w).sum::<f32>())
+            .unwrap_or(1.0)
+            .max(1.0);
+        Some((winner.0, winner.1, (winner.2 / own_total).min(1.0)))
+    }
+
+    /// Run against this crate's own tree — real files of several
+    /// languages, not fixtures chosen to agree.
+    #[test]
+    fn one_pass_marker_search_matches_rescanning_on_this_repository() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = crate::retrieval::scan::scan_root(root).unwrap();
+
+        let mut compared = 0usize;
+        for file in &report.files {
+            let Ok(bytes) = std::fs::read(root.join(&file.relative_path)) else {
+                continue;
+            };
+            let sample = &bytes[..bytes.len().min(SAMPLE_BYTES)];
+            let Ok(text) = std::str::from_utf8(sample) else {
+                continue;
+            };
+            compared += 1;
+
+            let fast = best_fingerprint(text);
+            let slow = best_fingerprint_by_rescanning(text);
+            match (fast, slow) {
+                (None, None) => {}
+                (Some(fast), Some(slow)) => {
+                    assert_eq!(
+                        (fast.0, fast.1),
+                        (slow.0, slow.1),
+                        "language/kind differ for {}",
+                        file.relative_path
+                    );
+                    assert!(
+                        (fast.2 - slow.2).abs() < 1e-6,
+                        "confidence differs for {}: {} vs {}",
+                        file.relative_path,
+                        fast.2,
+                        slow.2
+                    );
+                }
+                (fast, slow) => panic!(
+                    "one returned a language and the other did not for {}: {fast:?} vs {slow:?}",
+                    file.relative_path
+                ),
+            }
+        }
+        assert!(
+            compared > 100,
+            "expected a real corpus, compared {compared}"
+        );
+    }
+
+    /// The overlap rule is the part that is easy to get wrong: two
+    /// different markers may cover the same bytes, but one marker's own
+    /// matches never overlap each other. A plain non-overlapping search
+    /// across the whole pattern set would silently drop counts.
+    #[test]
+    fn markers_that_share_bytes_are_counted_the_way_str_matches_does() {
+        for text in [
+            // `const ` (JS) sits inside no other marker, but `fn ` and
+            // `impl ` co-occur densely in real Rust.
+            "fn a() {} fn b() {} impl X for Y {} let mut z = 1;",
+            // Self-overlapping candidates and repeated markers.
+            "aaaa fn fn fn  ::  ::  :: std::std::std::",
+            "",
+            "import os\nimport sys\ndef f():\n    elif_not_really = 1\n",
+        ] {
+            assert_eq!(
+                best_fingerprint(text).map(|f| (f.0, f.1)),
+                best_fingerprint_by_rescanning(text).map(|f| (f.0, f.1)),
+                "{text:?}"
+            );
+        }
     }
 }
 

@@ -31,40 +31,87 @@ Not a synthetic fixture — the corpus is the repository this file lives in.
 process start to a served HTTP query. That ratio is the entire argument
 for persisting it, and it is measured rather than assumed.
 
-### Where the sync time goes, and one scan that was paid for twice
+### Where the sync time goes
 
-Profiling the release build put **96% of sync in the scan** — 494 ms of
-513 ms — with tokenizing, BM25 construction, and the container write
-together under 20 ms. That reorders the obvious next step: reusing stored
-postings for unchanged files, which is what incremental sync usually
-means, is chasing the 4%.
+An earlier revision of this document said 96% of sync was the scan. That
+was wrong, and the way it was wrong is worth keeping: the sync report
+printed its *total* elapsed time on the "scanned ..." line, where it read
+as the scan's own cost. Two numbers that happened to be within 20 ms of
+each other looked like confirmation. The report now prints each phase,
+because a timer labelled as something it is not will send the next
+optimization pass at the wrong target — as it did here.
 
-It also exposed a plain defect. `tqf sync` called `scan_root`, then called
-`full_correctness_walk`, which calls `scan_root` again — and `scan_root`
-reads every file in the tree to classify it by content. The repository was
-read twice per sync. Passing the existing scan into the walk
-(`full_correctness_walk_of`) took the release build from **513 ms to
-329 ms (1.56x)** with byte-identical output.
+The real breakdown, release build, this repository (259 files scanned,
+175 indexed, 5.3 MiB):
 
-The remaining scan cost is a genuine content read: change detection hashes
-file contents. Skipping it for unchanged files needs a stat-only
-pre-filter on `byte_len`/`mtime_ns`, both of which the persisted
-`FileRecord` already carries. That is a real optimization with a real
-correctness caveat — mtime and size can miss a same-size edit inside one
-timestamp tick — so under invariant #8 it needs the content-hash walk to
-stay available as the fallback. `full_correctness_walk` is already exactly
-that fallback, and is already named for it. Not implemented here.
+| | before | after |
+|---|---|---|
+| scan | 165 ms | **19 ms** |
+| walk | ~2 ms | 2 ms |
+| index build | 109 ms | **92 ms** |
+| write | ~29 ms | 29 ms |
+| **total** | **513 ms** | **~150 ms** |
 
-A related gap worth naming: `index()` passes `FileTable::default()`, which
-is always empty, so every file is classified `new` on every sync and
-Phase 42's change-detection machinery never actually runs. Seeding the
-table from the persisted `FileRecord`s is the prerequisite for any of the
-above.
+Three changes, each verified to produce identical output rather than
+merely similar output:
 
-The index is 1.09 MiB for a 3.0 MiB corpus. It stores postings, the exact
-identifier lane, and per-chunk token counts — not the source text, per
-§185's rule that chunk text remains in the source file rather than being
-duplicated wholesale into the index.
+**The tree was walked twice.** `tqf sync` called `scan_root`, then called
+`full_correctness_walk`, which calls `scan_root` again. Passing the
+existing scan in took 513 ms to 329 ms. A test pins the two entry points
+to the same plan and contents.
+
+**Classification rescanned each file once per marker.** Isolating the scan
+put 94% of it in `classify` — 155 ms of 165 ms, against 4.6 ms of reading
+and 1.8 ms of BLAKE3 hashing. `best_fingerprint` ran
+`text.matches(marker)` for every marker of every one of twelve language
+fingerprints over a 64 KiB sample: several megabytes of scanning per file.
+One Aho-Corasick pass finds the same occurrences: **155 ms to 12 ms**.
+
+Reproducing `str::matches` exactly is the part worth care. It is leftmost
+and non-overlapping *per pattern* — two different markers may cover the
+same bytes, but one marker's own matches never overlap each other. Plain
+`find_iter` over the whole pattern set would let one marker's match
+suppress another's and quietly lose counts, so this uses overlapping
+search with a per-pattern end cursor. A differential test runs both
+implementations over every file in this repository and requires the same
+language, kind, and confidence.
+
+**The index build split each document twice and allocated per token.**
+BM25 wants lowercased tokens plus identifier subtokens; the exact lane
+wants the same tokens case-preserved, and re-split the whole document to
+get them. The per-document tally also cloned every token to key itself,
+allocating once per token *occurrence*. Splitting once and consuming the
+tokens: 109 ms to 92 ms. Verified through `export` — what actually reaches
+disk — and through real query rankings, since a difference in
+`avg_doc_len` alone would leave the bytes identical while every score
+shifted.
+
+`cargo test --release -- --ignored scan_cost_split` re-derives the scan
+split rather than asking anyone to trust these numbers.
+
+### What incremental sync would now target
+
+The dominant cost is no longer the scan; it is the BM25 build, at 92 of
+150 ms. Reading is 4.6 ms and hashing 1.8 ms for the whole tree, so
+change detection by exact content hash is essentially free — there is no
+reason to reach for an mtime/size heuristic and no correctness caveat to
+manage.
+
+What that leaves is the genuinely hard part: reusing the postings of
+unchanged files. Chunk ids are positional, so unchanged files shift ids
+when a file is added or removed ahead of them, and remapping them means
+extracting one document's terms from a term-keyed posting map — which is
+a forward index the format does not store. The honest options are a new
+segment (kinds 7-11 are reserved) or an incremental `LexicalIndex` that
+can add and remove a document while keeping `avg_doc_len` and every score
+identical to a full rebuild. Neither is started. The deterministic walk
+order landed first because "identical to a full rebuild" is not a
+well-defined goal while document order depends on the filesystem.
+
+A related gap: `index()` passes `FileTable::default()`, which is always
+empty, so every file is classified `new` on every sync and Phase 42's
+change detection never actually runs. Seeding it from the persisted
+`FileRecord`s is the prerequisite for any of the above.
 
 ### Real queries against it
 

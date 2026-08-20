@@ -30,6 +30,14 @@ pub struct SyncReport {
     pub indexed_chunks: usize,
     pub lexical_terms: usize,
     pub errors: Vec<String>,
+    /// Per-phase wall clock. Reported separately because the single
+    /// total used to be printed on the "scanned" line, where it read as
+    /// the scan's own cost — which sent an optimization pass at the
+    /// wrong phase.
+    pub scan_ms: u128,
+    pub walk_ms: u128,
+    pub index_ms: u128,
+    pub write_ms: u128,
     pub symlink_cycles_skipped: u64,
     pub elapsed_ms: u128,
     /// Where the index was written, and which generation it became.
@@ -98,7 +106,9 @@ fn index(path: &Path) -> Result<SyncReport> {
     let started = std::time::Instant::now();
     let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
+    let scan_started = std::time::Instant::now();
     let scan: ScanReport = scan_root(&root)?;
+    let scan_ms = scan_started.elapsed().as_millis();
     let mut report = SyncReport {
         root: root.display().to_string(),
         files_scanned: scan.files.len(),
@@ -122,17 +132,23 @@ fn index(path: &Path) -> Result<SyncReport> {
     // `scan_root` reads every file in the tree to classify it, so calling
     // it twice read the whole repository twice.
     let table = FileTable::default();
+    let walk_started = std::time::Instant::now();
     let (plan, contents) = full_correctness_walk_of(&root, &table, &scan)?;
+    report.walk_ms = walk_started.elapsed().as_millis();
     report.indexable = contents.len();
 
+    let index_started = std::time::Instant::now();
     let mut engine = SyncEngine::empty();
     engine.apply_structural_lexical(&plan, &contents);
+    report.index_ms = index_started.elapsed().as_millis();
     report.indexed_chunks = engine.lexical.document_count();
     report.lexical_terms = engine.lexical.term_count();
+    report.scan_ms = scan_ms;
 
     // Persist it (spec §173's project-local committed file). Written
     // atomically, so an interrupted sync leaves the previous index intact
     // rather than a truncated one that would still parse.
+    let write_started = std::time::Instant::now();
     let index_path = tqi::index_path(&root);
     let previous = tqi::codec::read(&index_path).ok();
     let persisted = build_contents(&engine, &root, &contents);
@@ -144,6 +160,7 @@ fn index(path: &Path) -> Result<SyncReport> {
     )?;
 
     let loaded = tqi::codec::read(&index_path)?;
+    report.write_ms = write_started.elapsed().as_millis();
 
     // Register the root so a server started anywhere can find it, and
     // write the project file that carries the index identity with the
@@ -232,7 +249,7 @@ fn render(report: &SyncReport) -> String {
         report.files_scanned,
         report.bytes_scanned as f64 / (1024.0 * 1024.0),
         report.ignored,
-        report.elapsed_ms
+        report.scan_ms
     );
     if report.symlink_cycles_skipped > 0 {
         let _ = writeln!(
@@ -287,6 +304,14 @@ fn render(report: &SyncReport) -> String {
                 "\nwritten:\n  {path}\n  generation {}, {:.1} KiB",
                 report.generation,
                 report.index_bytes as f64 / 1024.0
+            );
+            // Per phase, not one total: the total used to be printed on
+            // the "scanned" line, which read as the scan's own cost and
+            // pointed an optimization pass at the wrong phase.
+            let _ = writeln!(
+                out,
+                "  {} ms total — scan {}, walk {}, index {}, write {}",
+                report.elapsed_ms, report.scan_ms, report.walk_ms, report.index_ms, report.write_ms
             );
             let _ = writeln!(
                 out,
