@@ -24,12 +24,42 @@ Not a synthetic fixture — the corpus is the repository this file lives in.
 | Files indexed | 174 (Rust only, §307's scope decision) |
 | Distinct lexical terms | 10,782 |
 | Index size | 1,120,745 bytes (1.09 MiB) |
-| `tqf sync .` wall time | 1,956 ms |
+| `tqf sync .` wall time (debug) | 1,956 ms |
 | Server start → first served index query | **81 ms** |
 
 **24x**: rebuilding the index costs 1,956 ms; loading it costs 81 ms from
 process start to a served HTTP query. That ratio is the entire argument
 for persisting it, and it is measured rather than assumed.
+
+### Where the sync time goes, and one scan that was paid for twice
+
+Profiling the release build put **96% of sync in the scan** — 494 ms of
+513 ms — with tokenizing, BM25 construction, and the container write
+together under 20 ms. That reorders the obvious next step: reusing stored
+postings for unchanged files, which is what incremental sync usually
+means, is chasing the 4%.
+
+It also exposed a plain defect. `tqf sync` called `scan_root`, then called
+`full_correctness_walk`, which calls `scan_root` again — and `scan_root`
+reads every file in the tree to classify it by content. The repository was
+read twice per sync. Passing the existing scan into the walk
+(`full_correctness_walk_of`) took the release build from **513 ms to
+329 ms (1.56x)** with byte-identical output.
+
+The remaining scan cost is a genuine content read: change detection hashes
+file contents. Skipping it for unchanged files needs a stat-only
+pre-filter on `byte_len`/`mtime_ns`, both of which the persisted
+`FileRecord` already carries. That is a real optimization with a real
+correctness caveat — mtime and size can miss a same-size edit inside one
+timestamp tick — so under invariant #8 it needs the content-hash walk to
+stay available as the fallback. `full_correctness_walk` is already exactly
+that fallback, and is already named for it. Not implemented here.
+
+A related gap worth naming: `index()` passes `FileTable::default()`, which
+is always empty, so every file is classified `new` on every sync and
+Phase 42's change-detection machinery never actually runs. Seeding the
+table from the persisted `FileRecord`s is the prerequisite for any of the
+above.
 
 The index is 1.09 MiB for a 3.0 MiB corpus. It stores postings, the exact
 identifier lane, and per-chunk token counts — not the source text, per

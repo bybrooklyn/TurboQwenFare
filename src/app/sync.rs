@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::error::Result;
 use crate::retrieval::scan::{scan_root, ScanReport};
-use crate::retrieval::sync::{full_correctness_walk, FileTable, SyncEngine};
+use crate::retrieval::sync::{full_correctness_walk_of, FileTable, SyncEngine};
 use crate::retrieval::tqi::{self, codec::IndexContents, registry, segments::FileRecord};
 
 /// What one `tqf sync` run observed.
@@ -117,9 +117,12 @@ fn index(path: &Path) -> Result<SyncReport> {
         *report.by_language.entry(language.to_string()).or_insert(0) += 1;
     }
 
-    // The real walk and the real lexical/exact index build.
+    // The real walk and the real lexical/exact index build, reusing the
+    // scan above rather than making `full_correctness_walk` run its own —
+    // `scan_root` reads every file in the tree to classify it, so calling
+    // it twice read the whole repository twice.
     let table = FileTable::default();
-    let (plan, contents) = full_correctness_walk(&root, &table)?;
+    let (plan, contents) = full_correctness_walk_of(&root, &table, &scan)?;
     report.indexable = contents.len();
 
     let mut engine = SyncEngine::empty();
