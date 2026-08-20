@@ -378,6 +378,18 @@ const DEFAULT_MAX_OUTPUT_TOKENS: usize = 512;
 
 const DEV_DECODE_DIAGNOSTICS_ENV: &str = "TQF_DEV_DECODE_DIAGNOSTICS";
 
+/// Summarizes a whole generation instead of logging every step.
+///
+/// Separate from `TQF_DEV_DECODE_DIAGNOSTICS`, which emits per-token
+/// hashes and router traces: that is a correctness instrument, and forty
+/// layer hashes per token is not a form anyone can read the 15 tok/s
+/// question out of.
+const DEV_DECODE_PROFILE_ENV: &str = "TQF_DECODE_PROFILE";
+
+fn decode_profiling_enabled() -> bool {
+    std::env::var(DEV_DECODE_PROFILE_ENV).as_deref() == Ok("1")
+}
+
 fn emit_decode_diagnostics(
     input_token: u32,
     decoded: &crate::runtime::DecodeToken,
@@ -696,6 +708,8 @@ impl Qwen36ResidentReferenceGenerator {
             let mut collected = Vec::new();
             let mut reached_eos = false;
             let mut client_gone = false;
+            let mut profile =
+                decode_profiling_enabled().then(crate::runtime::profile::DecodeProfile::new);
 
             for _ in 0..maximum {
                 if cancellation_for_decode.is_cancelled() {
@@ -737,10 +751,33 @@ impl Qwen36ResidentReferenceGenerator {
                 let cache_before = runtime.expert_cache_stats();
                 // `generated` is this request's history, which is what the
                 // repetition penalties score against.
+                let step_started = std::time::Instant::now();
                 let decoded = runtime.decode_step(input, &mut sampler, &generated)?;
+                let step_elapsed = step_started.elapsed();
                 let cache_after = runtime.expert_cache_stats();
                 emit_decode_diagnostics(input, &decoded, cache_before, cache_after);
+                if let Some(profile) = profile.as_mut() {
+                    // The baseline is the *first* step's before-reading,
+                    // so prefill's fetches are not charged to decode.
+                    if let Some(before) = cache_before {
+                        profile.set_baseline(before);
+                    }
+                    profile.record_step(&decoded.diagnostics.timings, step_elapsed);
+                    if let Some(after) = cache_after {
+                        profile.record_expert_stats(after);
+                    }
+                }
                 next = decoded.token;
+            }
+
+            if let Some(profile) = &profile {
+                if !profile.is_empty() {
+                    // One multi-line block rather than structured fields:
+                    // this is a table a person reads, and splitting it
+                    // across tracing fields makes it unreadable in every
+                    // formatter.
+                    tracing::info!("\n{}", profile.report().render());
+                }
             }
 
             let (tail, finish) = decoder.finish()?;

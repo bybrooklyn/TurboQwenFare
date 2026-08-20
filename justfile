@@ -229,6 +229,25 @@ pin-helper-model:
 verify-real:
     ./scripts/verify-real.sh
 
+# Prints the summary at the end of the generation. Add
+# TQF_DEV_DECODE_DIAGNOSTICS=1 for the per-token trace too, but expect
+# forty layer hashes per token.
+#
+# Where a real decode run's wall clock goes (needs the real checkpoint).
+profile-decode memory="4G" tokens="32":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TQF_DECODE_PROFILE=1 cargo run --release -- --headless --yes --memory {{memory}} &
+    server=$!
+    trap 'kill $server 2>/dev/null || true' EXIT
+    until curl -fsS --max-time 2 http://127.0.0.1:11434/health >/dev/null 2>&1; do sleep 1; done
+    curl -fsS http://127.0.0.1:11434/v1/chat/completions \
+      -H 'Content-Type: application/json' \
+      -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Count to twenty."}],"max_tokens":{{tokens}}}' \
+      > /dev/null
+    echo "generation finished; the profile is in the server output above."
+    sleep 2
+
 # Lane E: every checkpoint-gated test.
 qual-all:
     cargo test --release -- --ignored --nocapture {{test_flags}}
