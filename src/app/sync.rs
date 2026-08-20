@@ -39,6 +39,22 @@ pub struct SyncReport {
 }
 
 pub fn run_sync(path: &Path) -> Result<()> {
+    // Checked here so the message names the path. Letting the walk fail
+    // produced a bare "No such file or directory (os error 2)", which
+    // says nothing about which argument was wrong — and for a file
+    // argument, "Not a directory (os error 20)" left the user to work
+    // out that `tqf sync` indexes directories.
+    if !path.exists() {
+        return Err(
+            crate::error::RetrievalError::SyncPathMissing(path.display().to_string()).into(),
+        );
+    }
+    if !path.is_dir() {
+        return Err(crate::error::RetrievalError::SyncPathNotADirectory(
+            path.display().to_string(),
+        )
+        .into());
+    }
     let report = index(path)?;
     print!("{}", render(&report));
     Ok(())
@@ -285,6 +301,28 @@ fn render(report: &SyncReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A bad path argument reported a bare OS error — "No such file or
+    /// directory (os error 2)" for a missing path, and "Not a directory
+    /// (os error 20)" for a file — neither of which names the argument
+    /// or says what `tqf sync` expects.
+    #[test]
+    fn a_bad_sync_path_is_reported_with_the_path_and_what_was_expected() {
+        let missing = super::run_sync(std::path::Path::new("/nonexistent/project"))
+            .expect_err("a missing path must be refused")
+            .to_string();
+        assert!(missing.contains("/nonexistent/project"), "{missing}");
+        assert!(missing.contains("no such directory"), "{missing}");
+
+        // A file is the more interesting mistake: it exists, so the
+        // message has to explain that sync takes a directory.
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let not_a_dir = super::run_sync(&file)
+            .expect_err("a file must be refused")
+            .to_string();
+        assert!(not_a_dir.contains("Cargo.toml"), "{not_a_dir}");
+        assert!(not_a_dir.contains("not a directory"), "{not_a_dir}");
+    }
+
     use super::*;
 
     fn sample() -> SyncReport {

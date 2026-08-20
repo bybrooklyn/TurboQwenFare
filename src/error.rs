@@ -301,6 +301,10 @@ pub enum RetrievalError {
     // the wrong format entirely.
     #[error("not a .tqi index: bad magic")]
     IndexBadMagic,
+    #[error("`tqf sync {0:?}`: no such directory")]
+    SyncPathMissing(String),
+    #[error("`tqf sync {0:?}`: not a directory — sync indexes a project directory, not a file")]
+    SyncPathNotADirectory(String),
     #[error("unsupported .tqi format major version {0}")]
     IndexUnsupportedMajorVersion(u16),
     #[error("malformed .tqi {what}: expected at least {expected} bytes, found {actual}")]
