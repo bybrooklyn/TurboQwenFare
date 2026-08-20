@@ -29,8 +29,9 @@ check() {
     if "$@" >/dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi
 }
 
-# -H is required: `curl -d` defaults to form encoding, which the server
-# correctly rejects with 415. Real clients always send JSON.
+# Most checks below send the header a real SDK sends. The server does not
+# require it — see the docs-style check near the bottom, which is the one
+# that reproduces Ollama's own README verbatim.
 JSON=(-H 'Content-Type: application/json')
 body()   { curl -fsS --max-time 120 "${JSON[@]}" "$@" 2>/dev/null; }
 status() { curl -s -o /dev/null -w '%{http_code}' --max-time 30 "${JSON[@]}" "$@"; }
@@ -132,20 +133,27 @@ fi
 
 note 'generation: NDJSON streaming — the framing Ollama clients parse'
 HDR="$TMP/headers.txt"; ND="$TMP/stream.ndjson"
-curl -fsS -N --max-time 300 "${JSON[@]}" -D "$HDR" "$BASE/api/chat" -d '{
+# No -f here: an unready server answers this with a 503, which is the
+# correct behavior (a streaming request that cannot run must fail with a
+# status, not a 200 carrying an error object). -f would discard that body
+# and report it as a missing response.
+STREAM_CODE="$(curl -sS -N --max-time 300 -o "$ND" -w '%{http_code}' \
+  "${JSON[@]}" -D "$HDR" "$BASE/api/chat" -d '{
   "model":"qwen3.6:35b",
   "messages":[{"role":"user","content":"Count to five."}],
-  "options":{"temperature":0,"num_predict":32}}' > "$ND" 2>/dev/null
+  "options":{"temperature":0,"num_predict":32}}' 2>/dev/null)"
 
-if [ -s "$ND" ]; then
+if [ "$MODEL_INSTALLED" != "true" ]; then
+    # Covered by the status check at the end of this script; there is no
+    # stream to inspect the framing of.
+    skip "NDJSON framing (no model installed; /api/chat returned $STREAM_CODE)"
+elif [ -s "$ND" ]; then
     grep -qi 'application/x-ndjson' "$HDR" \
         && ok 'content-type is application/x-ndjson' \
         || bad "content-type is application/x-ndjson (got: $(grep -i '^content-type' "$HDR" | tr -d '\r'))"
 
     lines=$(wc -l < "$ND")
-    if [ "$MODEL_INSTALLED" != "true" ]; then
-        skip "incremental line count (no model installed; saw $lines)"
-    elif [ "$lines" -gt 1 ]; then
+    if [ "$lines" -gt 1 ]; then
         ok "streamed $lines lines (incremental)"
     else
         bad "streamed $lines line — generation is not incremental"
@@ -166,18 +174,10 @@ for n, line in enumerate(open('$ND'), 1):
         bad 'every line is a bare JSON object'
     fi
 
-    if [ "$MODEL_INSTALLED" != "true" ]; then
-        if tail -1 "$ND" | grep -q '"error"'; then
-            ok 'the stream carries an Ollama-shaped error line when no model is installed'
-        else
-            bad 'the stream carries an Ollama-shaped error line when no model is installed'
-        fi
-    else
-        head -1 "$ND" | grep -q '"done":false' && ok 'first line has done:false' || bad 'first line has done:false'
-        tail -1 "$ND" | grep -q '"done":true'  && ok 'terminal line has done:true (clients hang without it)' \
-                                               || bad 'terminal line has done:true (clients hang without it)'
-        tail -1 "$ND" | grep -q '"done_reason"' && ok 'terminal line has done_reason' || bad 'terminal line has done_reason'
-    fi
+    head -1 "$ND" | grep -q '"done":false' && ok 'first line has done:false' || bad 'first line has done:false'
+    tail -1 "$ND" | grep -q '"done":true'  && ok 'terminal line has done:true (clients hang without it)' \
+                                           || bad 'terminal line has done:true (clients hang without it)'
+    tail -1 "$ND" | grep -q '"done_reason"' && ok 'terminal line has done_reason' || bad 'terminal line has done_reason'
 else
     bad 'POST /api/chat (streaming) returned a body'
 fi
@@ -222,6 +222,42 @@ generation_status 'seed / repeat_penalty / stop' /api/chat \
 generation_status 'num_predict -1 (unbounded) and keep_alive' /api/chat \
   '{"model":"qwen3.6:35b","stream":false,"keep_alive":"5m","messages":[{"role":"user","content":"hi"}],"options":{"num_predict":-1}}'
 
+
+# --------------------------------------------------------------------------
+# The invocation from Ollama's own README, verbatim: no Content-Type, which
+# means `curl -d` sends application/x-www-form-urlencoded. Real Ollama parses
+# it anyway. tqf used to 415 this, so every reader who copied a command out
+# of Ollama's documentation hit a wall on a server whose endpoint list was
+# complete and correct. Checked last because it is a compatibility claim
+# about the framing, not about any one endpoint.
+note "the bodies Ollama's own documentation sends"
+for path in /api/chat /api/generate; do
+    case "$path" in
+      /api/chat) doc_body='{"model":"qwen3.6:35b","messages":[{"role":"user","content":"hi"}],"stream":false}' ;;
+      *)         doc_body='{"model":"qwen3.6:35b","prompt":"hi","stream":false}' ;;
+    esac
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$BASE$path" -d "$doc_body")"
+    if [ "$code" = "415" ]; then
+        bad "$path accepts a body with no Content-Type (got 415)"
+    elif [ "$code" = "200" ] || { [ "$code" = "503" ] && [ "$MODEL_INSTALLED" != "true" ]; }; then
+        ok "$path accepts a body with no Content-Type (got $code)"
+    else
+        bad "$path accepts a body with no Content-Type (got $code)"
+    fi
+done
+
+# A streaming request that cannot run must fail with a status. A 200 tells
+# the client it succeeded, and the error object it then reads has no
+# `message` — clients stop on `done`, so without it they hang.
+if [ "$MODEL_INSTALLED" != "true" ]; then
+    note 'an unready server fails streaming requests with a status'
+    code="$(status "$BASE/api/chat" -d '{"model":"qwen3.6:35b","messages":[{"role":"user","content":"hi"}]}')"
+    if [ "$code" = "503" ]; then
+        ok "streaming /api/chat with no model returns 503 (got $code)"
+    else
+        bad "streaming /api/chat with no model returns 503 (got $code)"
+    fi
+fi
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
