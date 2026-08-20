@@ -141,6 +141,17 @@ smoke-ollama base="http://127.0.0.1:11434":
 smoke-openai base="http://127.0.0.1:11434":
     ./scripts/smoke-openai.sh {{base}}
 
+# Spec §289's exit gate: the real SDKs, not our idea of what they send.
+# Needs `pip install openai ollama anthropic`.
+smoke-clients base="http://127.0.0.1:11434":
+    python3 scripts/smoke-clients.py {{base}}
+
+# Every wire-level check against one running server.
+smoke base="http://127.0.0.1:11434":
+    @just smoke-ollama {{base}}
+    @just smoke-openai {{base}}
+    @just smoke-clients {{base}}
+
 # ------------------------------------------------- Lane D: qualification
 #
 # These need the real pinned checkpoint. Set the paths in `.env`:
