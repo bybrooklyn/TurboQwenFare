@@ -44,6 +44,15 @@ fn tokenize_raw(raw_tokens: &[&str]) -> Vec<String> {
             continue;
         }
         tokens.push(raw.to_ascii_lowercase());
+        // `split_identifier` allocates a `Vec<char>`, a `Vec<String>`,
+        // and a `String` per part — for every token, including the
+        // majority that have no boundary to split on and whose single
+        // part is discarded by the `len() > 1` check below. A token with
+        // no underscore, no uppercase, and no digit cannot produce more
+        // than one part, so the scan below decides it without allocating.
+        if !may_split(raw) {
+            continue;
+        }
         let subtokens = split_identifier(raw);
         if subtokens.len() > 1 {
             for sub in subtokens {
@@ -52,6 +61,17 @@ fn tokenize_raw(raw_tokens: &[&str]) -> Vec<String> {
         }
     }
     tokens
+}
+
+/// Whether `split_identifier` could return more than one part.
+///
+/// Every boundary it recognizes needs an underscore, an uppercase
+/// character, or a digit: the camel/Pascal and acronym rules both require
+/// `curr_is_upper`, and the digit rule requires a digit on one side. A
+/// token with none of the three is returned whole.
+fn may_split(raw: &str) -> bool {
+    raw.chars()
+        .any(|c| c == '_' || c.is_uppercase() || c.is_ascii_digit())
 }
 
 /// Splits on anything that isn't alphanumeric or `_` — the raw
@@ -552,6 +572,176 @@ mod persistence_tests {
         let rebuilt = LexicalIndex::from_parts(postings, exact, &lengths, &paths);
         assert_eq!(rebuilt.document_count(), 0);
         assert!(rebuilt.search("anything", 5).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod build_cost_probe {
+    /// Measurement, not a correctness check. Points at a directory via
+    /// `TQF_BENCH_TREE` so it can run against a large synthetic tree as
+    /// well as this repository:
+    /// `TQF_BENCH_TREE=/path cargo test --release -- --ignored --nocapture build_cost_split`
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn build_cost_split() {
+        let root = std::env::var("TQF_BENCH_TREE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+        let report = crate::retrieval::scan::scan_root(&root).unwrap();
+        let documents: Vec<(String, String)> = report
+            .files
+            .iter()
+            .filter(|f| f.classification.language == Some("Rust"))
+            .filter_map(|f| {
+                std::fs::read_to_string(root.join(&f.relative_path))
+                    .ok()
+                    .map(|text| (f.relative_path.clone(), text))
+            })
+            .collect();
+        let bytes: usize = documents.iter().map(|(_, t)| t.len()).sum();
+
+        let started = std::time::Instant::now();
+        let index = super::LexicalIndex::build(&documents);
+        let whole = started.elapsed();
+
+        // Raw splitting alone.
+        let started = std::time::Instant::now();
+        let mut raw_count = 0usize;
+        for (_, text) in &documents {
+            raw_count += std::hint::black_box(super::split_raw_tokens(text)).len();
+        }
+        let split_only = started.elapsed();
+
+        // Splitting plus the lowercase/subtoken pass.
+        let started = std::time::Instant::now();
+        let mut token_count = 0usize;
+        for (_, text) in &documents {
+            let raw = super::split_raw_tokens(text);
+            token_count += std::hint::black_box(super::tokenize_raw(&raw)).len();
+        }
+        let tokenize_only = started.elapsed();
+
+        println!(
+            "\ndocs {}  bytes {:.1} MiB  raw tokens {raw_count}  tokens {token_count}  terms              {}\n  whole build   {:>8.1} ms\n  split only    {:>8.1} ms\n  split+tokenize              {:>7.1} ms\n  remainder     {:>8.1} ms",
+            documents.len(),
+            bytes as f64 / (1024.0 * 1024.0),
+            index.term_count(),
+            whole.as_secs_f64() * 1000.0,
+            split_only.as_secs_f64() * 1000.0,
+            tokenize_only.as_secs_f64() * 1000.0,
+            (whole.as_secs_f64() - tokenize_only.as_secs_f64()) * 1000.0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tokenize_equivalence {
+    use super::*;
+
+    /// Tokenization with no fast path: `split_identifier` is called for
+    /// every token, unconditionally. An independent oracle — the
+    /// `build_equivalence` tests below compare two builds that both go
+    /// through `tokenize_raw`, so they could not catch a change inside
+    /// it.
+    fn tokenize_raw_always_splitting(raw_tokens: &[&str]) -> Vec<String> {
+        let mut tokens = Vec::new();
+        for raw in raw_tokens {
+            if raw.is_empty() {
+                continue;
+            }
+            tokens.push(raw.to_ascii_lowercase());
+            let subtokens = split_identifier(raw);
+            if subtokens.len() > 1 {
+                for sub in subtokens {
+                    tokens.push(sub.to_ascii_lowercase());
+                }
+            }
+        }
+        tokens
+    }
+
+    #[test]
+    fn the_fast_path_tokenizes_this_repository_identically() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = crate::retrieval::scan::scan_root(root).unwrap();
+        let mut compared = 0usize;
+        for file in &report.files {
+            let Ok(text) = std::fs::read_to_string(root.join(&file.relative_path)) else {
+                continue;
+            };
+            let raw = split_raw_tokens(&text);
+            assert_eq!(
+                tokenize_raw(&raw),
+                tokenize_raw_always_splitting(&raw),
+                "{}",
+                file.relative_path
+            );
+            compared += 1;
+        }
+        assert!(
+            compared > 100,
+            "expected a real corpus, compared {compared}"
+        );
+    }
+
+    /// The shapes the fast path has to get right, stated directly: a
+    /// token is skipped only when it cannot split, and every kind of
+    /// boundary `split_identifier` recognizes must defeat the skip.
+    #[test]
+    fn every_boundary_kind_still_reaches_the_splitter() {
+        for raw in [
+            // No boundary — the case the fast path exists for.
+            "count",
+            "input",
+            "fn",
+            "x",
+            "",
+            // Underscore, camel, Pascal, acronym, digit boundaries.
+            "memory_broker",
+            "memoryBroker",
+            "MemoryBroker",
+            "HTTPServer",
+            "utf8",
+            "q4k",
+            "SCREAMING_CASE",
+            "mixed_Case9x",
+            // Non-ASCII: lowercase accented letters must not be treated
+            // as a boundary, uppercase ones must.
+            "café",
+            "Café",
+        ] {
+            let raw_tokens = vec![raw];
+            assert_eq!(
+                tokenize_raw(&raw_tokens),
+                tokenize_raw_always_splitting(&raw_tokens),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// `may_split` must never say "no" to something that would split —
+    /// a false negative silently drops subtokens from the index, which
+    /// no search result would obviously reveal.
+    #[test]
+    fn may_split_never_skips_a_token_that_would_split() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = crate::retrieval::scan::scan_root(root).unwrap();
+        for file in &report.files {
+            let Ok(text) = std::fs::read_to_string(root.join(&file.relative_path)) else {
+                continue;
+            };
+            for raw in split_raw_tokens(&text) {
+                if !may_split(raw) {
+                    assert_eq!(
+                        split_identifier(raw).len(),
+                        1,
+                        "{raw:?} was skipped but splits into {:?}",
+                        split_identifier(raw)
+                    );
+                }
+            }
+        }
     }
 }
 

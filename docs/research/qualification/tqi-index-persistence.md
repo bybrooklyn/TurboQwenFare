@@ -48,11 +48,11 @@ The real breakdown, release build, this repository (259 files scanned,
 |---|---|---|
 | scan | 165 ms | **19 ms** |
 | walk | ~2 ms | 2 ms |
-| index build | 109 ms | **92 ms** |
-| write | ~29 ms | 29 ms |
-| **total** | **513 ms** | **~150 ms** |
+| index build | 109 ms | **~82 ms** |
+| write | ~29 ms | ~35 ms |
+| **total** | **513 ms** | **~141 ms** |
 
-Three changes, each verified to produce identical output rather than
+Four changes, each verified to produce identical output rather than
 merely similar output:
 
 **The tree was walked twice.** `tqf sync` called `scan_root`, then called
@@ -86,32 +86,70 @@ disk — and through real query rankings, since a difference in
 `avg_doc_len` alone would leave the bytes identical while every score
 shifted.
 
+**Identifier splitting allocated for tokens that cannot split.**
+`split_identifier` allocates a `Vec<char>`, a `Vec<String>`, and a
+`String` per part — for every raw token, including the majority whose
+single part the caller then discards. Every boundary it recognizes needs
+an underscore, an uppercase character, or a digit, so a byte scan for
+those three decides the common case without allocating: on this
+repository the tokenize pass went from ~78 ms to 51 ms. Its oracle is
+deliberately separate from the one above, which compares two builds that
+both run through `tokenize_raw` and so could not catch a change inside
+it; a third test asserts `may_split` never skips a token that would
+actually split, since a false negative there would silently drop
+subtokens from the index and no search result would obviously reveal it.
+
 `cargo test --release -- --ignored scan_cost_split` re-derives the scan
 split rather than asking anyone to trust these numbers.
 
-### What incremental sync would now target
+### How it scales, and why incremental sync is not built
 
-The dominant cost is no longer the scan; it is the BM25 build, at 92 of
-150 ms. Reading is 4.6 ms and hashing 1.8 ms for the whole tree, so
-change detection by exact content hash is essentially free — there is no
-reason to reach for an mtime/size heuristic and no correctness caveat to
-manage.
+A synthetic 5,000-file / 15.4 MiB Rust tree syncs in **776 ms** (scan 102,
+walk 37, index 541, write 92). Extrapolating, a 50,000-file monorepo is
+roughly 8 seconds.
 
-What that leaves is the genuinely hard part: reusing the postings of
-unchanged files. Chunk ids are positional, so unchanged files shift ids
-when a file is added or removed ahead of them, and remapping them means
-extracting one document's terms from a term-keyed posting map — which is
-a forward index the format does not store. The honest options are a new
-segment (kinds 7-11 are reserved) or an incremental `LexicalIndex` that
-can add and remove a document while keeping `avg_doc_len` and every score
-identical to a full rebuild. Neither is started. The deterministic walk
-order landed first because "identical to a full rebuild" is not a
-well-defined goal while document order depends on the filesystem.
+For an explicit `tqf sync .` — a setup step a person runs once per
+project — 8 seconds is fine. The case where it is not fine is a watcher
+re-syncing after every file save, and that is the point: **nothing calls
+sync repeatedly today.** Phase 42 built `LiveWatcher` against real
+FSEvents/inotify, but it is not wired into `tqf sync`, and spec §3 fixes
+the command surface at `tqf sync .` / `tqf unsync .` with no `--watch`.
 
-A related gap: `index()` passes `FileTable::default()`, which is always
-empty, so every file is classified `new` on every sync and Phase 42's
-change detection never actually runs. Seeding it from the persisted
-`FileRecord`s is the prerequisite for any of the above.
+So incremental sync would be an optimization for a caller that does not
+exist. That is the same shape as the defect this whole branch is about —
+a measured, qualified library nothing reaches — and it is why this is
+recorded as a decision rather than left as an omission.
+
+What would change the answer: wiring `LiveWatcher` into a real
+continuous-sync path. That needs a spec decision about the command
+surface first, not just an implementation.
+
+If it is built, the target is the BM25 build (541 of 776 ms at 5,000
+files), not the scan. Reading is 4.6 ms and hashing 1.8 ms for this
+repository's whole tree, so change detection by exact content hash is
+essentially free — there is no reason to reach for an mtime/size
+heuristic and no correctness caveat to manage. The hard part is reusing
+an unchanged file's postings: chunk ids are positional, so they shift
+when a file is added ahead of them, and remapping means extracting one
+document's terms from a term-keyed posting map — a forward index the
+format does not store. The honest options are a new segment (kinds 7-11
+are reserved) or an incremental `LexicalIndex` that adds and removes a
+document while keeping `avg_doc_len` and every score identical to a full
+rebuild. Spec §176's stable `FileId` and `next_chunk_id` already
+anticipate the first half of that.
+
+A prerequisite either way: `index()` passes `FileTable::default()`, which
+is always empty, so every file is classified `new` on every sync and
+Phase 42's change detection never actually runs.
+
+### Reproducing these numbers
+
+```sh
+cargo test --release -- --ignored --nocapture scan_cost_split
+cargo test --release -- --ignored --nocapture build_cost_split
+TQF_BENCH_TREE=/path/to/large/tree \
+  cargo test --release -- --ignored --nocapture build_cost_split
+```
 
 ### Real queries against it
 
